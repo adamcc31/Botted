@@ -33,6 +33,10 @@ class DualFeedSnapshot(BaseModel):
     spread_direction: Literal[
         "BINANCE_ABOVE", "CHAINLINK_ABOVE", "CONVERGED"
     ] = Field(..., description="Which feed is higher")
+    is_stale: bool = Field(
+        default=False,
+        description="True if snapshot data is stale. Always False when freshly created by DualFeed.get_snapshot().",
+    )
 
 
 class SpreadFilterResult(BaseModel):
