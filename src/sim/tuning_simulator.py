@@ -114,7 +114,7 @@ class TuningSchema:
 class SimulatedSignal:
     epoch_ts: int
     slug: str
-    direction: str  # BUY_YES, BUY_NO, ABSTAIN
+    direction: str  # BUY_UP, BUY_DOWN, ABSTAIN
     edge: float
     P_model: float
     strike_price: float
@@ -401,24 +401,24 @@ def simulate_schema(
 
         # Signal selection (STEP 6)
         if edge_yes > schema.margin_of_safety and edge_no > schema.margin_of_safety:
-            direction = "BUY_YES" if edge_yes >= edge_no else "BUY_NO"
+            direction = "BUY_UP" if edge_yes >= edge_no else "BUY_DOWN"
             edge = max(edge_yes, edge_no)
         elif edge_yes > schema.margin_of_safety:
-            direction = "BUY_YES"
+            direction = "BUY_UP"
             edge = edge_yes
         else:
-            direction = "BUY_NO"
+            direction = "BUY_DOWN"
             edge = edge_no
 
         result.signals_generated += 1
-        if direction == "BUY_YES":
+        if direction == "BUY_UP":
             result.signals_buy_yes += 1
         else:
             result.signals_buy_no += 1
 
         # Determine outcome
         actual_outcome = epoch.outcome or "UNKNOWN"
-        if direction == "BUY_YES":
+        if direction == "BUY_UP":
             won = (actual_outcome == "YES")
             # PnL: buy at 0.50, settle at 1.00 if win, 0.00 if loss
             pnl_pct = 100.0 if won else -100.0

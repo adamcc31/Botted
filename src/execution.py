@@ -172,14 +172,14 @@ class ExecutionClient:
         signal = approved_bet.signal
 
         # Determine token
-        token_key = "YES" if signal.signal == "BUY_YES" else "NO"
+        token_key = "YES" if signal.signal == "BUY_UP" else "NO"
         token_id = active_market.clob_token_ids.get(token_key, "")
 
         if not token_id:
             return OrderRejected(reason="MISSING_TOKEN_ID")
 
         # ── Maker vs taker-like pricing ────────────────────────
-        if signal.signal == "BUY_YES":
+        if signal.signal == "BUY_UP":
             clob_ask = signal.clob_yes_ask
             clob_bid = signal.clob_yes_bid
             edge = signal.edge_yes

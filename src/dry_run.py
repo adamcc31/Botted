@@ -126,7 +126,7 @@ class DryRunEngine:
         if "SPREAD_FILTER_SKIP" in str(signal.abstain_reason):
             signal_type_str = "SKIP"
             
-        entry_odds = signal.clob_yes_ask if signal_type_str == "BUY_YES" else signal.clob_no_ask
+        entry_odds = signal.clob_yes_ask if signal_type_str == "BUY_UP" else signal.clob_no_ask
             
         async with self._db.engine.begin() as conn:
             await conn.execute(text("""
@@ -181,7 +181,7 @@ class DryRunEngine:
             if entry_price_override is not None
             else (
                 signal.clob_yes_ask
-                if signal.signal == "BUY_YES"
+                if signal.signal == "BUY_UP"
                 else signal.clob_no_ask
             )
         )
@@ -244,9 +244,9 @@ class DryRunEngine:
         """
         # Determine outcome
         won = (
-            (trade.signal_type == "BUY_YES" and btc_at_resolution > trade.strike_price)
+            (trade.signal_type == "BUY_UP" and btc_at_resolution > trade.strike_price)
             or
-            (trade.signal_type == "BUY_NO" and btc_at_resolution <= trade.strike_price)
+            (trade.signal_type == "BUY_DOWN" and btc_at_resolution <= trade.strike_price)
         )
 
         outcome = "WIN" if won else "LOSS"
@@ -337,8 +337,8 @@ class DryRunEngine:
         brier = self._compute_brier_score()
 
         # Mean edges
-        yes_trades = [t for t in trades if t.signal_type == "BUY_YES"]
-        no_trades = [t for t in trades if t.signal_type == "BUY_NO"]
+        yes_trades = [t for t in trades if t.signal_type == "BUY_UP"]
+        no_trades = [t for t in trades if t.signal_type == "BUY_DOWN"]
         mean_edge_yes = np.mean([t.edge_yes for t in yes_trades]) if yes_trades else 0.0
         mean_edge_no = np.mean([t.edge_no for t in no_trades]) if no_trades else 0.0
         mean_ttr = np.mean([t.TTR_at_entry for t in trades]) if trades else 0.0

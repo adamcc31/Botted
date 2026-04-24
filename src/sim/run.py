@@ -290,7 +290,7 @@ async def run_backtest(
 
     pending: List[Tuple[Any, datetime, float]] = []
     # pending items: (PaperTrade, T_resolution_dt, btc_at_resolution)
-    signal_counts: Dict[str, int] = {"BUY_YES": 0, "BUY_NO": 0, "ABSTAIN": 0}
+    signal_counts: Dict[str, int] = {"BUY_UP": 0, "BUY_DOWN": 0, "ABSTAIN": 0}
     abstain_reason_counts: Dict[str, int] = {}
 
     for row in df.iter_rows(named=True):

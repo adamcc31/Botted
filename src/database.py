@@ -131,7 +131,7 @@ class SignalRecord(Base):
     timestamp_utc: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     signal_type: Mapped[str] = mapped_column(
         String, nullable=False
-    )  # BUY_YES | BUY_NO | ABSTAIN
+    )  # BUY_UP | BUY_DOWN | ABSTAIN
     abstain_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     p_model: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     edge_yes: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

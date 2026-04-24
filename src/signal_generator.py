@@ -7,7 +7,7 @@ Decision Flow:
   STEP 3: Liquidity Filter (CLOB depth + vig + staleness)
   STEP 4: Mispricing Calculation (edge_yes, edge_no)
   STEP 5: Margin of Safety Check (edge > threshold)
-  STEP 6: Final Signal Selection (BUY_YES / BUY_NO / ABSTAIN)
+  STEP 6: Final Signal Selection (BUY_UP / BUY_DOWN / ABSTAIN)
 """
 
 from __future__ import annotations
@@ -341,11 +341,11 @@ class SignalGenerator:
         # ── STEP 6: FINAL SIGNAL SELECTION ───────────────────
         if edge_yes > margin and edge_no > margin:
             # Both edges positive — pick larger
-            signal = "BUY_YES" if edge_yes >= edge_no else "BUY_NO"
+            signal = "BUY_UP" if edge_yes >= edge_no else "BUY_DOWN"
         elif edge_yes > margin:
-            signal = "BUY_YES"
+            signal = "BUY_UP"
         else:
-            signal = "BUY_NO"
+            signal = "BUY_DOWN"
 
         logger.info(
             "signal_generated",

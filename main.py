@@ -144,6 +144,7 @@ class TradingBot:
             self._config.get("telegram.heartbeat_minutes", 15.0)
         )
         self._post_mortem_tracker = {}
+        self._active_bets: dict[str, object] = {}  # market_id → active SignalResult
 
     async def _send_telegram(self, title: str, message: str) -> None:
         """Telegram send helper (never raises)."""
@@ -209,8 +210,8 @@ class TradingBot:
         """Fetch signal aggregation metrics from SQLite for Telegram reporting."""
         summary = {
             "Total Signals": 0,
-            "BUY_YES": 0,
-            "BUY_NO": 0,
+            "BUY_UP": 0,
+            "BUY_DOWN": 0,
             "ABSTAIN": 0,
             "SKIP": 0,
             "SKIP (Spread)": 0,
@@ -761,6 +762,43 @@ class TradingBot:
         self._latest_signal = signal
         await self._dry_run.record_signal(signal)
 
+        # ── ONE-BET-PER-MARKET RULE ───────────────────────────
+        # Only one active position/pending signal per market_id.
+        m_id = market.market_id
+        if signal.signal != "ABSTAIN" and m_id in self._active_bets:
+            existing = self._active_bets[m_id]
+            # Keep the signal with higher P_model confidence
+            existing_conf = existing.P_model if hasattr(existing, 'P_model') else 0.0
+            new_conf = signal.P_model
+            if new_conf <= existing_conf:
+                logger.info(
+                    "one_bet_rule_blocked",
+                    market_id=m_id,
+                    blocked_signal=signal.signal,
+                    blocked_p_model=round(new_conf, 4),
+                    active_signal=existing.signal if hasattr(existing, 'signal') else 'UNKNOWN',
+                    active_p_model=round(existing_conf, 4),
+                    reason="one_bet_per_market",
+                )
+                # Record blocked signal to SQLite for analysis
+                from src.schemas import SignalResult
+                blocked = signal.model_copy(update={
+                    "signal": "ABSTAIN",
+                    "abstain_reason": "BLOCKED_ONE_BET",
+                })
+                await self._dry_run.record_signal(blocked)
+                return
+            else:
+                # New signal is stronger — replace active bet
+                logger.info(
+                    "one_bet_rule_replaced",
+                    market_id=m_id,
+                    new_signal=signal.signal,
+                    new_p_model=round(new_conf, 4),
+                    replaced_signal=existing.signal if hasattr(existing, 'signal') else 'UNKNOWN',
+                    replaced_p_model=round(existing_conf, 4),
+                )
+
         # ── Post-Mortem Aggregator ────────────────────────────
         if signal.signal == "ABSTAIN":
             m_id = market.market_id
@@ -791,9 +829,9 @@ class TradingBot:
             logger.warning("live_verification_failed_clob_unavailable")
             return
 
-        real_best_ask = fresh_clob.yes_ask if signal.signal == "BUY_YES" else fresh_clob.no_ask
-        synthetic_edge = signal.edge_yes if signal.signal == "BUY_YES" else signal.edge_no
-        p_outcome = signal.P_model if signal.signal == "BUY_YES" else (1.0 - signal.P_model)
+        real_best_ask = fresh_clob.yes_ask if signal.signal == "BUY_UP" else fresh_clob.no_ask
+        synthetic_edge = signal.edge_yes if signal.signal == "BUY_UP" else signal.edge_no
+        p_outcome = signal.P_model if signal.signal == "BUY_UP" else (1.0 - signal.P_model)
         live_edge = p_outcome - signal.uncertainty_u - real_best_ask
         edge_deviation = abs(synthetic_edge - live_edge)
 
@@ -823,7 +861,7 @@ class TradingBot:
         signal.live_edge = live_edge
         
         # Override CLOB prices in signal to ensure Kelly uses real_best_ask
-        if signal.signal == "BUY_YES":
+        if signal.signal == "BUY_UP":
             signal.clob_yes_ask = real_best_ask
         else:
             signal.clob_no_ask = real_best_ask
@@ -844,6 +882,7 @@ class TradingBot:
         if self._mode == "dry-run":
             trade = self._dry_run.simulate_trade(signal, approved, market)
             self._discovery.mark_trade_executed()
+            self._active_bets[market.market_id] = signal  # Register active bet
 
             # Telegram: trade opened (paper order).
             asyncio.create_task(
@@ -893,7 +932,7 @@ class TradingBot:
             if fill_price is None:
                 fill_price = (
                     signal.clob_yes_ask
-                    if signal.signal == "BUY_YES"
+                    if signal.signal == "BUY_UP"
                     else signal.clob_no_ask
                 )
 
@@ -978,6 +1017,9 @@ class TradingBot:
         resolved = await self._dry_run.resolve_trade(trade, price)
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
 
+        # Clear one-bet-per-market lock
+        self._active_bets.pop(trade.market_id, None)
+
         # Telegram: trade resolved (PnL final for this paper/live record).
         asyncio.create_task(
             self._send_telegram(
@@ -1026,7 +1068,7 @@ class TradingBot:
                            reason="chainlink_stale_or_unavailable")
         
         if settlement_price is not None:
-            actual_outcome = "BUY_YES" if settlement_price >= strike_price else "BUY_NO"
+            actual_outcome = "BUY_UP" if settlement_price >= strike_price else "BUY_DOWN"
             
             try:
                 async with self._db.engine.begin() as conn:

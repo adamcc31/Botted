@@ -195,11 +195,11 @@ class RiskManager:
         kelly_floor = self._config.get("risk.kelly_floor_multiplier", 0.25)
 
         # ── Decimal odds from CLOB ────────────────────────────
-        if signal.signal == "BUY_YES":
+        if signal.signal == "BUY_UP":
             clob_ask = signal.clob_yes_ask
             # Conservative probability: subtract uncertainty from the event we bet on.
             p_win = max(0.0, min(1.0, signal.P_model - signal.uncertainty_u))
-        else:  # BUY_NO
+        else:  # BUY_DOWN
             clob_ask = signal.clob_no_ask
             p_win = max(0.0, min(1.0, (1.0 - signal.P_model) - signal.uncertainty_u))
 

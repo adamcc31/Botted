@@ -146,10 +146,10 @@ def build_model_panel(signal: Optional[SignalResult]) -> Panel:
         edge_no_txt += " ■ SIGNAL"
 
     # Signal direction
-    if signal.signal == "BUY_YES":
-        sig_txt = "[bold green]→ BUY_YES[/]"
-    elif signal.signal == "BUY_NO":
-        sig_txt = "[bold blue]→ BUY_NO[/]"
+    if signal.signal == "BUY_UP":
+        sig_txt = "[bold green]→ BUY_UP[/]"
+    elif signal.signal == "BUY_DOWN":
+        sig_txt = "[bold blue]→ BUY_DOWN[/]"
     else:
         reason = signal.abstain_reason or ""
         sig_txt = f"[yellow]→ ABSTAIN ({reason})[/]"

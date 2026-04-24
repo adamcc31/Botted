@@ -173,7 +173,7 @@ class FeatureMetadata(BaseModel):
 class SignalResult(BaseModel):
     """Output of signal evaluation pipeline."""
 
-    signal: Literal["BUY_YES", "BUY_NO", "ABSTAIN"]
+    signal: Literal["BUY_UP", "BUY_DOWN", "ABSTAIN"]
     abstain_reason: Optional[
         Literal[
             "TTR_PHASE",
@@ -287,7 +287,7 @@ class PaperTrade(BaseModel):
     trade_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
     market_id: str
-    signal_type: Literal["BUY_YES", "BUY_NO"]
+    signal_type: Literal["BUY_UP", "BUY_DOWN"]
     entry_price: float
     bet_size: float
     strike_price: float

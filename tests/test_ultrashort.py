@@ -252,7 +252,7 @@ class TestMarketPatterns(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════
 class TestUltraShortSignal(unittest.TestCase):
     def test_buy_yes_with_large_edge(self):
-        """BUY_YES when fair prob >> CLOB ask on ultra-short market."""
+        """BUY_UP when fair prob >> CLOB ask on ultra-short market."""
         cfg = DummyConfig()
         sg = SignalGenerator(cfg)
         now = datetime.now(timezone.utc)
@@ -267,7 +267,7 @@ class TestUltraShortSignal(unittest.TestCase):
         # P_model = 0.70 (from fair_prob), u = 0.03 (ultra-short default)
         res = sg.evaluate(P_model=0.70, uncertainty_u=0.03,
                            clob_state=clob, active_market=market, feature_vector=fv)
-        self.assertEqual(res.signal, "BUY_YES")
+        self.assertEqual(res.signal, "BUY_UP")
         # Edge should be: 0.70 - 0.30 - 0.03 = 0.37 (huge)
         self.assertGreater(res.edge_yes, 0.30)
 

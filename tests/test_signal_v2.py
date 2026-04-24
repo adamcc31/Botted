@@ -143,7 +143,7 @@ class SignalV2Tests(unittest.TestCase):
         fv = make_feature_vector(now, market_id, current_price=100.0, ttr_minutes=7.0)
 
         res = sg.evaluate(P_model=0.70, uncertainty_u=0.02, clob_state=clob, active_market=active, feature_vector=fv)
-        self.assertEqual(res.signal, "BUY_YES")
+        self.assertEqual(res.signal, "BUY_UP")
 
     def test_basis_risk_halt_when_non_binance_near_resolution(self):
         cfg = DummyConfig()
