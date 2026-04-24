@@ -1,0 +1,16 @@
+polars==1.39.3
+python-binance==1.0.36
+py-clob-client==0.34.6
+numpy==2.2.3
+pandas==2.2.3
+dateparser==1.4.0
+tzlocal==5.3.1
+python-dotenv==1.0.1
+click==8.1.7
+requests==2.32.3
+structlog==25.5.0
+rich==14.3.3
+sqlalchemy==2.0.49
+aiosqlite==0.22.1
+httpx>=0.28.0
+pydantic>=2.12.0

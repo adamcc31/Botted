@@ -1,0 +1,132 @@
+{
+  "_comment": "Edit via CLI atau langsung. Tidak perlu restart container.",
+  "_version": "1.0.0",
+  "regime": {
+    "vol_lower_threshold": 0.15,
+    "vol_upper_threshold": 0.8,
+    "binance_spread_max_bps": 15.0,
+    "binance_min_depth_btc": 0.5
+  },
+  "dual_feed": {
+    "rtds_ws_url": "wss://ws-live-data.polymarket.com",
+    "spread_threshold_normal_pct": 0.03,
+    "spread_threshold_elevated_pct": 0.08,
+    "rolling_window_seconds": 60,
+    "stale_threshold_seconds": 10,
+    "reconnect_max_retries": 10,
+    "reconnect_initial_delay_s": 1,
+    "reconnect_max_delay_s": 30
+  },
+  "signal": {
+    "margin_of_safety": 0.02,
+    "ttr_min_minutes": 5.0,
+    "ttr_max_minutes": 12.0,
+    "dynamic_ttr_enabled": true,
+    "entry_window_short_min_minutes": 5.0,
+    "entry_window_short_max_minutes": 60.0,
+    "entry_window_medium_min_minutes": 30.0,
+    "entry_window_medium_max_minutes": 240.0,
+    "entry_window_long_min_minutes": 60.0,
+    "entry_window_long_max_minutes": 720.0,
+    "probability_source": "fair",
+    "hybrid_fair_weight": 0.7,
+    "hybrid_model_weight": 0.3,
+    "no_trade_deadband": 0.00,
+    "min_ttr_minutes": 1.5
+  },
+  "clob": {
+    "min_depth_usd": 10.0,
+    "max_market_vig": 0.07,
+    "stale_threshold_seconds": 30,
+    "poll_interval_seconds": 5,
+    "max_consecutive_404": 3
+  },
+  "risk": {
+    "kelly_divisor": 2,
+    "max_bet_fraction": 0.1,
+    "min_bet_usd": 1.0,
+    "daily_loss_limit_pct": 0.90,
+    "session_loss_limit_pct": 0.90,
+    "consecutive_loss_multiplier": 0.15,
+    "kelly_floor_multiplier": 0.25,
+    "max_buy_price": 0.75,
+    "live_edge_tolerance": 0.05
+  },
+  "dry_run": {
+    "pass_win_rate": 0.53,
+    "pass_profit_factor": 1.1,
+    "pass_dry_run_score": 0.7,
+    "pass_max_drawdown": -0.15,
+    "min_trades_per_session": 10,
+    "go_live_consecutive_pass": 5,
+    "go_live_min_total_trades": 100,
+    "abort_consecutive_fail": 3,
+    "abort_win_rate_threshold": 0.48,
+    "abort_consecutive_losses": 6,
+    "max_duration_hours": 48,
+    "abstain_summary_every_signals": 25
+  },
+  "model": {
+    "retrain_win_rate_trigger": 0.5,
+    "retrain_brier_trigger": 0.245,
+    "retrain_consecutive_sessions": 2,
+    "ensemble_lgbm_weight": 0.7,
+    "ensemble_logreg_weight": 0.3,
+    "calibration_method": "isotonic"
+  },
+  "observability": {
+    "ws_drop_rate_warning_threshold": 0.001,
+    "ws_drop_rate_error_threshold": 0.005,
+    "ws_latency_warning_ms": 2000,
+    "clob_poll_interval_seconds": 5,
+    "feature_compute_lag_warning_ms": 500
+  },
+  "binance": {
+    "ws_base_url": "wss://stream.binance.com:9443/stream",
+    "rest_base_url": "https://api.binance.com",
+    "buffer_capacity": 500,
+    "stale_threshold_s": 30,
+    "max_retries": 10,
+    "initial_delay_s": 1,
+    "backoff_multiplier": 2,
+    "max_delay_s": 60
+  },
+  "market_discovery": {
+    "poll_interval_s": 30,
+    "waiting_poll_s": 60,
+    "min_ttr_to_discover": 2.0,
+    "late_ttr_minutes": 0.5,
+    "rotation_ttr_buffer_minutes": 2.0,
+    "tag_slug": "bitcoin",
+    "min_volume_24hr": 50000.0,
+    "strike_distance_soft_cap_pct": 0.2,
+    "strike_distance_hard_cap_pct": 0.5,
+    "hard_penalty_absurd_strike": 0.3,
+    "target_ttr_minutes": 5.0,
+    "target_horizons_minutes": [
+      5.0
+    ],
+    "weight_volume": 0.40,
+    "weight_prob": 0.25,
+    "weight_ttr": 0.20,
+    "weight_strike": 0.10,
+    "weight_horizon": 0.05
+  },
+  "rotation": {
+    "min_dwell_minutes": 3.0,
+    "freeze_when_in_entry_window": true,
+    "cooldown_after_trade_minutes": 2.0
+  },
+  "execution": {
+    "taker_edge_threshold": 0.04
+  },
+  "fair_prob": {
+    "base_uncertainty_p": 0.02,
+    "near_expiry_u_boost": 0.10
+  },
+  "telegram": {
+    "enabled": true,
+    "timeout_seconds": 10.0,
+    "report_interval_hours": 2.0
+  }
+}

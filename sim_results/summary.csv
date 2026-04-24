@@ -1,0 +1,4 @@
+schema,total_epochs,signals,buy_yes,buy_no,wins,losses,win_rate,avg_edge,total_pnl_pct,spread_rejections,margin_rejections,margin_of_safety,spread_max_bps,uncertainty_multiplier
+A_Conservative,72,8,2,6,4,4,0.5000,0.064820,0.00,0,64,0.05,5.0,1.0
+B_Balanced_HFT,72,16,2,14,9,7,0.5625,0.055895,200.00,0,56,0.03,10.0,0.8
+C_Aggressive,72,32,4,28,19,13,0.5938,0.044677,600.00,0,40,0.02,15.0,0.6

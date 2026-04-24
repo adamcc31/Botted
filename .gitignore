@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Binary Data Files (Large)
+*.parquet
+*.h5
+*.feather
+*.pkl
+
+# Strategy Logs & Telemetry
+logs/*.log
+logs/*.csv
+tmp_tokens.txt
+
+# Large Dataset Folders
+data/
+raw_data/
+processed_data/
+results/
+models/
+
+# VS Code / OS files
+.vscode/
+.DS_Store
+Thumbs.db
+
+#example project
+example_project
