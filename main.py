@@ -414,6 +414,7 @@ class TradingBot:
             asyncio.create_task(self._binance.start(), name="binance_feed"),
             asyncio.create_task(self._dual_feed.start(), name="dual_feed_rtds"),
             asyncio.create_task(self._discovery.start(), name="market_discovery"),
+            asyncio.create_task(self._clob.start(), name="clob_ws_loop"),
             asyncio.create_task(self._run_clob_loop(), name="clob_feed"),
             asyncio.create_task(self._run_dashboard(), name="dashboard"),
             asyncio.create_task(

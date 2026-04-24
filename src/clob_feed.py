@@ -8,12 +8,15 @@ Constructs CLOBState with liquidity metrics and vig calculation.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict
 
 import httpx
 import structlog
+import websockets
+from websockets.exceptions import ConnectionClosed
 
 from src.config_manager import ConfigManager
 from src.schemas import ActiveMarket, CLOBState
@@ -29,6 +32,7 @@ class CLOBFeed:
     """
 
     CLOB_BASE_URL = "https://clob.polymarket.com"
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
@@ -51,6 +55,14 @@ class CLOBFeed:
         self._last_fetch_time: float = 0.0
         self._stale_event_count: int = 0
         self._running = False
+        
+        # WebSocket / Cache State
+        self._cached_books: Dict[str, dict] = {}
+        self._last_fetch_time_per_token: Dict[str, float] = {}
+        self._rest_rate_limit_s = 2.0
+        self._active_tokens: set[str] = set()
+        self._ws_connection: Optional[websockets.WebSocketClientProtocol] = None
+        self._ws_task: Optional[asyncio.Task] = None
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -78,29 +90,64 @@ class CLOBFeed:
 
     # ── Polling Loop ──────────────────────────────────────────
 
-    async def start(self, market: ActiveMarket) -> None:
-        """Start polling loop for given market."""
+    async def start(self, market: Optional[ActiveMarket] = None) -> None:
+        """Start WebSocket loop."""
         self._running = True
-        logger.info(
-            "clob_feed_started",
-            market_id=market.market_id,
-            poll_interval=self._poll_interval,
-        )
-
-        while self._running:
-            try:
-                state = await self.fetch_clob_snapshot(market)
-                if state:
-                    self._cached_state = state
-                    self._last_fetch_time = time.time()
-            except Exception as e:
-                logger.error("clob_feed_loop_error", error=str(e))
-
-            await asyncio.sleep(self._poll_interval)
+        logger.info("clob_ws_started", url=self.WS_URL)
+        
+        if not self._ws_task or self._ws_task.done():
+            self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def stop(self) -> None:
         self._running = False
-        logger.info("clob_feed_stopped")
+        if self._ws_connection:
+            await self._ws_connection.close()
+        logger.info("clob_ws_stopped")
+
+    async def _ws_loop(self) -> None:
+        """Background loop to receive push data from CLOB WebSocket."""
+        while self._running:
+            if not self._active_tokens:
+                await asyncio.sleep(1)
+                continue
+                
+            try:
+                async with websockets.connect(
+                    self.WS_URL,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    close_timeout=5,
+                ) as ws:
+                    self._ws_connection = ws
+                    logger.info("clob_ws_connected", tokens=list(self._active_tokens))
+                    
+                    sub_msg = {"auth": {}, "type": "MARKET", "assets_ids": list(self._active_tokens)}
+                    await ws.send(json.dumps(sub_msg))
+                    
+                    async for raw_msg in ws:
+                        if not self._running:
+                            break
+                        
+                        try:
+                            msg = json.loads(raw_msg)
+                            if msg.get("event_type") == "book":
+                                asset = msg.get("asset_id", "")
+                                if asset in self._active_tokens:
+                                    self._cached_books[asset] = msg
+                                    self._last_fetch_time = time.time()
+                        except json.JSONDecodeError:
+                            continue
+                        except Exception as e:
+                            logger.error("clob_ws_message_error", error=str(e))
+                            
+            except (ConnectionClosed, ConnectionError, OSError) as e:
+                logger.warning("clob_ws_disconnected", error=str(e))
+            except Exception as e:
+                logger.error("clob_ws_unexpected_error", error=str(e))
+            
+            self._ws_connection = None
+            if self._running:
+                await asyncio.sleep(2)
 
     # ── Snapshot Fetch ────────────────────────────────────────
 
@@ -118,8 +165,29 @@ class CLOBFeed:
             logger.warning("clob_missing_token_ids", market_id=market.market_id)
             return None
 
-        yes_book = await self._fetch_book(yes_token)
-        no_book = await self._fetch_book(no_token)
+        new_tokens = {yes_token, no_token}
+        if self._active_tokens != new_tokens:
+            logger.info("clob_rotating_market_subscription", old=list(self._active_tokens), new=list(new_tokens))
+            self._active_tokens = new_tokens
+            self._cached_books.clear()
+            if self._ws_connection:
+                # Force reconnect to subscribe to new tokens
+                await self._ws_connection.close()
+                
+        # Get from WS cache first
+        yes_book = self._cached_books.get(yes_token)
+        no_book = self._cached_books.get(no_token)
+        
+        # Fallback to REST initial fetch
+        if not yes_book:
+            yes_book = await self._fetch_book(yes_token)
+            if yes_book:
+                self._cached_books[yes_token] = yes_book
+                
+        if not no_book:
+            no_book = await self._fetch_book(no_token)
+            if no_book:
+                self._cached_books[no_token] = no_book
 
         if not yes_book or not no_book:
             # Use cached state if available, flag as potentially stale
@@ -183,6 +251,14 @@ class CLOBFeed:
             signalling main.py to call force_rediscover().
         All other HTTP or connection errors use the existing exponential backoff retry.
         """
+        # Rate Limiting (2 seconds per token)
+        last_fetch = self._last_fetch_time_per_token.get(token_id, 0.0)
+        if time.time() - last_fetch < self._rest_rate_limit_s:
+            # We skip the fetch if called too recently to avoid 429
+            return None
+            
+        self._last_fetch_time_per_token[token_id] = time.time()
+        
         for attempt in range(self._max_retries):
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
