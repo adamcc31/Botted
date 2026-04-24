@@ -31,6 +31,7 @@ from websockets.exceptions import ConnectionClosed
 
 from src.config_manager import ConfigManager
 from src.schemas import DualFeedSnapshot
+from src.binance_feed import BinanceFeed
 
 logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
 
@@ -48,8 +49,9 @@ class DualFeed:
 
     RTDS_URL = "wss://ws-live-data.polymarket.com"
 
-    def __init__(self, config: ConfigManager) -> None:
+    def __init__(self, config: ConfigManager, binance_feed: BinanceFeed) -> None:
         self._config = config
+        self._binance_feed = binance_feed
         self._rtds_url = config.get("dual_feed.rtds_ws_url", self.RTDS_URL)
         self._rolling_window_s = config.get("dual_feed.rolling_window_seconds", 60)
         self._stale_threshold_s = config.get("dual_feed.stale_threshold_seconds", 10)
@@ -61,9 +63,7 @@ class DualFeed:
         self._backoff_multiplier = 2
 
         # Latest prices
-        self._binance_price: Optional[float] = None
         self._chainlink_price: Optional[float] = None
-        self._binance_ts: float = 0.0
         self._chainlink_ts: float = 0.0
 
         # Rolling window: deque of (timestamp, binance_price, chainlink_price)
@@ -86,8 +86,8 @@ class DualFeed:
 
     @property
     def binance_price_rtds(self) -> Optional[float]:
-        """Binance BTC/USDT price as relayed by RTDS. None if unavailable."""
-        return self._binance_price
+        """Binance BTC/USDT price from direct Binance WS feed."""
+        return self._binance_feed.latest_price
 
     @property
     def is_chainlink_stale(self) -> bool:
@@ -98,10 +98,8 @@ class DualFeed:
 
     @property
     def is_binance_rtds_stale(self) -> bool:
-        """True if RTDS Binance price is missing or hasn't updated within threshold."""
-        if self._binance_price is None or self._binance_ts == 0.0:
-            return True
-        return (time.time() - self._binance_ts) > self._stale_threshold_s
+        """True if direct Binance WS feed is stale."""
+        return self._binance_feed.is_stale
 
     @property
     def is_available(self) -> bool:
@@ -121,13 +119,14 @@ class DualFeed:
         Returns None if either feed is unavailable or stale.
         NO SILENT FALLBACK — caller must handle None explicitly.
         """
-        if self._chainlink_price is None or self._binance_price is None:
+        bp = self._binance_feed.latest_price
+        if self._chainlink_price is None or bp is None:
             return None
-        if self.is_chainlink_stale or self.is_binance_rtds_stale:
+        if self.is_chainlink_stale or self._binance_feed.is_stale:
             return None
 
-        spread = self._binance_price - self._chainlink_price
-        spread_pct = abs(spread / self._chainlink_price) * 100.0
+        spread = bp - self._chainlink_price
+        spread_pct = abs(spread) / self._chainlink_price * 100.0
 
         if abs(spread_pct) < 0.001:
             direction = "CONVERGED"
@@ -138,7 +137,7 @@ class DualFeed:
 
         return DualFeedSnapshot(
             timestamp=datetime.now(timezone.utc),
-            binance_price=self._binance_price,
+            binance_price=bp,
             chainlink_price=self._chainlink_price,
             spread=spread,
             spread_pct=spread_pct,
@@ -255,19 +254,7 @@ class DualFeed:
             self._retry_count = 0
             logger.info("rtds_ws_connected", url=self._rtds_url)
 
-            # Subscribe to both feeds
-            # Feed 1: Binance price via RTDS
-            binance_sub = {
-                "action": "subscribe",
-                "subscriptions": [{
-                    "topic": "crypto_prices",
-                    "type": "update",
-                    "filters": "btcusdt",
-                }],
-            }
-            await ws.send(json.dumps(binance_sub))
-
-            # Feed 2: Chainlink oracle price
+            # Subscribe to Chainlink oracle price
             chainlink_sub = {
                 "action": "subscribe",
                 "subscriptions": [{
@@ -278,7 +265,7 @@ class DualFeed:
             }
             await ws.send(json.dumps(chainlink_sub))
 
-            logger.info("rtds_subscriptions_sent", feeds=["crypto_prices", "crypto_prices_chainlink"])
+            logger.info("rtds_subscriptions_sent", feeds=["crypto_prices_chainlink"])
 
             async for raw_msg in ws:
                 if not self._running:
@@ -341,24 +328,12 @@ class DualFeed:
                     symbol=symbol,
                 )
 
-        elif topic == "crypto_prices":
-            # Binance feed via RTDS
-            if "btcusdt" in symbol or "btc" in symbol or not symbol:
-                self._binance_price = price
-                self._binance_ts = ts
-                self._record_snapshot()
-
-                logger.debug(
-                    "rtds_binance_tick",
-                    price=round(price, 2),
-                    symbol=symbol,
-                )
-
     def _record_snapshot(self) -> None:
         """Record snapshot if both prices are available."""
-        if self._binance_price is not None and self._chainlink_price is not None:
+        bp = self._binance_feed.latest_price
+        if bp is not None and self._chainlink_price is not None:
             self._snapshot_history.append(
-                (time.time(), self._binance_price, self._chainlink_price)
+                (time.time(), bp, self._chainlink_price)
             )
 
     def _compute_backoff_delay(self) -> float:

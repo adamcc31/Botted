@@ -22,7 +22,7 @@ class DualFeedSnapshot(BaseModel):
     """Point-in-time snapshot of Binance vs Chainlink oracle prices."""
 
     timestamp: datetime
-    binance_price: float = Field(..., description="BTC price from RTDS crypto_prices (Binance feed)")
+    binance_price: float = Field(..., description="BTC price from direct Binance WebSocket feed")
     chainlink_price: float = Field(..., description="BTC price from RTDS crypto_prices_chainlink")
     spread: float = Field(..., description="binance_price - chainlink_price (signed)")
     spread_pct: float = Field(

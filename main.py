@@ -126,7 +126,7 @@ class TradingBot:
         self._risk_mgr = RiskManager(self._config)
         self._execution = ExecutionClient(self._config)
         self._fair_prob_engine = FairProbabilityEngine(self._config)
-        self._dual_feed = DualFeed(self._config)
+        self._dual_feed = DualFeed(self._config, self._binance)
         self._spread_filter = SpreadFilter(self._config)
         self._exporter: Exporter | None = None
         self._telegram = TelegramNotifier(self._config)
