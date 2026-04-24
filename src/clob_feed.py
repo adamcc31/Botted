@@ -129,12 +129,19 @@ class CLOBFeed:
                             break
                         
                         try:
-                            msg = json.loads(raw_msg)
-                            if msg.get("event_type") == "book":
-                                asset = msg.get("asset_id", "")
-                                if asset in self._active_tokens:
-                                    self._cached_books[asset] = msg
-                                    self._last_fetch_time = time.time()
+                            raw = json.loads(raw_msg)
+                            events = raw if isinstance(raw, list) else [raw]
+                            
+                            for event in events:
+                                if not isinstance(event, dict):
+                                    continue
+                                event_type = event.get("event_type") or event.get("type")
+                                if event_type == "book":
+                                    token_id = event.get("asset_id")
+                                    if token_id and token_id in self._active_tokens:
+                                        self._cached_books[token_id] = event
+                                        self._last_fetch_time = time.time()
+                                        logger.info("clob_book_updated", source="websocket", token_id=token_id[:16])
                         except json.JSONDecodeError:
                             continue
                         except Exception as e:
