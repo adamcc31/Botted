@@ -170,6 +170,7 @@ class SignalRecord(Base):
     actual_outcome: Mapped[Optional[str]] = mapped_column(String, default="PENDING")
     settlement_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     settlement_price_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    oracle_source: Mapped[Optional[str]] = mapped_column(String, nullable=True) # LIVE | CACHED | UNAVAILABLE
 
     model_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     mode: Mapped[str] = mapped_column(String, nullable=False)  # DRY | LIVE

@@ -54,7 +54,8 @@ class DualFeed:
         self._binance_feed = binance_feed
         self._rtds_url = config.get("dual_feed.rtds_ws_url", self.RTDS_URL)
         self._rolling_window_s = config.get("dual_feed.rolling_window_seconds", 60)
-        self._stale_threshold_s = config.get("dual_feed.stale_threshold_seconds", 10)
+        import os
+        self._stale_threshold_s = int(os.getenv("RTDS_STALE_THRESHOLD_SECONDS", config.get("dual_feed.stale_threshold_seconds", 10)))
 
         # Reconnection parameters
         self._max_retries = config.get("dual_feed.reconnect_max_retries", 10)
@@ -116,14 +117,22 @@ class DualFeed:
         """
         Get current dual-feed snapshot.
 
-        Returns None if either feed is unavailable or stale.
-        NO SILENT FALLBACK — caller must handle None explicitly.
+        Returns None if either feed is unavailable or stale (>60s for Chainlink).
+        Degraded Mode: Allows Chainlink price if stale < 60s.
         """
         bp = self._binance_feed.latest_price
         if self._chainlink_price is None or bp is None:
             return None
-        if self.is_chainlink_stale or self._binance_feed.is_stale:
+        
+        # Binance must be live
+        if self._binance_feed.is_stale:
             return None
+
+        age = time.time() - self._chainlink_ts
+        if age >= 60.0:
+            return None
+
+        source = "CHAINLINK_LIVE" if age <= self._stale_threshold_s else "CHAINLINK_CACHED"
 
         spread = bp - self._chainlink_price
         spread_pct = abs(spread) / self._chainlink_price * 100.0
@@ -142,6 +151,7 @@ class DualFeed:
             spread=spread,
             spread_pct=spread_pct,
             spread_direction=direction,
+            oracle_source=source
         )
 
     def get_oracle_price(self) -> Optional[float]:
@@ -154,6 +164,26 @@ class DualFeed:
         if self.is_chainlink_stale:
             return None
         return self._chainlink_price
+
+    def get_oracle_price_with_source(self) -> Tuple[Optional[float], str]:
+        """
+        Get oracle price and its source (LIVE, CACHED, or UNAVAILABLE).
+        
+        Degraded Mode: If stale < 60s, use cached price.
+        """
+        if self._chainlink_price is None or self._chainlink_ts == 0.0:
+            return None, "UNAVAILABLE"
+            
+        age = time.time() - self._chainlink_ts
+        
+        if age <= self._stale_threshold_s:
+            return self._chainlink_price, "CHAINLINK_LIVE"
+            
+        if age < 60.0:
+            logger.warning("using_cached_chainlink", age_seconds=round(age, 2))
+            return self._chainlink_price, "CHAINLINK_CACHED"
+            
+        return None, "UNAVAILABLE"
 
     def get_rolling_spread_stats(self) -> dict:
         """
@@ -205,6 +235,9 @@ class DualFeed:
         self._running = True
         self._retry_count = 0
 
+        # Start heartbeat monitor
+        heartbeat_task = asyncio.create_task(self._heartbeat_monitor(), name="rtds_heartbeat")
+
         while self._running:
             try:
                 await self._connect_and_listen()
@@ -233,6 +266,29 @@ class DualFeed:
                 if not self._running:
                     break
                 await asyncio.sleep(5.0)
+        
+        heartbeat_task.cancel()
+
+    async def _heartbeat_monitor(self) -> None:
+        """Monitor for silent hangs (WebSocket connected but no data)."""
+        heartbeat_interval = 15  # seconds
+        while self._running:
+            await asyncio.sleep(heartbeat_interval)
+            if self._chainlink_ts == 0.0:
+                continue
+            
+            age = time.time() - self._chainlink_ts
+            # Stale lebih dari 3x threshold = silent hang
+            if age > self._stale_threshold_s * 3:
+                logger.warning(
+                    "rtds_silent_hang_detected",
+                    age_seconds=round(age, 2),
+                    threshold_seconds=self._stale_threshold_s,
+                    action="forcing_reconnect",
+                )
+                if self._ws_connection:
+                    await self._ws_connection.close()
+                    # Reconnect will be handled by the loop in start()
 
     async def stop(self) -> None:
         """Stop RTDS WebSocket gracefully."""
@@ -246,8 +302,8 @@ class DualFeed:
         """Establish RTDS WebSocket connection, subscribe, and process messages."""
         async with websockets.connect(
             self._rtds_url,
-            ping_interval=20,
-            ping_timeout=10,
+            ping_interval=30,  # Heartbeat every 30s
+            ping_timeout=10,   # Reconnect if pong not received in 10s
             close_timeout=5,
         ) as ws:
             self._ws_connection = ws

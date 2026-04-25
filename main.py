@@ -430,6 +430,14 @@ class TradingBot:
             else:
                 logger.info("live_preflight_ready")
 
+        # Register signal handlers for graceful shutdown
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda: asyncio.create_task(self._graceful_shutdown())
+            )
+
         # Register bar close and price update callbacks
         self._binance.set_on_bar_close(self._on_bar_close)
         self._binance.set_on_price_update(self._on_binance_price_update)
@@ -463,6 +471,30 @@ class TradingBot:
         except asyncio.CancelledError:
             logger.info("bot_shutting_down")
         finally:
+            await self.stop()
+
+    async def _graceful_shutdown(self) -> None:
+        """Graceful shutdown triggered by signal with timeout guard."""
+        if self._stopping:
+            return
+            
+        logger.info("graceful_shutdown_triggered")
+        self._stop_reason = "SIGTERM_RECEIVED"
+        
+        try:
+            async with asyncio.timeout(25):  # 25 seconds, 5 seconds buffer for Railway
+                await self.stop()
+                logger.info("graceful_shutdown_complete")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "graceful_shutdown_timeout",
+                note="Shutdown sequence exceeded 25s; Railway may kill process soon."
+            )
+            # Ensure stop() is called even if it partially timed out, 
+            # though stop() itself might be what timed out.
+            await self.stop()
+        except Exception as e:
+            logger.error("graceful_shutdown_error", error=str(e))
             await self.stop()
 
     async def stop(self) -> None:
@@ -616,7 +648,7 @@ class TradingBot:
         # Requirement: oracle snapshot is taken ONCE at the start of
         # the pipeline and reused for all downstream computations.
         dual_snapshot = self._dual_feed.get_snapshot()
-        oracle_price = self._dual_feed.get_oracle_price()
+        oracle_price, oracle_source = self._dual_feed.get_oracle_price_with_source()
 
         # ── SPREAD FILTER GATE ────────────────────────────────
         # Must run BEFORE feature/fair_prob computation.
@@ -626,7 +658,7 @@ class TradingBot:
         if spread_result.recommendation == "SKIP":
             skip_signal = SignalResult(
                 signal="ABSTAIN",
-                abstain_reason="SPREAD_FILTER_SKIP" if dual_snapshot is None
+                abstain_reason="ORACLE_UNAVAILABLE" if oracle_source == "UNAVAILABLE"
                     else "SPREAD_FILTER_SKIP",
                 P_model=0.5,
                 uncertainty_u=1.0,
@@ -646,6 +678,7 @@ class TradingBot:
                 spread_filter_passed=False,
                 spread_filter_reason=spread_result.reason,
                 entry_odds_source=entry_odds_source,
+                oracle_source=oracle_source,
             )
             skip_signal.binance_price_at_signal = self._binance.latest_price
             logger.warning(
@@ -821,6 +854,7 @@ class TradingBot:
         signal.spread_filter_reason = spread_result.reason
         signal.strike_price_source = "GAMMA"  # strike always from Gamma API
         signal.odds_source = "CLOB"  # odds always from CLOB order book
+        signal.oracle_source = oracle_source
 
         if entry_odds_source == "DEFAULT_FALLBACK":
             blocked = SignalResult(

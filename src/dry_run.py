@@ -140,7 +140,7 @@ class DryRunEngine:
                     entry_odds, theoretical_pnl, signal_correct, actual_outcome, mode,
                     obi_value, tfm_norm, rv_value, vol_percentile, depth_ratio,
                     strike_distance_pct, contest_urgency, odds_yes_60s_ago,
-                    odds_delta_60s, btc_return_1m, confidence_bucket, entry_odds_source
+                    odds_delta_60s, btc_return_1m, confidence_bucket, entry_odds_source, oracle_source
                 ) VALUES (
                     :signal_id, :session_id, :market_id, :timestamp_utc, :signal_type,
                     :abstain_reason, :p_model, :clob_yes_ask, :clob_no_ask,
@@ -149,7 +149,7 @@ class DryRunEngine:
                     :entry_odds, :theoretical_pnl, 'PENDING', 'PENDING', 'DRY',
                     :obi_value, :tfm_norm, :rv_value, :vol_percentile, :depth_ratio,
                     :strike_distance_pct, :contest_urgency, :odds_yes_60s_ago,
-                    :odds_delta_60s, :btc_return_1m, :confidence_bucket, :entry_odds_source
+                    :odds_delta_60s, :btc_return_1m, :confidence_bucket, :entry_odds_source, :oracle_source
                 )
             """), {
                 "signal_id": str(uuid.uuid4()),
@@ -183,6 +183,7 @@ class DryRunEngine:
                 "btc_return_1m": ml_features.get("btc_return_1m"),
                 "confidence_bucket": ml_features.get("confidence_bucket"),
                 "entry_odds_source": getattr(signal, "entry_odds_source", None),
+                "oracle_source": getattr(signal, "oracle_source", None),
             })
 
     def simulate_trade(

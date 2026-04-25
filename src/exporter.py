@@ -192,7 +192,8 @@ class Exporter:
                         odds_delta_60s,
                         btc_return_1m,
                         confidence_bucket,
-                        entry_odds_source
+                        entry_odds_source,
+                        oracle_source
                     FROM signals 
                     WHERE session_id = :session_id
                     ORDER BY timestamp_utc ASC

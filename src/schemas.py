@@ -37,6 +37,9 @@ class DualFeedSnapshot(BaseModel):
         default=False,
         description="True if snapshot data is stale. Always False when freshly created by DualFeed.get_snapshot().",
     )
+    oracle_source: Optional[Literal["CHAINLINK_LIVE", "CHAINLINK_CACHED", "UNAVAILABLE"]] = Field(
+        default="CHAINLINK_LIVE", description="Source of oracle price in this snapshot"
+    )
 
 
 class SpreadFilterResult(BaseModel):
@@ -244,6 +247,9 @@ class SignalResult(BaseModel):
     entry_odds_source: Optional[str] = Field(
         default=None, description="Source of entry odds: CLOB_LIVE or DEFAULT_FALLBACK"
     )
+    oracle_source: Optional[Literal["CHAINLINK_LIVE", "CHAINLINK_CACHED", "UNAVAILABLE"]] = Field(
+        default=None, description="Source of oracle price: LIVE, CACHED (degraded mode), or UNAVAILABLE"
+    )
 
 
 # ============================================================
@@ -319,6 +325,7 @@ class PaperTrade(BaseModel):
     spread_filter_reason: Optional[str] = None
     strike_price_source: Optional[str] = None
     odds_source: Optional[str] = None
+    oracle_source: Optional[str] = None
 
     # Filled post-resolution
     btc_at_resolution: Optional[float] = None
