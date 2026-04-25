@@ -538,6 +538,7 @@ class TradingBot:
         Called on each 15-minute bar close.
         Full pipeline: features → model → signal → risk → trade.
         """
+        from src.schemas import SignalResult
         self._dry_run.increment_bars()
 
         # Check if we have an active market
@@ -622,7 +623,6 @@ class TradingBot:
         spread_result = self._spread_filter.check(self._dual_feed)
 
         if spread_result.recommendation == "SKIP":
-            from src.schemas import SignalResult
             skip_signal = SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="SPREAD_FILTER_SKIP" if dual_snapshot is None
@@ -660,7 +660,6 @@ class TradingBot:
             return
 
         if spread_result.recommendation == "WAIT":
-            from src.schemas import SignalResult
             wait_signal = SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="SPREAD_FILTER_WAIT",
@@ -864,7 +863,6 @@ class TradingBot:
                     reason="one_bet_per_market",
                 )
                 # Record blocked signal to SQLite for analysis
-                from src.schemas import SignalResult
                 blocked = signal.model_copy(update={
                     "signal": "ABSTAIN",
                     "abstain_reason": "BLOCKED_ONE_BET",
