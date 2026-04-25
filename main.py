@@ -826,7 +826,7 @@ class TradingBot:
                 abstain_reason="CONTAMINATED_FALLBACK_ODDS",
                 clob_yes_ask=signal.clob_yes_ask,
                 clob_no_ask=signal.clob_no_ask,
-                p_model=signal.p_model,
+                P_model=signal.P_model,
                 TTR_minutes=signal.TTR_minutes,
                 strike_price=signal.strike_price,
                 current_price=signal.current_price,
