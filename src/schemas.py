@@ -186,20 +186,22 @@ class SignalResult(BaseModel):
             "SPREAD_FILTER_SKIP",
             "SPREAD_FILTER_WAIT",
             "ORACLE_UNAVAILABLE",
+            "CONTAMINATED_FALLBACK_ODDS",
+            "BLOCKED_ONE_BET",
         ]
     ] = None
     P_model: float = Field(..., ge=0.0, le=1.0)
-    uncertainty_u: float = Field(
-        ...,
+    uncertainty_u: Optional[float] = Field(
+        default=None,
         ge=0.0,
         description="Probability-point uncertainty buffer used for conservative edge and sizing",
     )
-    edge_yes: float
-    edge_no: float
-    clob_yes_bid: float
-    clob_yes_ask: float
-    clob_no_bid: float
-    clob_no_ask: float
+    edge_yes: Optional[float] = None
+    edge_no: Optional[float] = None
+    clob_yes_bid: Optional[float] = None
+    clob_yes_ask: Optional[float] = None
+    clob_no_bid: Optional[float] = None
+    clob_no_ask: Optional[float] = None
     TTR_minutes: float
     strike_price: float
     current_price: float
