@@ -430,8 +430,9 @@ class TradingBot:
             else:
                 logger.info("live_preflight_ready")
 
-        # Register bar close callback
+        # Register bar close and price update callbacks
         self._binance.set_on_bar_close(self._on_bar_close)
+        self._binance.set_on_price_update(self._on_binance_price_update)
 
         # Start concurrent tasks
         tasks = [
@@ -792,12 +793,13 @@ class TradingBot:
             ml_features["btc_return_1m"] = None
 
         # Determine confidence bucket based on ML probability
+        # Determine quantitative confidence bucket for ML features
         confidence_bucket = None
         if p_model is not None:
-            if p_model >= 0.8: confidence_bucket = "HIGH_CONFIDENCE"
-            elif p_model >= 0.6: confidence_bucket = "MEDIUM_CONFIDENCE"
-            elif p_model > 0.4: confidence_bucket = "LOW_CONFIDENCE"
-            else: confidence_bucket = "VERY_LOW"
+            if p_model < 0.30: confidence_bucket = '0-30'
+            elif p_model < 0.50: confidence_bucket = '30-50'
+            elif p_model < 0.70: confidence_bucket = '50-70'
+            else: confidence_bucket = '70-100'
         ml_features["confidence_bucket"] = confidence_bucket
 
         # ── Signal Generation ─────────────────────────────────
@@ -1078,6 +1080,24 @@ class TradingBot:
         self._latest_metrics = self._dry_run.compute_session_metrics(
             self._model.version
         )
+
+    def _on_binance_price_update(self, price: float) -> None:
+        """Handler for real-time Binance price ticks."""
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        self._binance_price_history.append((now, price))
+        
+        # Temporary debug log per user request
+        if len(self._binance_price_history) % 100 == 0:  # Log every 100 ticks to avoid noise
+            logger.debug("binance_price_history_append", 
+                         buffer_size=len(self._binance_price_history), 
+                         price=price, 
+                         ts=now)
+        
+        # Prune > 90s
+        cutoff = now - timedelta(seconds=90)
+        while self._binance_price_history and self._binance_price_history[0][0] < cutoff:
+            self._binance_price_history.popleft()
 
     async def _schedule_resolution(self, trade, market) -> None:
         """Wait for market resolution and settle trade."""
