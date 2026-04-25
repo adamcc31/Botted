@@ -145,6 +145,29 @@ class TradingBot:
         )
         self._post_mortem_tracker = {}
         self._active_bets: dict[str, object] = {}  # market_id → active SignalResult
+        
+        from collections import deque
+        self._odds_history: dict[str, deque] = {}   # per market_id
+        self._binance_price_history: deque = deque()  # global
+
+    def _get_value_n_seconds_ago(
+        self,
+        history: 'deque',
+        seconds: int,
+        tolerance_seconds: int = 30
+    ) -> float | None:
+        """
+        Ambil nilai dari history yang paling mendekati N detik lalu.
+        Return None jika tidak ada entri dalam toleransi waktu.
+        """
+        if not history:
+            return None
+        from datetime import timedelta
+        target = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+        closest = min(history, key=lambda x: abs((x[0] - target).total_seconds()))
+        if abs((closest[0] - target).total_seconds()) > tolerance_seconds:
+            return None
+        return closest[1]
 
     async def _send_telegram(self, title: str, message: str) -> None:
         """Telegram send helper (never raises)."""
@@ -555,6 +578,8 @@ class TradingBot:
 
         clob_state = self._clob.clob_state
         
+        entry_odds_source = "CLOB_LIVE"
+        
         # ── Synthetic CLOB Fallback for Ultra-Short Markets ──
         # Market discovery identifies dynamic 5m markets. If they have no book depth
         # (common in first 60s), we inject a tight synthetic 50/50 book.
@@ -575,6 +600,7 @@ class TradingBot:
                     is_liquid=True,
                     is_stale=False
                 )
+                entry_odds_source = "DEFAULT_FALLBACK"
                 logger.debug("using_synthetic_clob_fallback", market_id=market.market_id)
 
         if not clob_state:
@@ -611,14 +637,16 @@ class TradingBot:
                 clob_no_ask=clob_state.no_ask,
                 TTR_minutes=market.TTR_minutes,
                 strike_price=market.strike_price,
-                current_price=0.0,
+                current_price=self._binance.latest_price or 0.0,
                 strike_distance=0.0,
                 market_id=market.market_id,
                 timestamp=datetime.now(timezone.utc),
                 spread_pct_at_signal=spread_result.spread_pct,
                 spread_filter_passed=False,
                 spread_filter_reason=spread_result.reason,
+                entry_odds_source=entry_odds_source,
             )
+            skip_signal.binance_price_at_signal = self._binance.latest_price
             logger.warning(
                 "spread_filter_blocked_entry",
                 recommendation=spread_result.recommendation,
@@ -628,7 +656,7 @@ class TradingBot:
                 chainlink_stale=self._dual_feed.is_chainlink_stale,
             )
             self._latest_signal = skip_signal
-            await self._dry_run.record_signal(skip_signal)
+            await self._dry_run.record_signal(skip_signal, slug=market.slug)
             return
 
         if spread_result.recommendation == "WAIT":
@@ -646,21 +674,23 @@ class TradingBot:
                 clob_no_ask=clob_state.no_ask,
                 TTR_minutes=market.TTR_minutes,
                 strike_price=market.strike_price,
-                current_price=oracle_price or 0.0,
+                current_price=self._binance.latest_price or 0.0,
                 strike_distance=0.0,
                 market_id=market.market_id,
                 timestamp=datetime.now(timezone.utc),
                 spread_pct_at_signal=spread_result.spread_pct,
                 spread_filter_passed=False,
                 spread_filter_reason=spread_result.reason,
+                entry_odds_source=entry_odds_source,
             )
+            wait_signal.binance_price_at_signal = self._binance.latest_price
             logger.info(
                 "spread_filter_wait",
                 spread_pct=round(spread_result.spread_pct, 4),
                 reason=spread_result.reason,
             )
             self._latest_signal = wait_signal
-            await self._dry_run.record_signal(wait_signal)
+            await self._dry_run.record_signal(wait_signal, slug=market.slug)
             return
 
         # ── Feature Computation ───────────────────────────────
@@ -741,10 +771,42 @@ class TradingBot:
                 uncertainty_u=round(uncertainty_u, 4),
             )
 
+        # ── ML Features Collection ────────────────────────────
+        ml_features = {}
+        if fv:
+            ml_features = dict(zip(fv.feature_names, fv.values))
+            
+        m_id = market.market_id
+        odds_hist = self._odds_history.get(m_id)
+        odds_60s_ago = self._get_value_n_seconds_ago(odds_hist, 60, tolerance_seconds=30)
+        ml_features["odds_yes_60s_ago"] = odds_60s_ago
+        if odds_60s_ago is not None and clob_state:
+            ml_features["odds_delta_60s"] = clob_state.yes_ask - odds_60s_ago
+        else:
+            ml_features["odds_delta_60s"] = None
+
+        btc_60s_ago = self._get_value_n_seconds_ago(self._binance_price_history, 60, tolerance_seconds=30)
+        current_btc = self._binance.latest_price
+        if btc_60s_ago is not None and btc_60s_ago > 0 and current_btc is not None:
+            ml_features["btc_return_1m"] = (current_btc - btc_60s_ago) / btc_60s_ago
+        else:
+            ml_features["btc_return_1m"] = None
+
+        # Determine confidence bucket based on ML probability
+        confidence_bucket = None
+        if p_model is not None:
+            if p_model >= 0.8: confidence_bucket = "HIGH_CONFIDENCE"
+            elif p_model >= 0.6: confidence_bucket = "MEDIUM_CONFIDENCE"
+            elif p_model > 0.4: confidence_bucket = "LOW_CONFIDENCE"
+            else: confidence_bucket = "VERY_LOW"
+        ml_features["confidence_bucket"] = confidence_bucket
+
         # ── Signal Generation ─────────────────────────────────
         signal = self._signal_gen.evaluate(
             p_model, uncertainty_u, clob_state, market, fv
         )
+        
+        signal.entry_odds_source = entry_odds_source
 
         # ── Enrich signal with dual-feed tracking fields ──────
         binance_price_now = self._binance.latest_price
@@ -759,8 +821,29 @@ class TradingBot:
         signal.strike_price_source = "GAMMA"  # strike always from Gamma API
         signal.odds_source = "CLOB"  # odds always from CLOB order book
 
+        if entry_odds_source == "DEFAULT_FALLBACK":
+            blocked = SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="CONTAMINATED_FALLBACK_ODDS",
+                clob_yes_ask=signal.clob_yes_ask,
+                clob_no_ask=signal.clob_no_ask,
+                p_model=signal.p_model,
+                TTR_minutes=signal.TTR_minutes,
+                strike_price=signal.strike_price,
+                current_price=signal.current_price,
+                strike_distance=signal.strike_distance,
+                market_id=signal.market_id,
+                timestamp=signal.timestamp,
+                entry_odds_source=entry_odds_source,
+            )
+            blocked.binance_price_at_signal = self._binance.latest_price
+            self._latest_signal = blocked
+            await self._dry_run.record_signal(blocked, slug=market.slug, ml_features=ml_features)
+            logger.info("signal_skipped_contaminated_fallback", market_id=market.market_id)
+            return
+
         self._latest_signal = signal
-        await self._dry_run.record_signal(signal)
+        await self._dry_run.record_signal(signal, slug=market.slug, ml_features=ml_features)
 
         # ── ONE-BET-PER-MARKET RULE ───────────────────────────
         # Only one active position/pending signal per market_id.
@@ -785,8 +868,9 @@ class TradingBot:
                 blocked = signal.model_copy(update={
                     "signal": "ABSTAIN",
                     "abstain_reason": "BLOCKED_ONE_BET",
+                    "entry_odds_source": entry_odds_source,
                 })
-                await self._dry_run.record_signal(blocked)
+                await self._dry_run.record_signal(blocked, slug=market.slug, ml_features=ml_features)
                 return
             else:
                 # New signal is stronger — replace active bet
@@ -977,7 +1061,7 @@ class TradingBot:
                 )
 
         # Check abort conditions
-        abort = self._dry_run.check_abort_conditions()
+        abort = self._dry_run.check_abort_conditions(mode=self._mode)
         if abort:
             logger.critical("session_abort", reason=abort)
             self._stop_reason = abort
@@ -1079,6 +1163,14 @@ class TradingBot:
                                 WHEN signal_type = :actual_outcome THEN 'TRUE'
                                 WHEN signal_type IN ('SKIP', 'ABSTAIN') THEN 'N/A'
                                 ELSE 'FALSE'
+                            END,
+                            theoretical_pnl = CASE
+                                WHEN signal_type IN ('BUY_UP', 'BUY_DOWN') THEN
+                                    CASE 
+                                        WHEN signal_type = :actual_outcome THEN ROUND((1.0 / NULLIF(entry_odds, 0)) - 1.0, 4)
+                                        ELSE -1.0
+                                    END
+                                ELSE 0.0
                             END,
                             settlement_price = :settlement_price,
                             settlement_price_source = :price_source
@@ -1219,6 +1311,17 @@ class TradingBot:
                     if state:
                         self._clob._cached_state = state
                         self._clob._last_fetch_time = __import__("time").time()
+                        
+                        from datetime import datetime, timezone, timedelta
+                        now = datetime.now(timezone.utc)
+                        m_id = market.market_id
+                        if m_id not in self._odds_history:
+                            self._odds_history[m_id] = __import__("collections").deque()
+                        self._odds_history[m_id].append((now, state.yes_ask))
+                        
+                        cutoff = now - timedelta(seconds=90)
+                        while self._odds_history[m_id] and self._odds_history[m_id][0][0] < cutoff:
+                            self._odds_history[m_id].popleft()
                 except Exception as e:
                     logger.error("clob_loop_error", error=str(e))
 

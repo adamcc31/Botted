@@ -145,6 +145,17 @@ class SignalRecord(Base):
     tfm_norm: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     market_vig: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     
+    # ── ML Features ──
+    rv_value: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    depth_ratio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    strike_distance_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    contest_urgency: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    odds_yes_60s_ago: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    odds_delta_60s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    btc_return_1m: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    confidence_bucket: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    entry_odds_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    
     # ── New Tracking Columns ──
     slug: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     strike_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

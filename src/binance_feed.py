@@ -104,6 +104,7 @@ class BinanceFeed:
 
         # Callbacks
         self._on_bar_close: Optional[Callable] = None
+        self._on_price_update: Optional[Callable] = None
 
         # Health metrics
         self._health = WSHealthMetrics()
@@ -157,6 +158,10 @@ class BinanceFeed:
     def set_on_bar_close(self, callback: Callable) -> None:
         """Register callback for bar close events."""
         self._on_bar_close = callback
+
+    def set_on_price_update(self, callback: Callable) -> None:
+        """Register callback for price updates (e.g. from aggTrade)."""
+        self._on_price_update = callback
 
     # ── REST Bootstrap ────────────────────────────────────────
 
@@ -390,6 +395,9 @@ class BinanceFeed:
             }
             self._trade_buffer.append(trade)
             self._latest_price = trade["price"]
+            
+            if self._on_price_update:
+                self._on_price_update(self._latest_price)
 
         except (KeyError, ValueError) as e:
             logger.warning("binance_agg_trade_parse_error", error=str(e))

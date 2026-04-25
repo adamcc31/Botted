@@ -180,7 +180,19 @@ class Exporter:
                         1.0 as theoretical_exit_odds,
                         theoretical_pnl,
                         signal_correct,
-                        actual_outcome
+                        actual_outcome,
+                        obi_value,
+                        tfm_norm as tfm_value,
+                        rv_value,
+                        vol_percentile,
+                        depth_ratio,
+                        strike_distance_pct,
+                        contest_urgency,
+                        odds_yes_60s_ago,
+                        odds_delta_60s,
+                        btc_return_1m,
+                        confidence_bucket,
+                        entry_odds_source
                     FROM signals 
                     WHERE session_id = :session_id
                     ORDER BY timestamp_utc ASC

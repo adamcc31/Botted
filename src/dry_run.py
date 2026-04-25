@@ -91,7 +91,9 @@ class DryRunEngine:
 
     # ── Trade Simulation ──────────────────────────────────────
 
-    async def record_signal(self, signal: SignalResult) -> None:
+    async def record_signal(self, signal: SignalResult, slug: str = "", ml_features: dict = None) -> None:
+        if ml_features is None:
+            ml_features = {}
         """Record every signal evaluation (including ABSTAIN)."""
         self._signals_evaluated += 1
         if signal.signal == "ABSTAIN":
@@ -135,13 +137,19 @@ class DryRunEngine:
                     abstain_reason, p_model, clob_yes_ask, clob_no_ask,
                     ttr_minutes, slug, strike_price, binance_price, chainlink_price,
                     spread_pct, spread_filter_passed, spread_filter_reason,
-                    entry_odds, theoretical_pnl, signal_correct, actual_outcome, mode
+                    entry_odds, theoretical_pnl, signal_correct, actual_outcome, mode,
+                    obi_value, tfm_norm, rv_value, vol_percentile, depth_ratio,
+                    strike_distance_pct, contest_urgency, odds_yes_60s_ago,
+                    odds_delta_60s, btc_return_1m, confidence_bucket, entry_odds_source
                 ) VALUES (
                     :signal_id, :session_id, :market_id, :timestamp_utc, :signal_type,
                     :abstain_reason, :p_model, :clob_yes_ask, :clob_no_ask,
                     :ttr_minutes, :slug, :strike_price, :binance_price, :chainlink_price,
                     :spread_pct, :spread_filter_passed, :spread_filter_reason,
-                    :entry_odds, :theoretical_pnl, 'PENDING', 'PENDING', 'DRY'
+                    :entry_odds, :theoretical_pnl, 'PENDING', 'PENDING', 'DRY',
+                    :obi_value, :tfm_norm, :rv_value, :vol_percentile, :depth_ratio,
+                    :strike_distance_pct, :contest_urgency, :odds_yes_60s_ago,
+                    :odds_delta_60s, :btc_return_1m, :confidence_bucket, :entry_odds_source
                 )
             """), {
                 "signal_id": str(uuid.uuid4()),
@@ -154,7 +162,7 @@ class DryRunEngine:
                 "clob_yes_ask": signal.clob_yes_ask,
                 "clob_no_ask": signal.clob_no_ask,
                 "ttr_minutes": signal.TTR_minutes,
-                "slug": None, # market_id is logged, we can backfill slug if needed, but the user requested slug. Let's pass it if we have it. Wait, active_market is not passed here.
+                "slug": slug,
                 "strike_price": signal.strike_price,
                 "binance_price": getattr(signal, "binance_price_at_signal", None),
                 "chainlink_price": getattr(signal, "chainlink_price_at_signal", None),
@@ -163,6 +171,18 @@ class DryRunEngine:
                 "spread_filter_reason": getattr(signal, "spread_filter_reason", None),
                 "entry_odds": entry_odds,
                 "theoretical_pnl": 0.0, # Will be calculated during resolve
+                "obi_value": ml_features.get("OBI"),
+                "tfm_norm": ml_features.get("TFM_normalized"),
+                "rv_value": ml_features.get("RV"),
+                "vol_percentile": ml_features.get("vol_percentile"),
+                "depth_ratio": ml_features.get("depth_ratio"),
+                "strike_distance_pct": ml_features.get("strike_distance_pct"),
+                "contest_urgency": ml_features.get("contest_urgency"),
+                "odds_yes_60s_ago": ml_features.get("odds_yes_60s_ago"),
+                "odds_delta_60s": ml_features.get("odds_delta_60s"),
+                "btc_return_1m": ml_features.get("btc_return_1m"),
+                "confidence_bucket": ml_features.get("confidence_bucket"),
+                "entry_odds_source": getattr(signal, "entry_odds_source", None),
             })
 
     def simulate_trade(
@@ -397,20 +417,33 @@ class DryRunEngine:
 
     # ── Abort Conditions ──────────────────────────────────────
 
-    def check_abort_conditions(self) -> Optional[str]:
+    def check_abort_conditions(self, mode: str = "dry-run") -> Optional[str]:
         """Check if session should be aborted."""
         abort_consec_losses = self._config.get("dry_run.abort_consecutive_losses", 6)
 
-        if self._consecutive_losses >= abort_consec_losses:
+        if mode == "live" and self._consecutive_losses >= abort_consec_losses:
             return f"CONSECUTIVE_LOSSES_{self._consecutive_losses}"
 
         # Check cumulative win rate (after 50+ trades)
         trades = self._resolved_trades
         if len(trades) >= 50:
             win_rate = sum(1 for t in trades if t.outcome == "WIN") / len(trades)
-            threshold = self._config.get("dry_run.abort_win_rate_threshold", 0.48)
+            if mode == "live":
+                import os
+                threshold = float(os.getenv("LIVE_WINRATE_STOP_THRESHOLD", "0.48"))
+            else:
+                threshold = self._config.get("dry_run.abort_win_rate_threshold", 0.48)
+                
             if win_rate < threshold:
-                return f"WIN_RATE_BELOW_{threshold}"
+                if mode == "dry-run":
+                    logger.warning("winrate_below_threshold_dry_run_continues",
+                                   current_winrate=round(win_rate, 4),
+                                   threshold=threshold,
+                                   mode="dry-run",
+                                   note="auto-stop disabled in dry-run for data collection")
+                    return None
+                else:
+                    return f"WIN_RATE_BELOW_{threshold}"
 
         return None
 

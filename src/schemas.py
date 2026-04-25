@@ -239,6 +239,9 @@ class SignalResult(BaseModel):
     odds_source: Optional[Literal["CLOB", "ESTIMATED"]] = Field(
         default=None, description="Source of odds — must be CLOB after fix"
     )
+    entry_odds_source: Optional[str] = Field(
+        default=None, description="Source of entry odds: CLOB_LIVE or DEFAULT_FALLBACK"
+    )
 
 
 # ============================================================
