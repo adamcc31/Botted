@@ -859,6 +859,18 @@ class TradingBot:
         signal.odds_source = "CLOB"  # odds always from CLOB order book
         signal.oracle_source = oracle_source
 
+        # Guard: tunggu verifikasi strike selesai (max 15 detik)
+        if not self._discovery.is_strike_verified:
+            for _ in range(15):
+                await asyncio.sleep(1.0)
+                if self._discovery.is_strike_verified:
+                    break
+            if not self._discovery.is_strike_verified:
+                logger.warning("strike_unverified_skipping_record",
+                               market_id=market.market_id,
+                               source=getattr(market, "strike_price_source", None))
+                return  # skip record daripada tulis data corrupt
+
         if entry_odds_source == "DEFAULT_FALLBACK":
             blocked = SignalResult(
                 signal="ABSTAIN",

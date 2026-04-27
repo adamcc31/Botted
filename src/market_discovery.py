@@ -104,6 +104,7 @@ class MarketDiscovery:
         # Populated by VaticFeed (primary) or epoch_strike_catcher (fallback)
         self._epoch_strike_cache: dict[int, tuple[float, str]] = {}
         self._pending_epoch_tasks: set[int] = set()  # epochs with scheduled catchers
+        self._failed_historical_epochs: dict[int, float] = {}  # epoch_ts → timestamp of failure
         # Active bid tracking — prevents rotation away from markets with open positions
         self._has_active_bid: bool = False
 
@@ -120,6 +121,19 @@ class MarketDiscovery:
     @property
     def is_market_active(self) -> bool:
         return self._state == DiscoveryState.ACTIVE and self._active_market is not None
+
+    @property
+    def is_strike_verified(self) -> bool:
+        """Returns True if active market strike is from a verified source."""
+        if not self._active_market:
+            return False
+        unverified_sources = {
+            "CHAINLINK_RTDS_ACTIVE_WINDOW",
+            "CHAINLINK_RTDS_CURRENT",
+            "UNAVAILABLE",
+        }
+        source = getattr(self._active_market, "strike_price_source", None)
+        return source not in unverified_sources
 
     # ── State Machine ─────────────────────────────────────────
 
@@ -307,6 +321,24 @@ class MarketDiscovery:
 
         # Cancel pending epoch catcher — Vatic already provided the price
         self._pending_epoch_tasks.discard(epoch_ts)
+
+        # ── FIX Q4: Override active_market jika pakai harga fallback ──
+        if (
+            self._active_market
+            and self._active_market.strike_price is not None
+            and abs(self._active_market.T_open.timestamp() - epoch_ts) < 1
+        ):
+            old_strike = self._active_market.strike_price
+            self._active_market = self._active_market.model_copy(
+                update={"strike_price": price}
+            )
+            # Set the dynamic property for tracking source
+            self._active_market.strike_price_source = source
+            logger.info("vatic_override_active_market_strike",
+                        epoch=epoch_ts,
+                        old_strike=round(old_strike, 2),
+                        new_strike=round(price, 2),
+                        source=source)
 
     async def _handle_active(self) -> None:
         """
@@ -1196,16 +1228,28 @@ class MarketDiscovery:
                            epoch=epoch_ts,
                            epoch_delta_seconds=int(epoch_delta),
                            rtds_covers_epoch=rtds_covers_epoch)
-            historical_strike = await self._fetch_historical_strike_at_epoch(epoch_ts)
-            if historical_strike and historical_strike > 0:
-                self._epoch_strike_cache[epoch_ts] = (historical_strike, "CHAINLINK_HISTORICAL_HTTP")
-                logger.info("strike_from_chainlink_historical",
-                            epoch=epoch_ts,
-                            strike=historical_strike,
-                            epoch_delta_seconds=int(epoch_delta),
-                            source="CHAINLINK_HISTORICAL_HTTP")
-                market_data["strike_price_source"] = "CHAINLINK_HISTORICAL_HTTP"
-                return historical_strike
+            
+            # Guard: jangan retry HTTP jika sudah pernah gagal dalam 2 menit terakhir
+            import time as _time
+            last_fail = self._failed_historical_epochs.get(epoch_ts, 0)
+            if _time.time() - last_fail < 120:
+                logger.debug("historical_fetch_cooldown",
+                             epoch=epoch_ts,
+                             retry_in=int(120 - (_time.time() - last_fail)))
+            else:
+                historical_strike = await self._fetch_historical_strike_at_epoch(epoch_ts)
+                if historical_strike and historical_strike > 0:
+                    self._epoch_strike_cache[epoch_ts] = (historical_strike, "CHAINLINK_HISTORICAL_HTTP")
+                    logger.info("strike_from_chainlink_historical",
+                                epoch=epoch_ts,
+                                strike=historical_strike,
+                                epoch_delta_seconds=int(epoch_delta),
+                                source="CHAINLINK_HISTORICAL_HTTP")
+                    market_data["strike_price_source"] = "CHAINLINK_HISTORICAL_HTTP"
+                    return historical_strike
+                else:
+                    # Catat kegagalan agar tidak spam
+                    self._failed_historical_epochs[epoch_ts] = _time.time()
 
             # Layer 1b: All historical sources failed — use current Chainlink price as last resort.
             # This is intentionally a warning: the strike will be approximate.
