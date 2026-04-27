@@ -615,8 +615,8 @@ class MarketDiscovery:
                             m_patched["createdAt"] = iso_open
 
                             # --- CHAINLINK STRIKE PRICE RESOLUTION ---
-                            # Use window start time as the oracle epoch, forced to 5-min boundary
-                            window_ts = (int(synthetic_open.timestamp()) // 300) * 300
+                            # Use deterministic epoch: resolution_ts - window_duration
+                            window_ts = int(T_res.timestamp()) - (window_min * 60)
                             strike = await self._get_strike_price(m_patched, window_ts)
                             if strike:
                                 # Patch both fields used by _parse_strike_from_market
@@ -728,20 +728,20 @@ class MarketDiscovery:
 
                         # --- Path B Vatic Hydration (WITH FALLBACK) ---
                         slug = m.get("slug", "")
-                        # FIX: Only hydrate if it matches a dynamic 5m pattern to avoid rounding small slug IDs as epochs
+                        # FIX: Only hydrate if it matches a dynamic 5m pattern
                         if slug and self._is_btc_up_down_market(m) and "5m" in slug.lower():
                             try:
-                                # Extract epoch from slug (e.g., btc-updown-5m-1712345600)
-                                epoch_str = slug.split("-")[-1]
-                                epoch_raw = int(epoch_str)
-                                if epoch_raw > 1_700_000_000:
-                                    epoch_aligned = (epoch_raw // 300) * 300
+                                end_date_str = m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
+                                T_res = self._parse_timestamp(end_date_str)
+                                if T_res:
+                                    # Determistic epoch: resolution_ts - 300s
+                                    epoch_aligned = int(T_res.timestamp()) - 300
                                     vatic_strike = await self._get_strike_price(m, epoch_aligned)
                                     if vatic_strike:
                                         # Patch both fields used by _parse_strike_from_market
                                         m["groupItemThreshold"] = str(vatic_strike)
                                         m["strike_price"] = str(vatic_strike)
-                            except (ValueError, IndexError):
+                            except Exception:
                                 pass
 
                         volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
