@@ -988,14 +988,19 @@ class MarketDiscovery:
             market_data["strike_price_source"] = "CHAINLINK_RTDS_SNAPSHOT"
             return strike
 
-        # --- LAYER 2: Chainlink Current Price (if epoch boundary was missed) ---
-        # Allow up to 30s drift if we just started the bot
+        # --- LAYER 2: Chainlink Current Price (unconditional fallback) ---
+        # History may be empty on cold start or if epoch is in the future.
+        # Current Chainlink price is always a valid approximation since
+        # Polymarket uses Chainlink at epoch boundary — and BTC rarely
+        # moves >0.1% within a single 5-min slot.
         current_cl = self._dual_feed.chainlink_price
         now_ts = datetime.now(timezone.utc).timestamp()
-        if current_cl and abs(now_ts - epoch_ts) < 30:
+        if current_cl and current_cl > 0:
             logger.warning("strike_from_chainlink_current",
                            epoch=epoch_ts,
                            strike=current_cl,
+                           epoch_delta_seconds=int(epoch_ts - now_ts),
+                           note="history_empty_using_current_price",
                            source="CHAINLINK_RTDS_CURRENT")
             market_data["strike_price_source"] = "CHAINLINK_RTDS_CURRENT"
             return current_cl
