@@ -443,3 +443,22 @@ class DualFeed:
             return closest
             
         return None
+
+    def get_chainlink_first_tick_at_epoch(self, epoch_ts: int) -> float | None:
+        """
+        Retrieve the FIRST Chainlink tick AT or AFTER epoch_ts.
+        
+        This matches Polymarket's settlement logic:
+        Strike price = first Chainlink price received at/after window boundary.
+        
+        Returns (price) or None if no tick found after epoch_ts.
+        """
+        if not self._chainlink_history:
+            return None
+            
+        # Forward scan: find first entry where ts >= epoch_ts
+        for ts, val in self._chainlink_history:
+            if ts >= epoch_ts:
+                return val
+                
+        return None

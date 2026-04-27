@@ -76,6 +76,10 @@ class MarketDiscovery:
         r"up\s+or\s+down\s+from\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
     ]
 
+    # TTR window constants (seconds)
+    TTR_MIN_SECONDS = 30    # below this: too risky to relay transactions
+    TTR_MAX_SECONDS = 300   # above this: market hasn't started yet (5 min window)
+
     def __init__(self, config: ConfigManager, dual_feed: 'DualFeed') -> None:
         self._config = config
         self._dual_feed = dual_feed
@@ -99,6 +103,8 @@ class MarketDiscovery:
         # Epoch strike cache: captured Chainlink prices at exact epoch boundaries
         self._epoch_strike_cache: dict[int, float] = {}
         self._pending_epoch_tasks: set[int] = set()  # epochs with scheduled catchers
+        # Active bid tracking — prevents rotation away from markets with open positions
+        self._has_active_bid: bool = False
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -197,14 +203,19 @@ class MarketDiscovery:
             slot_duration = 3600
             
         current_slot = (now // slot_duration) * slot_duration
-        MIN_TTR_SECONDS = 90
         
         slug_candidates = []
         for i in range(lookahead_slots + 1):
             epoch = current_slot + (slot_duration * i)
-            ttl = epoch - now
-            if ttl >= MIN_TTR_SECONDS:
-                slug_candidates.append((f"{prefix.strip()}-{epoch}", float(ttl)))
+            # TTR = time until resolution (epoch + slot_duration)
+            resolution_ts = epoch + slot_duration
+            ttr = resolution_ts - now
+            
+            # Only include markets within valid TTR window
+            # TTR > TTR_MAX_SECONDS: market hasn't started yet (skip for now)
+            # TTR < TTR_MIN_SECONDS: too late to relay safely
+            if self.TTR_MIN_SECONDS <= ttr <= self.TTR_MAX_SECONDS:
+                slug_candidates.append((f"{prefix.strip()}-{epoch}", float(ttr)))
                 
         return slug_candidates
 
@@ -264,8 +275,29 @@ class MarketDiscovery:
                 logger.info("no_active_market_found", transitioning_to="WAITING")
         await self._sleep_epoch_synchronized(self._poll_interval)
 
+    def mark_bid_active(self) -> None:
+        """Called by orchestrator when a bid/trade is placed on active market."""
+        self._has_active_bid = True
+        logger.info("bid_active_on_market",
+                    market_id=self._active_market.market_id if self._active_market else None)
+
+    def mark_bid_resolved(self) -> None:
+        """Called by orchestrator when the active bid resolves or is cancelled."""
+        self._has_active_bid = False
+        logger.info("bid_resolved_on_market",
+                    market_id=self._active_market.market_id if self._active_market else None)
+
     async def _handle_active(self) -> None:
-        """Monitor active market TTR and validity."""
+        """
+        Monitor active market TTR and validity.
+
+        TTR Window Rules:
+        - TTR <= 0: Market resolved → SEARCHING
+        - TTR < 30s AND no active bid: Too late for relay → rotate
+        - TTR < 30s AND active bid: Hold until resolution (monitor only)
+        - 30s <= TTR <= 300s: Valid trading window
+        - TTR > 300s: Should not happen (filtered at discovery)
+        """
         if not self._active_market:
             self._state = DiscoveryState.SEARCHING
             return
@@ -280,8 +312,33 @@ class MarketDiscovery:
                 "market_resolved",
                 market_id=self._active_market.market_id,
             )
+            self._has_active_bid = False
             self._active_market = None
             self._state = DiscoveryState.SEARCHING
+
+        elif ttr_seconds < self.TTR_MIN_SECONDS:
+            if self._has_active_bid:
+                # Hold: active bid needs to ride until resolution
+                logger.info(
+                    "market_expiring_bid_held",
+                    market_id=self._active_market.market_id,
+                    TTR_seconds=round(ttr_seconds, 1),
+                    reason="active_bid_monitoring_until_resolution",
+                )
+                self._active_market = self._active_market.model_copy(
+                    update={"TTR_minutes": ttr_minutes}
+                )
+            else:
+                # No bid — too late to enter, rotate immediately
+                logger.info(
+                    "market_expired_rotating",
+                    market_id=self._active_market.market_id,
+                    TTR_seconds=round(ttr_seconds, 1),
+                    reason="below_min_ttr_no_active_bid",
+                )
+                self._active_market = None
+                self._state = DiscoveryState.SEARCHING
+
         elif ttr_minutes < self._late_ttr:
             # Mark as LATE — no new entries allowed
             logger.info(
@@ -289,12 +346,11 @@ class MarketDiscovery:
                 market_id=self._active_market.market_id,
                 TTR_minutes=round(ttr_minutes, 2),
             )
-            # Update TTR on market
             self._active_market = self._active_market.model_copy(
                 update={"TTR_minutes": ttr_minutes}
             )
         else:
-            # Update TTR
+            # Normal: valid trading window
             self._active_market = self._active_market.model_copy(
                 update={"TTR_minutes": ttr_minutes}
             )
@@ -341,6 +397,7 @@ class MarketDiscovery:
     def mark_trade_executed(self) -> None:
         """Called by orchestrator when a trade is actually opened."""
         self._last_trade_at = datetime.now(timezone.utc)
+        self._has_active_bid = True
 
     async def check_and_rotate(self) -> bool:
         """
@@ -1024,10 +1081,12 @@ class MarketDiscovery:
         """
         Unified strike price resolver.
 
-        RULE: Strike price = Chainlink price EXACTLY at epoch boundary.
-        - If epoch has passed: use cached capture or history snapshot.
-        - If epoch is within ±30s: use current Chainlink price.
-        - If epoch is in the future (>30s away): return None (wait).
+        RULE: Strike price = FIRST Chainlink tick AT or AFTER epoch boundary.
+        - Layer 0: Epoch strike cache (captured by boundary catcher)
+        - Layer 1: First Chainlink tick at/after epoch (from RTDS history)
+        - Layer 1b: Current Chainlink price (cold start, window already active)
+        - Layer 2: Current Chainlink price (within ±30s of epoch)
+        - Layer 3: Polymarket payload (last resort, epoch passed)
         """
         import time as _time
         now_ts = _time.time()
@@ -1043,21 +1102,22 @@ class MarketDiscovery:
             market_data["strike_price_source"] = "CHAINLINK_EPOCH_CACHE"
             return cached
 
-        # --- LAYER 1: Chainlink History Snapshot (epoch already passed) ---
+        # --- LAYER 1: First Chainlink Tick AT/AFTER Epoch (most accurate) ---
         if epoch_delta < 0:  # epoch is in the past
-            strike = self._dual_feed.get_chainlink_at_epoch(epoch_ts)
+            strike = self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts)
             if strike:
-                logger.info("strike_from_chainlink_rtds",
+                # Cache it for future lookups
+                self._epoch_strike_cache[epoch_ts] = strike
+                logger.info("strike_from_chainlink_first_tick",
                             epoch=epoch_ts,
                             strike=strike,
                             epoch_delta_seconds=int(epoch_delta),
-                            source="CHAINLINK_RTDS_SNAPSHOT")
-                market_data["strike_price_source"] = "CHAINLINK_RTDS_SNAPSHOT"
+                            source="CHAINLINK_FIRST_TICK")
+                market_data["strike_price_source"] = "CHAINLINK_FIRST_TICK"
                 return strike
 
-            # History empty (cold start) — use current Chainlink price.
+            # Layer 1b: History empty (cold start) — use current Chainlink price.
             # Window is already active, so strike is already locked.
-            # Current price is valid approximation (BTC moves <0.1% in 5min).
             current_cl = self._dual_feed.chainlink_price
             if current_cl and current_cl > 0:
                 logger.warning("strike_window_active_using_chainlink",
@@ -1066,6 +1126,11 @@ class MarketDiscovery:
                                elapsed_seconds=int(-epoch_delta),
                                source="CHAINLINK_RTDS_ACTIVE_WINDOW")
                 market_data["strike_price_source"] = "CHAINLINK_RTDS_ACTIVE_WINDOW"
+                # Schedule async verification to correct this later
+                asyncio.create_task(
+                    self._verify_strike_price(epoch_ts, current_cl),
+                    name=f"strike_verify_{epoch_ts}"
+                )
                 return current_cl
 
         # --- LAYER 2: Current Chainlink Price (within ±30s of epoch) ---
@@ -1078,6 +1143,11 @@ class MarketDiscovery:
                                epoch_delta_seconds=int(epoch_delta),
                                source="CHAINLINK_RTDS_CURRENT")
                 market_data["strike_price_source"] = "CHAINLINK_RTDS_CURRENT"
+                # Schedule verification for precision correction
+                asyncio.create_task(
+                    self._verify_strike_price(epoch_ts, current_cl),
+                    name=f"strike_verify_{epoch_ts}"
+                )
                 return current_cl
 
         # --- LAYER 3: Polymarket Payload (epoch passed but no Chainlink data) ---
@@ -1100,6 +1170,73 @@ class MarketDiscovery:
 
         market_data["strike_price_source"] = "UNAVAILABLE"
         return None
+
+    async def _verify_strike_price(self, epoch_ts: int, initial_strike: float) -> None:
+        """
+        Cross-verify the initial strike price estimate against the precise
+        first-tick from RTDS history after a delay.
+        
+        If the RTDS first-tick differs, override the cached value and update
+        the active market if it matches this epoch.
+        """
+        # Wait for RTDS history to accumulate the tick
+        await asyncio.sleep(10.0)
+
+        verified = self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts)
+
+        if verified is None:
+            # Fallback: try Chainlink HTTP API for the exact timestamp
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    # CryptoCompare histominute as Chainlink proxy
+                    resp = await client.get(
+                        "https://min-api.cryptocompare.com/data/v2/histominute",
+                        params={"fsym": "BTC", "tsym": "USD", "limit": 1, "toTs": epoch_ts + 60}
+                    )
+                    if resp.is_success:
+                        data = resp.json().get("Data", {}).get("Data", [])
+                        for candle in data:
+                            if candle.get("time", 0) >= epoch_ts:
+                                verified = float(candle.get("close", 0))
+                                break
+            except Exception as e:
+                logger.debug("strike_verify_http_fallback_failed", error=str(e))
+
+        if verified is None:
+            logger.debug("strike_verify_no_data", epoch=epoch_ts)
+            return
+
+        diff = abs(verified - initial_strike)
+        diff_pct = (diff / initial_strike) * 100 if initial_strike > 0 else 0
+
+        if diff > 0.01:  # More than $0.01 difference
+            # Override the cached value
+            old_price = self._epoch_strike_cache.get(epoch_ts, initial_strike)
+            self._epoch_strike_cache[epoch_ts] = verified
+
+            logger.warning("strike_price_verified",
+                           source="RTDS_FIRST_TICK" if self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts) else "HTTP_FALLBACK",
+                           epoch=epoch_ts,
+                           old_price=round(old_price, 2),
+                           new_price=round(verified, 2),
+                           diff_usd=round(diff, 2),
+                           diff_pct=round(diff_pct, 4))
+
+            # Update active market strike_price if it matches this epoch
+            if (self._active_market and
+                self._active_market.strike_price and
+                abs(self._active_market.strike_price - initial_strike) < 1.0):
+                self._active_market = self._active_market.model_copy(
+                    update={"strike_price": verified}
+                )
+                logger.info("active_market_strike_updated",
+                            market_id=self._active_market.market_id,
+                            new_strike=round(verified, 2))
+        else:
+            logger.info("strike_price_confirmed",
+                        epoch=epoch_ts,
+                        strike=round(verified, 2),
+                        diff_usd=round(diff, 2))
 
     def _parse_strike_from_market(self, market_data: dict) -> Optional[float]:
         """Extract strike price from raw Polymarket payload fields or text."""
