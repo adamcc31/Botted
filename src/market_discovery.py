@@ -533,10 +533,10 @@ class MarketDiscovery:
                             m_patched["startDate"] = iso_open
                             m_patched["createdAt"] = iso_open
 
-                            # --- VATIC ORACLE HYDRATION ---
+                            # --- VATIC ORACLE HYDRATION (WITH FALLBACK) ---
                             # Use window start time as the oracle epoch, forced to 5-min boundary
                             window_ts = (int(synthetic_open.timestamp()) // 300) * 300
-                            vatic_strike = await self._fetch_vatic_strike(window_ts)
+                            vatic_strike = await self._get_strike_price(m_patched, window_ts)
                             if vatic_strike:
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
 
@@ -631,17 +631,19 @@ class MarketDiscovery:
                         if not self._is_btc_up_down_market(m):
                             continue
 
-                        # --- Path B Vatic Hydration ---
+                        # --- Path B Vatic Hydration (WITH FALLBACK) ---
                         slug = m.get("slug", "")
-                        if slug:
+                        # FIX: Only hydrate if it matches a dynamic 5m pattern to avoid rounding small slug IDs as epochs
+                        if slug and self._is_btc_up_down_market(m) and "5m" in slug.lower():
                             try:
                                 # Extract epoch from slug (e.g., btc-updown-5m-1712345600)
                                 epoch_str = slug.split("-")[-1]
                                 epoch_raw = int(epoch_str)
-                                epoch_aligned = (epoch_raw // 300) * 300
-                                vatic_strike = await self._fetch_vatic_strike(epoch_aligned)
-                                if vatic_strike:
-                                    m["groupItemThreshold"] = str(vatic_strike)
+                                if epoch_raw > 1_700_000_000:
+                                    epoch_aligned = (epoch_raw // 300) * 300
+                                    vatic_strike = await self._get_strike_price(m, epoch_aligned)
+                                    if vatic_strike:
+                                        m["groupItemThreshold"] = str(vatic_strike)
                             except (ValueError, IndexError):
                                 pass
 
@@ -754,34 +756,12 @@ class MarketDiscovery:
             if ttr_minutes <= 0:
                 return None
 
-            strike_price = None
-
-            if is_dynamic_5m:
-                # API Payload Extraction: grab the Price To Beat from raw JSON values
-                raw_target = (
-                    market_data.get("groupItemThreshold") or 
-                    market_data.get("initial_price") or 
-                    market_data.get("strike_price")
-                )
-                if raw_target is not None:
-                    try:
-                        extracted = float(raw_target)
-                        # Ensure it's populated and not exactly 0 (which may happen precisely at 00:00 before oracle update)
-                        if extracted > 1000.0: 
-                            strike_price = extracted
-                    except (ValueError, TypeError):
-                        pass
-
             # ----------------------------------------------------
-            # TEXT REGEX EXTRACTION (Fallback / Standard)
+            # STRIKE PRICE RESOLUTION (Unified)
             # ----------------------------------------------------
-            if strike_price is None:
-                strike_price = self._extract_strike_price(question)
-            if strike_price is None:
-                strike_price = self._extract_strike_price(group_item)
-            if strike_price is None:
-                desc = market_data.get("description", "")
-                strike_price = self._extract_strike_price(desc)
+            # Note: _get_strike_price was already called during discovery hydration.
+            # Here we just ensure we pick it up from the patched payload or fallback to regex.
+            strike_price = self._parse_strike_from_market(market_data)
                 
             if strike_price is None:
                 question_l = question.lower()
@@ -987,6 +967,9 @@ class MarketDiscovery:
 
     async def _fetch_vatic_strike(self, epoch_ts: int) -> Optional[float]:
         """Fetch precise strike price from Vatic Oracle with epoch caching."""
+        # FIX 1: Guard against TTL/offsets being passed instead of timestamps
+        assert epoch_ts > 1_700_000_000, f"epoch_ts looks wrong: {epoch_ts} — expected Unix timestamp"
+        
         # Force exact 5-minute boundary alignment
         epoch_ts = (epoch_ts // 300) * 300
 
@@ -1025,6 +1008,68 @@ class MarketDiscovery:
                          error=str(e),
                          error_type=type(e).__name__)
             
+        return None
+
+    async def _get_strike_price(self, market_data: dict, epoch_ts: int) -> Optional[float]:
+        """
+        Unified strike price resolver with multiple fallback layers.
+        1. Vatic Oracle (Primary)
+        2. Polymarket Metadata (Secondary)
+        3. Binance Spot Approximation (Last Resort)
+        """
+        # --- LAYER 1: Vatic Oracle ---
+        try:
+            strike = await self._fetch_vatic_strike(epoch_ts)
+            if strike:
+                return strike
+        except Exception as e:
+            logger.warning("vatic_oracle_unavailable", epoch=epoch_ts, error=str(e))
+
+        # --- LAYER 2: Polymarket Payload ---
+        strike = self._parse_strike_from_market(market_data)
+        if strike:
+            logger.warning("strike_from_market_fallback", epoch=epoch_ts, strike=strike, reason="vatic_unavailable")
+            return strike
+
+        # --- LAYER 3: Binance Approximation ---
+        # Only use if market is fresh (TTR > 4 minutes) to avoid massive basis risk
+        now = datetime.now(timezone.utc)
+        ttr_sec = epoch_ts + 300 - int(now.timestamp())
+        if ttr_sec > 240:
+            spot = await self._fetch_binance_spot()
+            if spot:
+                logger.warning("strike_approximate_fallback", epoch=epoch_ts, strike=spot, reason="all_sources_failed")
+                return spot
+
+        return None
+
+    def _parse_strike_from_market(self, market_data: dict) -> Optional[float]:
+        """Extract strike price from raw Polymarket payload fields or text."""
+        # 1. Direct Fields
+        raw_target = (
+            market_data.get("groupItemThreshold") or 
+            market_data.get("initial_price") or 
+            market_data.get("strike_price")
+        )
+        if raw_target is not None:
+            try:
+                extracted = float(raw_target)
+                if extracted > 1000.0: 
+                    return extracted
+            except (ValueError, TypeError):
+                pass
+
+        # 2. Text Patterns
+        question = market_data.get("question", "")
+        group_item = market_data.get("groupItemTitle", "")
+        desc = market_data.get("description", "")
+        
+        for text in [question, group_item, desc]:
+            if not text: continue
+            strike = self._extract_strike_price(text)
+            if strike:
+                return strike
+        
         return None
 
     def _resolve_signal_ttr_window(self, market: ActiveMarket) -> tuple[float, float]:
