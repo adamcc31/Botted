@@ -82,7 +82,8 @@ class MarketDiscovery:
         self._active_market: Optional[ActiveMarket] = None
         self._active_since: Optional[datetime] = None
         self._last_trade_at: Optional[datetime] = None
-        self._poll_interval = config.get("market_discovery.poll_interval_s", 30)
+        poll_interval_env = int(os.getenv("GAMMA_POLL_INTERVAL_SECONDS", "30"))
+        self._poll_interval = max(30, poll_interval_env)
         self._waiting_poll = config.get("market_discovery.waiting_poll_s", 60)
         self._min_ttr = config.get("market_discovery.min_ttr_to_discover", 5.0)
         self._late_ttr = config.get("market_discovery.late_ttr_minutes", 3.0)
@@ -90,6 +91,7 @@ class MarketDiscovery:
         self._rotation_score_buffer = config.get("market_discovery.rotation_score_buffer", 0.03)
         self._target_yes_prob = config.get("market_discovery.target_yes_probability", 0.5)
         self._target_ttr_minutes = config.get("market_discovery.target_ttr_minutes", 5.0)
+        self._lookahead_slots = int(os.getenv("MARKET_LOOKAHEAD_SLOTS", "3"))
         self._running = False
         self._last_log_time: float = 0.0
         self._candidate_pool: list[dict[str, Any]] = []
@@ -131,6 +133,77 @@ class MarketDiscovery:
     async def stop(self) -> None:
         self._running = False
         logger.info("market_discovery_stopped")
+
+    async def _fetch_with_backoff(
+        self, 
+        client: httpx.AsyncClient, 
+        url: str, 
+        params: dict = None, 
+        headers: dict = None
+    ) -> httpx.Response:
+        """
+        Fetch from Gamma API with exponential backoff on 429.
+        """
+        base_delay = 60  # seconds
+        max_delay = 600  # 10 minutes
+        attempt = 0
+        
+        while True:
+            try:
+                resp = await client.get(
+                    url, 
+                    params=params, 
+                    headers=headers or {"Accept": "application/json"},
+                    timeout=15.0
+                )
+                if resp.status_code == 429:
+                    delay = min(base_delay * (2 ** attempt), max_delay)
+                    logger.warning(
+                        "gamma_api_429_backoff",
+                        attempt=attempt,
+                        wait_seconds=delay,
+                        url=url
+                    )
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                    continue
+                return resp
+            except (httpx.ConnectError, httpx.ReadError, httpx.WriteTimeout) as e:
+                # For network errors, we also retry but with a smaller fixed delay
+                # unless it persists.
+                if attempt >= 3:
+                    raise
+                logger.debug("gamma_api_network_retry", error=str(e), attempt=attempt)
+                await asyncio.sleep(5.0 * (attempt + 1))
+                attempt += 1
+                continue
+
+    def _get_target_slugs(self, prefix: str, lookahead_slots: int = 3) -> list[tuple[str, float]]:
+        """
+        Generate slug candidates for markets resolving soon.
+        Handles TTR edge cases and returns (slug, ttl) tuples.
+        """
+        import time as _time
+        now = int(_time.time())
+        slot_duration = 300  # 5 minutes in seconds
+        
+        # Determine the slot type from prefix if possible
+        if "15m" in prefix:
+            slot_duration = 900
+        elif "1h" in prefix:
+            slot_duration = 3600
+            
+        current_slot = (now // slot_duration) * slot_duration
+        MIN_TTR_SECONDS = 90
+        
+        slug_candidates = []
+        for i in range(lookahead_slots + 1):
+            epoch = current_slot + (slot_duration * i)
+            ttl = epoch - now
+            if ttl >= MIN_TTR_SECONDS:
+                slug_candidates.append((f"{prefix.strip()}-{epoch}", float(ttl)))
+                
+        return slug_candidates
 
     async def _sleep_epoch_synchronized(self, base_interval: float) -> None:
         """
@@ -390,133 +463,94 @@ class MarketDiscovery:
 
     async def _query_dynamic_5m_markets(self, spot_price: Optional[float]) -> list[dict]:
         """
-        Targeted discovery for dynamic short-interval markets (e.g. BTC Up/Down 5-min).
-
-        WHY THIS EXISTS:
-        - Dynamic 5-min markets have only ~5 min of lifespan, so they NEVER accumulate
-          enough volume24hr to rank in a generic volume-sorted scan (top-200).
-        - The Gamma /markets?order=volume24hr endpoint will never surface them.
-        - Fix: query the known parent event by slug via /events, then extract the
-          currently active sub-market directly.
-
-        ALSO FIXES:
-        - `startDateIso` on sub-markets is the *event* creation date (days ago),
-          not the current 5-min window open time.  We synthesize a correct T_open
-          as T_resolution − 5 min so that the lifespan check in _parse_market passes.
+        Targeted discovery for dynamic short-interval markets using direct slug construction.
+        
+        This drastically reduces API calls by querying specific slugs instead of scanning
+        the top 200 markets.
         """
-        event_slugs: list[str] = self._config.get(
+        event_slug_prefixes: list[str] = self._config.get(
             "market_discovery.dynamic_5m_event_slugs",
             [SLUG_PREFIX],
         )
         candidates: list[dict] = []
 
         async with httpx.AsyncClient(timeout=15.0) as client:
-            now_ts = int(datetime.now(timezone.utc).timestamp())
-            for base_slug in event_slugs:
-                window_seconds = 300
-                if "15m" in base_slug:
-                    window_seconds = 900
-                elif "1h" in base_slug:
-                    window_seconds = 3600
-
-                current_window_ts = (now_ts // window_seconds) * window_seconds
-
-                for offset in (0, 1):
-                    window_ts = current_window_ts + (offset * window_seconds)
-                    slug = f"{base_slug.strip()}-{window_ts}"
-
+            for prefix in event_slug_prefixes:
+                # 1. Generate targeted slug candidates with TTR filtering
+                slug_tuples = self._get_target_slugs(prefix, self._lookahead_slots)
+                
+                for slug, ttl in slug_tuples:
                     try:
-                        # 1. Path-based lookup
-                        resp = await client.get(
-                            f"{self.GAMMA_API_BASE}/events/slug/{slug}",
-                            headers={"Accept": "application/json"}
+                        # 2. Targeted lookup via /markets endpoint
+                        resp = await self._fetch_with_backoff(
+                            client,
+                            f"{self.GAMMA_API_BASE}/markets",
+                            params={"slug": slug}
                         )
                         
-                        if resp.is_success:
-                            payload = resp.json()
-                            if payload and isinstance(payload, dict) and payload.get("slug"):
-                                event = payload
+                        if not resp.is_success:
+                            continue
+                            
+                        markets = resp.json()
+                        if not isinstance(markets, list) or not markets:
+                            # Fallback: some dynamic markets are nested in Events
+                            resp = await self._fetch_with_backoff(
+                                client,
+                                f"{self.GAMMA_API_BASE}/events/slug/{slug}"
+                            )
+                            if resp.is_success:
+                                event_data = resp.json()
+                                markets = event_data.get("markets", [])
                             else:
                                 continue
-                        else:
-                            # 2. Query fallback lookup
-                            resp = await client.get(
-                                f"{self.GAMMA_API_BASE}/events",
-                                params={"slug": slug, "limit": 1},
-                                headers={"Accept": "application/json"}
-                            )
-                            if not resp.is_success:
-                                continue
-                            
-                            payload = resp.json()
-                            if isinstance(payload, dict):
-                                payload = payload.get("data", [payload])
-                            if not isinstance(payload, list) or not payload:
-                                continue
-                            event = payload[0]
-
-                        sub_markets: list[dict] = event.get("markets", [])
-
-                        if not sub_markets:
-                            logger.warning("dynamic_5m_event_has_no_markets", slug=slug,
-                                           event_id=event.get("id"))
+                        
+                        if not isinstance(markets, list) or not markets:
                             continue
-    
-                        for m in sub_markets:
+
+                        for m in markets:
                             # Basic activity check
                             if not m.get("active") or m.get("closed"):
                                 continue
                             if not m.get("enableOrderBook"):
                                 continue
-    
-                            # --- Patch T_open: use T_resolution − 5 min ---
-                            # The event-level startDate is the series creation date,
-                            # NOT the current 5-min window open time. Fix it here so
-                            # _parse_market's lifespan check does not reject the market.
+
+                            # --- Patch T_open: use T_resolution − window_duration ---
                             end_date_str = (
                                 m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
                             )
                             T_res = self._parse_timestamp(end_date_str)
+                            if T_res is None:
+                                continue
+                                
                             m_patched = dict(m)
-                            if T_res is not None:
-                                synthetic_open = T_res - timedelta(minutes=5)
-                                iso_open = synthetic_open.isoformat()
-                                # Overwrite all possible startDate field names
-                                m_patched["startDateIso"] = iso_open
-                                m_patched["startDate"] = iso_open
-                                m_patched["createdAt"] = iso_open
+                            window_min = 5
+                            if "15m" in prefix: window_min = 15
+                            elif "1h" in prefix: window_min = 60
+                            
+                            synthetic_open = T_res - timedelta(minutes=window_min)
+                            iso_open = synthetic_open.isoformat()
+                            m_patched["startDateIso"] = iso_open
+                            m_patched["startDate"] = iso_open
+                            m_patched["createdAt"] = iso_open
 
                             # --- VATIC ORACLE HYDRATION ---
-                            # window_ts adalah tepat waktu awal epoch (timestamp)
+                            # Use window start time as the oracle epoch
+                            window_ts = int(synthetic_open.timestamp())
                             vatic_strike = await self._fetch_vatic_strike(window_ts)
                             if vatic_strike:
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
-    
+
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
-                                logger.info(
-                                    "dynamic_5m_parse_returned_none",
-                                    slug=slug,
-                                    market_id=m.get("conditionId") or m.get("id"),
-                                    question=m.get("question", "")[:80],
-                                )
                                 continue
 
-                            # --- FILTER TIME-TO-RESOLUTION (TTR) KETAT ---
-                            # Jangan pertimbangkan epoch yang sisa waktunya di bawah 4 menit
-                            if parsed.TTR_minutes < 4.0:
-                                logger.debug(
-                                    "dynamic_5m_skipped_too_late", 
-                                    market_id=parsed.market_id, 
-                                    TTR=round(parsed.TTR_minutes, 2)
-                                )
+                            # Final sanity check on TTR
+                            if parsed.TTR_minutes < 1.5:  # ~90 seconds
                                 continue
     
                             if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
                                 continue
     
-                            # 5-min markets have negligible 24hr volume by design;
-                            # use total volume (all-time) as the liquidity signal instead.
                             volume = float(
                                 m.get("volume") or m.get("volumeNum", 0.0) or
                                 m.get("volume24hr", 0.0) or 0.0
@@ -535,7 +569,7 @@ class MarketDiscovery:
                                     "yes_prob": yes_prob,
                                     "score": score_components["score_total"],
                                     "score_components": score_components,
-                                    "source": f"event:{slug}",
+                                    "source": f"direct_slug:{slug}",
                                 }
                             )
                             logger.info(
@@ -547,136 +581,95 @@ class MarketDiscovery:
                                 yes_prob=yes_prob,
                                 slug=slug,
                             )
-                    except httpx.HTTPError as e:
-                        logger.warning("dynamic_5m_event_http_error", slug=slug, error=str(e))
                     except Exception as e:
-                        logger.warning("dynamic_5m_event_parse_error", slug=slug, error=str(e))
+                        logger.warning("dynamic_5m_slug_error", slug=slug, error=str(e))
 
         return candidates
 
     async def _query_candidates(self) -> list[dict]:
         """
-        Query Gamma API via /markets endpoint for active price-action targets.
-        Uses a high limit (200) to find daily markets even if buried in volume.
-
-        ALSO merges results from _query_dynamic_5m_markets() — a targeted event-based
-        lookup for short-interval markets that never surface via volume-sorted scans.
+        Query Gamma API. 
+        Path A: targeted slug lookup (fast, efficient).
+        Path B: broad volume scan (fallback only).
         """
         min_volume = self._config.get("market_discovery.min_volume_24hr", 1000.0)
         spot_price = await self._fetch_binance_spot()
 
         try:
-            # ── Path A: targeted event-based lookup for 5-min dynamic markets ──
-            dynamic_candidates = await self._query_dynamic_5m_markets(spot_price)
+            # ── Path A: targeted lookup ──
+            candidates = await self._query_dynamic_5m_markets(spot_price)
 
-            # ── Path B: generic volume-sorted scan for daily/hourly markets ──
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    f"{self.GAMMA_API_BASE}/markets",
-                    params={
-                        "active": "true",
-                        "closed": "false",
-                        "order": "volume24hr",
-                        "ascending": "false",
-                        "limit": 200
-                    },
-                )
-                resp.raise_for_status()
-                markets = resp.json()
-
-                if not isinstance(markets, list):
-                    markets = markets.get("data", []) if isinstance(markets, dict) else []
-
-                candidates = list(dynamic_candidates)  # seed with dynamic results
-                seen_ids = {c["market"].market_id for c in candidates}
-                skipped_reasons = []  # Log top 5 skipped for transparency
-
-                for m in markets:
-                    q = m.get("question", "")
-
-                    # 1. Basic Technical Filter
-                    if not m.get("active") or m.get("closed") or not m.get("enableOrderBook"):
-                        continue
-
-                    # 2. Design Pattern Check (Strict Above/Up/Down)
-                    if not self._is_btc_up_down_market(m):
-                        if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
-                            skipped_reasons.append(f"PA-Mismatch: '{q[:50]}...'")
-                        continue
-
-                    # 3. Volume Check — skip for 5-min dynamic markets (handled in Path A)
-                    volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
-                    is_dynamic = "up or down - 5 minute" in q.lower() or "up or down - 5 min" in q.lower()
-                    if not is_dynamic and volume < min_volume:
-                        if len(skipped_reasons) < 5:
-                            skipped_reasons.append(f"Low-Volume: '${volume:,.0f}' for '{q[:50]}...'")
-                        continue
-
-                    parsed = self._parse_market(m)
-                    if not parsed:
-                        if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
-                            skipped_reasons.append(f"ParseFailed: '{q[:50]}...'")
-                        continue
-
-                    # Deduplicate against dynamic results
-                    if parsed.market_id in seen_ids:
-                        continue
-                    seen_ids.add(parsed.market_id)
-
-                    # Bypass strict TTR minimum for 5-minute dynamic markets
-                    is_5m_target = "5 minute" in parsed.question.lower()
-                    if is_5m_target or parsed.TTR_minutes >= self._min_ttr:
-                        # Ensure CLOB tradability: must have YES/NO token IDs.
-                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
-                            if len(skipped_reasons) < 5:
-                                skipped_reasons.append(f"Missing-Token-IDs: '{q[:50]}...'")
-                            continue
-
-                    # Basis-risk policy: only hard-skip if explicitly configured.
-                    non_binance_policy = self._config.get(
-                        "settlement.non_binance_policy", "uncertainty_inflate"
-                    )
-                    non_binance_is_mismatch = not (
-                        parsed.settlement_exchange == "BINANCE"
-                        and parsed.settlement_granularity == "1m"
-                    )
-                    if non_binance_policy == "abstain" and non_binance_is_mismatch:
-                        continue
-
-                    yes_prob = self._extract_yes_probability(m)
-                    score_components = self._score_candidate(
-                        market=parsed,
-                        volume_24h=volume,
-                        yes_prob=yes_prob,
-                        spot_price=spot_price,
-                    )
-                    candidates.append(
-                        {
-                            "market": parsed,
-                            "volume": volume,
-                            "yes_prob": yes_prob,
-                            "score": score_components["score_total"],
-                            "score_components": score_components,
-                            "source": "volume_scan",
+            # ── Path B: broad scan (Fallback) ──
+            # Only run Path B if Path A found nothing. This drastically reduces 429 risks.
+            if not candidates:
+                logger.debug("discovery_path_b_fallback", msg="Path A found no candidates, falling back to broad scan")
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    resp = await self._fetch_with_backoff(
+                        client,
+                        f"{self.GAMMA_API_BASE}/markets",
+                        params={
+                            "active": "true",
+                            "closed": "false",
+                            "order": "volume24hr",
+                            "ascending": "false",
+                            "limit": 200
                         }
                     )
+                    resp.raise_for_status()
+                    markets = resp.json()
 
-                if not candidates and skipped_reasons:
-                    logger.info(
-                        "discovery_skipped_candidates",
-                        top_reasons=skipped_reasons,
-                        total_markets_scanned=len(markets),
-                        dynamic_candidates_found=len(dynamic_candidates),
-                    )
+                    if not isinstance(markets, list):
+                        markets = markets.get("data", []) if isinstance(markets, dict) else []
 
-                candidates.sort(key=lambda c: c["score"], reverse=True)
-                return candidates
+                    seen_ids = set()
 
-        except httpx.HTTPError as e:
-            logger.error("gamma_api_error_markets", error=str(e))
-            return []
+                    for m in markets:
+                        q = m.get("question", "")
+                        if not m.get("active") or m.get("closed") or not m.get("enableOrderBook"):
+                            continue
+
+                        if not self._is_btc_up_down_market(m):
+                            continue
+
+                        volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
+                        if volume < min_volume:
+                            continue
+
+                        parsed = self._parse_market(m)
+                        if not parsed or parsed.market_id in seen_ids:
+                            continue
+                        seen_ids.add(parsed.market_id)
+
+                        # Standard TTR filter for broad scan
+                        if parsed.TTR_minutes < self._min_ttr:
+                            continue
+
+                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                            continue
+
+                        yes_prob = self._extract_yes_probability(m)
+                        score_components = self._score_candidate(
+                            market=parsed,
+                            volume_24h=volume,
+                            yes_prob=yes_prob,
+                            spot_price=spot_price,
+                        )
+                        candidates.append(
+                            {
+                                "market": parsed,
+                                "volume": volume,
+                                "yes_prob": yes_prob,
+                                "score": score_components["score_total"],
+                                "score_components": score_components,
+                                "source": "volume_scan_fallback",
+                            }
+                        )
+
+            candidates.sort(key=lambda c: c["score"], reverse=True)
+            return candidates
+
         except Exception as e:
-            logger.error("market_discovery_parse_error_markets", error=str(e))
+            logger.error("market_discovery_query_error", error=str(e))
             return []
 
     def _is_btc_up_down_market(self, market_data: dict) -> bool:
