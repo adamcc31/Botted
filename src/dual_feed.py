@@ -458,7 +458,20 @@ class DualFeed:
             
         # Forward scan: find first entry where ts >= epoch_ts
         for ts, val in self._chainlink_history:
-            if ts >= epoch_ts:
-                return val
+            if ts >= float(epoch_ts):
+                # Ensure the tick isn't unreasonably far in the future
+                if (ts - float(epoch_ts)) <= 60:
+                    return val
+                break
                 
         return None
+
+    def rtds_buffer_covers_epoch(self, epoch_ts: int) -> bool:
+        """
+        Returns True if the RTDS tick buffer has data at or before epoch_ts.
+        Ensures we don't use a mid-window tick as the opening price.
+        """
+        if not self._chainlink_history:
+            return False
+        earliest_tick_ts = self._chainlink_history[0][0]
+        return earliest_tick_ts <= epoch_ts
