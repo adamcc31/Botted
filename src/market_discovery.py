@@ -96,6 +96,9 @@ class MarketDiscovery:
         self._running = False
         self._last_log_time: float = 0.0
         self._candidate_pool: list[dict[str, Any]] = []
+        # Epoch strike cache: captured Chainlink prices at exact epoch boundaries
+        self._epoch_strike_cache: dict[int, float] = {}
+        self._pending_epoch_tasks: set[int] = set()  # epochs with scheduled catchers
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -533,14 +536,26 @@ class MarketDiscovery:
                             m_patched["startDate"] = iso_open
                             m_patched["createdAt"] = iso_open
 
-                            # --- VATIC ORACLE HYDRATION (WITH FALLBACK) ---
+                            # --- CHAINLINK STRIKE PRICE RESOLUTION ---
                             # Use window start time as the oracle epoch, forced to 5-min boundary
                             window_ts = (int(synthetic_open.timestamp()) // 300) * 300
-                            vatic_strike = await self._get_strike_price(m_patched, window_ts)
-                            if vatic_strike:
+                            strike = await self._get_strike_price(m_patched, window_ts)
+                            if strike:
                                 # Patch both fields used by _parse_strike_from_market
-                                m_patched["groupItemThreshold"] = str(vatic_strike)
-                                m_patched["strike_price"] = str(vatic_strike)
+                                m_patched["groupItemThreshold"] = str(strike)
+                                m_patched["strike_price"] = str(strike)
+                            else:
+                                # Epoch boundary hasn't arrived yet — schedule a catcher
+                                import time as _time
+                                if window_ts > _time.time() and window_ts not in self._pending_epoch_tasks:
+                                    self._pending_epoch_tasks.add(window_ts)
+                                    asyncio.create_task(
+                                        self._schedule_epoch_strike_capture(window_ts),
+                                        name=f"epoch_catcher_{window_ts}"
+                                    )
+                                    logger.info("epoch_strike_catcher_scheduled",
+                                                epoch=window_ts,
+                                                wait_seconds=int(window_ts - _time.time()))
 
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
@@ -970,50 +985,105 @@ class MarketDiscovery:
             return None
 
 
-    async def _get_strike_price(self, market_data: dict, epoch_ts: int) -> Optional[float]:
+    async def _schedule_epoch_strike_capture(self, epoch_ts: int) -> None:
         """
-        Unified strike price resolver with multiple fallback layers.
-        1. Chainlink RTDS Snapshot at Epoch (Primary - Official Settlement Source)
-        2. Chainlink RTDS Current (Secondary - acceptable for very fresh markets)
-        3. Polymarket Metadata (Tertiary - Fallback)
+        Wait until epoch_ts arrives, then capture the Chainlink price
+        as the official strike price for that epoch boundary.
         """
-        # --- LAYER 1: Chainlink Snapshot at Epoch Boundary ---
-        # This is the exact value Polymarket uses for strike price generation.
-        strike = self._dual_feed.get_chainlink_at_epoch(epoch_ts)
-        if strike:
-            logger.info("strike_from_chainlink_rtds",
+        import time as _time
+        now = _time.time()
+        wait_seconds = epoch_ts - now
+
+        if wait_seconds > 0:
+            logger.info("epoch_strike_catcher_waiting",
+                        epoch=epoch_ts,
+                        wait_seconds=round(wait_seconds, 1))
+            await asyncio.sleep(wait_seconds)
+
+        # Small buffer to let the Chainlink tick arrive
+        await asyncio.sleep(0.5)
+
+        strike = self._dual_feed.chainlink_price
+        delay_ms = int((_time.time() - epoch_ts) * 1000)
+
+        if strike and strike > 0:
+            self._epoch_strike_cache[epoch_ts] = strike
+            logger.info("strike_captured_at_epoch",
                         epoch=epoch_ts,
                         strike=strike,
-                        source="CHAINLINK_RTDS_SNAPSHOT")
-            market_data["strike_price_source"] = "CHAINLINK_RTDS_SNAPSHOT"
-            return strike
-
-        # --- LAYER 2: Chainlink Current Price (unconditional fallback) ---
-        # History may be empty on cold start or if epoch is in the future.
-        # Current Chainlink price is always a valid approximation since
-        # Polymarket uses Chainlink at epoch boundary — and BTC rarely
-        # moves >0.1% within a single 5-min slot.
-        current_cl = self._dual_feed.chainlink_price
-        now_ts = datetime.now(timezone.utc).timestamp()
-        if current_cl and current_cl > 0:
-            logger.warning("strike_from_chainlink_current",
+                        delay_ms=delay_ms)
+        else:
+            logger.warning("strike_capture_failed_no_chainlink",
                            epoch=epoch_ts,
-                           strike=current_cl,
-                           epoch_delta_seconds=int(epoch_ts - now_ts),
-                           note="history_empty_using_current_price",
-                           source="CHAINLINK_RTDS_CURRENT")
-            market_data["strike_price_source"] = "CHAINLINK_RTDS_CURRENT"
-            return current_cl
+                           delay_ms=delay_ms)
 
-        # --- LAYER 3: Polymarket Payload ---
-        strike = self._parse_strike_from_market(market_data)
-        if strike:
-            logger.warning("strike_from_market_fallback", 
-                           epoch=epoch_ts, 
-                           strike=strike, 
-                           source="POLYMARKET_PAYLOAD")
-            market_data["strike_price_source"] = "POLYMARKET_PAYLOAD"
-            return strike
+        # Cleanup: remove from pending set
+        self._pending_epoch_tasks.discard(epoch_ts)
+
+    async def _get_strike_price(self, market_data: dict, epoch_ts: int) -> Optional[float]:
+        """
+        Unified strike price resolver.
+
+        RULE: Strike price = Chainlink price EXACTLY at epoch boundary.
+        - If epoch has passed: use cached capture or history snapshot.
+        - If epoch is within ±30s: use current Chainlink price.
+        - If epoch is in the future (>30s away): return None (wait).
+        """
+        import time as _time
+        now_ts = _time.time()
+        epoch_delta = epoch_ts - now_ts  # positive = future, negative = past
+
+        # --- LAYER 0: Epoch Strike Cache (captured by boundary catcher) ---
+        cached = self._epoch_strike_cache.get(epoch_ts)
+        if cached:
+            logger.info("strike_from_epoch_cache",
+                        epoch=epoch_ts,
+                        strike=cached,
+                        source="EPOCH_CACHE")
+            market_data["strike_price_source"] = "CHAINLINK_EPOCH_CACHE"
+            return cached
+
+        # --- LAYER 1: Chainlink History Snapshot (epoch already passed) ---
+        if epoch_delta < 0:  # epoch is in the past
+            strike = self._dual_feed.get_chainlink_at_epoch(epoch_ts)
+            if strike:
+                logger.info("strike_from_chainlink_rtds",
+                            epoch=epoch_ts,
+                            strike=strike,
+                            epoch_delta_seconds=int(epoch_delta),
+                            source="CHAINLINK_RTDS_SNAPSHOT")
+                market_data["strike_price_source"] = "CHAINLINK_RTDS_SNAPSHOT"
+                return strike
+
+        # --- LAYER 2: Current Chainlink Price (within ±30s of epoch) ---
+        if abs(epoch_delta) <= 30:
+            current_cl = self._dual_feed.chainlink_price
+            if current_cl and current_cl > 0:
+                logger.warning("strike_from_chainlink_current",
+                               epoch=epoch_ts,
+                               strike=current_cl,
+                               epoch_delta_seconds=int(epoch_delta),
+                               source="CHAINLINK_RTDS_CURRENT")
+                market_data["strike_price_source"] = "CHAINLINK_RTDS_CURRENT"
+                return current_cl
+
+        # --- LAYER 3: Polymarket Payload (epoch passed but no Chainlink data) ---
+        if epoch_delta < 0:
+            strike = self._parse_strike_from_market(market_data)
+            if strike:
+                logger.warning("strike_from_market_fallback",
+                               epoch=epoch_ts,
+                               strike=strike,
+                               epoch_delta_seconds=int(epoch_delta),
+                               source="POLYMARKET_PAYLOAD")
+                market_data["strike_price_source"] = "POLYMARKET_PAYLOAD"
+                return strike
+
+        # --- Epoch is in the future (>30s away) → cannot assign strike yet ---
+        if epoch_delta > 30:
+            logger.debug("strike_deferred_epoch_future",
+                         epoch=epoch_ts,
+                         epoch_delta_seconds=int(epoch_delta))
 
         market_data["strike_price_source"] = "UNAVAILABLE"
         return None
