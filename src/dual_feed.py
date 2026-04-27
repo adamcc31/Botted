@@ -72,6 +72,10 @@ class DualFeed:
             maxlen=max(60, self._rolling_window_s) * 10  # ~10 ticks/sec headroom
         )
 
+        # Precise Chainlink history for strike price resolution (epoch boundary lookup)
+        # 10 ticks/sec * 600s (10 min) = 6000 entries max for lookback safety
+        self._chainlink_history: Deque[Tuple[float, float]] = deque(maxlen=6000)
+
         # Connection state
         self._ws_connection = None
         self._running = False
@@ -378,6 +382,9 @@ class DualFeed:
                 self._chainlink_ts = ts
                 self._record_snapshot()
 
+                # Record precise history for epoch-aligned strike lookups
+                self._chainlink_history.append((ts, price))
+
                 logger.debug(
                     "chainlink_tick",
                     price=round(price, 2),
@@ -396,3 +403,43 @@ class DualFeed:
         """Compute exponential backoff delay."""
         delay = self._initial_delay_s * (self._backoff_multiplier ** self._retry_count)
         return min(delay, self._max_delay_s)
+
+    def get_chainlink_at_epoch(self, epoch_ts: int) -> float | None:
+        """
+        Retrieve the Chainlink price closest to a specific Unix epoch timestamp.
+        Used to resolve official Polymarket strike prices without third-party oracles.
+        """
+        return self._get_value_n_seconds_ago_at(
+            self._chainlink_history,
+            target_ts=float(epoch_ts)
+        )
+
+    def _get_value_n_seconds_ago_at(
+        self,
+        history: Deque[Tuple[float, float]],
+        target_ts: float,
+        tolerance_seconds: int = 30
+    ) -> float | None:
+        """
+        Helper to find the value in history closest to target_ts within tolerance.
+        """
+        if not history:
+            return None
+            
+        # Linear search from newest to oldest since we usually look back 0-300s
+        closest = None
+        min_diff = float('inf')
+        
+        for ts, val in reversed(history):
+            diff = abs(ts - target_ts)
+            if diff < min_diff:
+                min_diff = diff
+                closest = val
+            if diff > tolerance_seconds and ts < target_ts:
+                # Optimized: history is sorted by ts, so we can stop if we're past tolerance
+                break
+                
+        if closest is not None and min_diff <= tolerance_seconds:
+            return closest
+            
+        return None

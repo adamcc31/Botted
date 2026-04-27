@@ -76,8 +76,9 @@ class MarketDiscovery:
         r"up\s+or\s+down\s+from\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
     ]
 
-    def __init__(self, config: ConfigManager) -> None:
+    def __init__(self, config: ConfigManager, dual_feed: 'DualFeed') -> None:
         self._config = config
+        self._dual_feed = dual_feed
         self._state = DiscoveryState.SEARCHING
         self._active_market: Optional[ActiveMarket] = None
         self._active_since: Optional[datetime] = None
@@ -95,7 +96,6 @@ class MarketDiscovery:
         self._running = False
         self._last_log_time: float = 0.0
         self._candidate_pool: list[dict[str, Any]] = []
-        self._vatic_cache: dict[str, Any] = {"epoch": None, "price": None}
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -969,82 +969,48 @@ class MarketDiscovery:
         except Exception:
             return None
 
-    async def _fetch_vatic_strike(self, epoch_ts: int) -> Optional[float]:
-        """Fetch precise strike price from Vatic Oracle with epoch caching."""
-        # FIX 1: Guard against TTL/offsets being passed instead of timestamps
-        assert epoch_ts > 1_700_000_000, f"epoch_ts looks wrong: {epoch_ts} — expected Unix timestamp"
-        
-        # Force exact 5-minute boundary alignment
-        epoch_ts = (epoch_ts // 300) * 300
-
-        if self._vatic_cache["epoch"] == epoch_ts and self._vatic_cache["price"] is not None:
-            return self._vatic_cache["price"]
-
-        url = "https://api.vatic.trading/api/v1/targets/timestamp"
-        try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                resp = await client.get(
-                    url, 
-                    params={"asset": "btc", "type": "5min", "timestamp": epoch_ts}
-                )
-                if resp.is_success:
-                    data = resp.json()
-                    price = data.get("target_price") or data.get("target") or data.get("price")
-                    if price:
-                        price_float = float(price)
-                        self._vatic_cache = {"epoch": epoch_ts, "price": price_float}
-                        logger.info("vatic_strike_fetch_success", 
-                                    epoch=epoch_ts, 
-                                    strike=price_float)
-                        return price_float
-                    else:
-                        logger.warning("vatic_strike_missing_in_payload", 
-                                       epoch=epoch_ts, 
-                                       payload=data)
-                else:
-                    logger.error("vatic_strike_fetch_http_error",
-                                 epoch=epoch_ts,
-                                 status_code=resp.status_code,
-                                 response=resp.text[:200])
-        except Exception as e:
-            logger.error("vatic_strike_fetch_failed",
-                         epoch=epoch_ts,
-                         error=str(e),
-                         error_type=type(e).__name__)
-            
-        return None
 
     async def _get_strike_price(self, market_data: dict, epoch_ts: int) -> Optional[float]:
         """
         Unified strike price resolver with multiple fallback layers.
-        1. Vatic Oracle (Primary)
-        2. Polymarket Metadata (Secondary)
-        3. Binance Spot Approximation (Last Resort)
+        1. Chainlink RTDS Snapshot at Epoch (Primary - Official Settlement Source)
+        2. Chainlink RTDS Current (Secondary - acceptable for very fresh markets)
+        3. Polymarket Metadata (Tertiary - Fallback)
         """
-        # --- LAYER 1: Vatic Oracle ---
-        try:
-            strike = await self._fetch_vatic_strike(epoch_ts)
-            if strike:
-                return strike
-        except Exception as e:
-            logger.warning("vatic_oracle_unavailable", epoch=epoch_ts, error=str(e))
-
-        # --- LAYER 2: Polymarket Payload ---
-        strike = self._parse_strike_from_market(market_data)
+        # --- LAYER 1: Chainlink Snapshot at Epoch Boundary ---
+        # This is the exact value Polymarket uses for strike price generation.
+        strike = self._dual_feed.get_chainlink_at_epoch(epoch_ts)
         if strike:
-            logger.warning("strike_from_market_fallback", epoch=epoch_ts, strike=strike, reason="vatic_unavailable")
+            logger.info("strike_from_chainlink_rtds",
+                        epoch=epoch_ts,
+                        strike=strike,
+                        source="CHAINLINK_RTDS_SNAPSHOT")
+            market_data["strike_price_source"] = "CHAINLINK_RTDS_SNAPSHOT"
             return strike
 
-        # --- LAYER 3: Binance Approximation ---
-        # Only use if market is fresh enough (TTR > 60s)
-        now = datetime.now(timezone.utc)
-        ttr_sec = epoch_ts + 300 - int(now.timestamp())
-        if ttr_sec > 60:
-            spot = await self._fetch_binance_spot()
-            if spot:
-                logger.warning("strike_approximate_fallback", epoch=epoch_ts, strike=spot, reason="all_sources_failed")
-                return spot
+        # --- LAYER 2: Chainlink Current Price (if epoch boundary was missed) ---
+        # Allow up to 30s drift if we just started the bot
+        current_cl = self._dual_feed.chainlink_price
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if current_cl and abs(now_ts - epoch_ts) < 30:
+            logger.warning("strike_from_chainlink_current",
+                           epoch=epoch_ts,
+                           strike=current_cl,
+                           source="CHAINLINK_RTDS_CURRENT")
+            market_data["strike_price_source"] = "CHAINLINK_RTDS_CURRENT"
+            return current_cl
 
+        # --- LAYER 3: Polymarket Payload ---
+        strike = self._parse_strike_from_market(market_data)
+        if strike:
+            logger.warning("strike_from_market_fallback", 
+                           epoch=epoch_ts, 
+                           strike=strike, 
+                           source="POLYMARKET_PAYLOAD")
+            market_data["strike_price_source"] = "POLYMARKET_PAYLOAD"
+            return strike
+
+        market_data["strike_price_source"] = "UNAVAILABLE"
         return None
 
     def _parse_strike_from_market(self, market_data: dict) -> Optional[float]:

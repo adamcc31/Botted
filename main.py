@@ -118,7 +118,8 @@ class TradingBot:
         self._config = ConfigManager.get_instance()
 
         self._binance = BinanceFeed(self._config)
-        self._discovery = MarketDiscovery(self._config)
+        self._dual_feed = DualFeed(self._config, self._binance)
+        self._discovery = MarketDiscovery(self._config, self._dual_feed)
         self._clob = CLOBFeed(self._config)
         self._feature_engine = FeatureEngine(self._config)
         self._model = ModelEnsemble(self._config)
@@ -126,7 +127,6 @@ class TradingBot:
         self._risk_mgr = RiskManager(self._config)
         self._execution = ExecutionClient(self._config)
         self._fair_prob_engine = FairProbabilityEngine(self._config)
-        self._dual_feed = DualFeed(self._config, self._binance)
         self._spread_filter = SpreadFilter(self._config)
         self._exporter: Exporter | None = None
         self._telegram = TelegramNotifier(self._config)
