@@ -595,28 +595,28 @@ class MarketDiscovery:
                             if not m.get("enableOrderBook"):
                                 continue
 
-                            # --- Patch T_open: use T_resolution − window_duration ---
-                            end_date_str = (
-                                m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
-                            )
-                            T_res = self._parse_timestamp(end_date_str)
-                            if T_res is None:
-                                continue
-                                
+                            # --- Extract Epoch from Slug (SOT for Window Start) ---
+                            # Gamma API returns fake midnight end_dates for active dynamic markets!
                             m_patched = dict(m)
                             window_min = 5
                             if "15m" in prefix: window_min = 15
                             elif "1h" in prefix: window_min = 60
                             
-                            synthetic_open = T_res - timedelta(minutes=window_min)
-                            iso_open = synthetic_open.isoformat()
-                            m_patched["startDateIso"] = iso_open
-                            m_patched["startDate"] = iso_open
-                            m_patched["createdAt"] = iso_open
+                            try:
+                                window_ts = int(slug.split("-")[-1])
+                                resolution_ts = window_ts + (window_min * 60)
+                                
+                                # Override timestamps for parse_market
+                                m_patched["endDateIso"] = datetime.fromtimestamp(resolution_ts, tz=timezone.utc).isoformat()
+                                m_patched["endDate"] = m_patched["endDateIso"]
+                                
+                                m_patched["startDateIso"] = datetime.fromtimestamp(window_ts, tz=timezone.utc).isoformat()
+                                m_patched["startDate"] = m_patched["startDateIso"]
+                                m_patched["createdAt"] = m_patched["startDateIso"]
+                            except (ValueError, IndexError):
+                                continue
 
                             # --- CHAINLINK STRIKE PRICE RESOLUTION ---
-                            # Use deterministic epoch: resolution_ts - window_duration
-                            window_ts = int(T_res.timestamp()) - (window_min * 60)
                             strike = await self._get_strike_price(m_patched, window_ts)
                             if strike:
                                 # Patch both fields used by _parse_strike_from_market
@@ -731,17 +731,26 @@ class MarketDiscovery:
                         # FIX: Only hydrate if it matches a dynamic 5m pattern
                         if slug and self._is_btc_up_down_market(m) and "5m" in slug.lower():
                             try:
-                                end_date_str = m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
-                                T_res = self._parse_timestamp(end_date_str)
-                                if T_res:
-                                    # Determistic epoch: resolution_ts - 300s
-                                    epoch_aligned = int(T_res.timestamp()) - 300
-                                    vatic_strike = await self._get_strike_price(m, epoch_aligned)
+                                epoch_ts = int(slug.split("-")[-1])
+                                if epoch_ts > 1_700_000_000:
+                                    window_min = 5
+                                    if "15m" in slug.lower(): window_min = 15
+                                    elif "1h" in slug.lower(): window_min = 60
+                                    
+                                    # Override fake Gamma API timestamps
+                                    resolution_ts = epoch_ts + (window_min * 60)
+                                    m["endDateIso"] = datetime.fromtimestamp(resolution_ts, tz=timezone.utc).isoformat()
+                                    m["endDate"] = m["endDateIso"]
+                                    m["startDateIso"] = datetime.fromtimestamp(epoch_ts, tz=timezone.utc).isoformat()
+                                    m["startDate"] = m["startDateIso"]
+                                    m["createdAt"] = m["startDateIso"]
+
+                                    vatic_strike = await self._get_strike_price(m, epoch_ts)
                                     if vatic_strike:
                                         # Patch both fields used by _parse_strike_from_market
                                         m["groupItemThreshold"] = str(vatic_strike)
                                         m["strike_price"] = str(vatic_strike)
-                            except Exception:
+                            except (ValueError, IndexError):
                                 pass
 
                         volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
@@ -835,6 +844,21 @@ class MarketDiscovery:
 
             if T_resolution is None or T_open is None:
                 return None
+
+            # --- Gamma API Fake Midnight Override ---
+            # Even if patched earlier, ensure we ALWAYS trust the slug epoch for dynamic markets
+            if is_dynamic_5m and slug:
+                try:
+                    epoch_ts = int(slug.split("-")[-1])
+                    if epoch_ts > 1_700_000_000:
+                        window_min = 5
+                        if "15m" in slug.lower(): window_min = 15
+                        elif "1h" in slug.lower(): window_min = 60
+                        
+                        T_open = datetime.fromtimestamp(epoch_ts, tz=timezone.utc)
+                        T_resolution = datetime.fromtimestamp(epoch_ts + (window_min * 60), tz=timezone.utc)
+                except (ValueError, IndexError):
+                    pass
 
             lifespan_minutes = (T_resolution - T_open).total_seconds() / 60.0
             
