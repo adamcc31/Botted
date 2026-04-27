@@ -100,8 +100,9 @@ class MarketDiscovery:
         self._running = False
         self._last_log_time: float = 0.0
         self._candidate_pool: list[dict[str, Any]] = []
-        # Epoch strike cache: captured Chainlink prices at exact epoch boundaries
-        self._epoch_strike_cache: dict[int, float] = {}
+        # Epoch strike cache: (price, source) tuples per epoch
+        # Populated by VaticFeed (primary) or epoch_strike_catcher (fallback)
+        self._epoch_strike_cache: dict[int, tuple[float, str]] = {}
         self._pending_epoch_tasks: set[int] = set()  # epochs with scheduled catchers
         # Active bid tracking — prevents rotation away from markets with open positions
         self._has_active_bid: bool = False
@@ -286,6 +287,26 @@ class MarketDiscovery:
         self._has_active_bid = False
         logger.info("bid_resolved_on_market",
                     market_id=self._active_market.market_id if self._active_market else None)
+
+    def inject_vatic_strike(self, epoch_ts: int, price: float, source: str) -> None:
+        """
+        Callback for VaticFeed — injects official strike price into cache.
+
+        Called on every window_open event from wss://api.vatic.trading/ws.
+        Overrides any existing cache entry (Vatic is SOT).
+        """
+        old = self._epoch_strike_cache.get(epoch_ts)
+        self._epoch_strike_cache[epoch_ts] = (price, source)
+
+        logger.info("vatic_strike_injected",
+                    epoch=epoch_ts,
+                    price=price,
+                    source=source,
+                    overridden_old=old[0] if old else None,
+                    overridden_source=old[1] if old else None)
+
+        # Cancel pending epoch catcher — Vatic already provided the price
+        self._pending_epoch_tasks.discard(epoch_ts)
 
     async def _handle_active(self) -> None:
         """
@@ -1044,35 +1065,57 @@ class MarketDiscovery:
 
     async def _schedule_epoch_strike_capture(self, epoch_ts: int) -> None:
         """
-        Wait until epoch_ts arrives, then capture the Chainlink price
-        as the official strike price for that epoch boundary.
+        Fallback strike capture — waits 15 seconds AFTER epoch boundary
+        to give VaticFeed time to deliver the official price.
+
+        If Vatic already populated the cache, this task is a no-op.
+        If not, falls back to Chainlink first-tick from RTDS history.
         """
         import time as _time
-        now = _time.time()
-        wait_seconds = epoch_ts - now
 
-        if wait_seconds > 0:
+        # Wait until epoch boundary + 15s grace period for Vatic
+        target_time = epoch_ts + 15
+        wait = target_time - _time.time()
+        if wait > 0:
             logger.info("epoch_strike_catcher_waiting",
                         epoch=epoch_ts,
-                        wait_seconds=round(wait_seconds, 1))
-            await asyncio.sleep(wait_seconds)
+                        wait_seconds=round(wait, 1),
+                        note="15s_grace_for_vatic")
+            await asyncio.sleep(wait)
 
-        # Small buffer to let the Chainlink tick arrive
-        await asyncio.sleep(0.5)
+        # Check if Vatic already provided the price
+        if epoch_ts in self._epoch_strike_cache:
+            cached = self._epoch_strike_cache[epoch_ts]
+            logger.debug("epoch_catcher_skipped_vatic_available",
+                         epoch=epoch_ts,
+                         price=cached[0],
+                         source=cached[1])
+            self._pending_epoch_tasks.discard(epoch_ts)
+            return
 
-        strike = self._dual_feed.chainlink_price
+        # Vatic failed — fallback to Chainlink
+        logger.warning("vatic_timeout_chainlink_fallback",
+                       epoch=epoch_ts,
+                       waited_seconds=15)
+
+        # Try first tick at/after epoch from RTDS history
+        strike = self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts)
+        if not strike:
+            # Last resort: current Chainlink price
+            strike = self._dual_feed.chainlink_price
+
         delay_ms = int((_time.time() - epoch_ts) * 1000)
 
         if strike and strike > 0:
-            self._epoch_strike_cache[epoch_ts] = strike
-            logger.info("strike_captured_at_epoch",
+            self._epoch_strike_cache[epoch_ts] = (strike, "CHAINLINK_FALLBACK")
+            logger.info("strike_captured_chainlink_fallback",
                         epoch=epoch_ts,
                         strike=strike,
                         delay_ms=delay_ms)
         else:
-            logger.warning("strike_capture_failed_no_chainlink",
-                           epoch=epoch_ts,
-                           delay_ms=delay_ms)
+            logger.error("strike_capture_failed_all_sources",
+                         epoch=epoch_ts,
+                         delay_ms=delay_ms)
 
         # Cleanup: remove from pending set
         self._pending_epoch_tasks.discard(epoch_ts)
@@ -1092,22 +1135,23 @@ class MarketDiscovery:
         now_ts = _time.time()
         epoch_delta = epoch_ts - now_ts  # positive = future, negative = past
 
-        # --- LAYER 0: Epoch Strike Cache (captured by boundary catcher) ---
+        # --- LAYER 0: Epoch Strike Cache (Vatic SOT or Chainlink fallback) ---
         cached = self._epoch_strike_cache.get(epoch_ts)
         if cached:
+            price, source = cached
             logger.info("strike_from_epoch_cache",
                         epoch=epoch_ts,
-                        strike=cached,
-                        source="EPOCH_CACHE")
-            market_data["strike_price_source"] = "CHAINLINK_EPOCH_CACHE"
-            return cached
+                        strike=price,
+                        source=source)
+            market_data["strike_price_source"] = source
+            return price
 
         # --- LAYER 1: First Chainlink Tick AT/AFTER Epoch (most accurate) ---
         if epoch_delta < 0:  # epoch is in the past
             strike = self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts)
             if strike:
                 # Cache it for future lookups
-                self._epoch_strike_cache[epoch_ts] = strike
+                self._epoch_strike_cache[epoch_ts] = (strike, "CHAINLINK_FIRST_TICK")
                 logger.info("strike_from_chainlink_first_tick",
                             epoch=epoch_ts,
                             strike=strike,
@@ -1211,11 +1255,13 @@ class MarketDiscovery:
 
         if diff > 0.01:  # More than $0.01 difference
             # Override the cached value
-            old_price = self._epoch_strike_cache.get(epoch_ts, initial_strike)
-            self._epoch_strike_cache[epoch_ts] = verified
+            old_entry = self._epoch_strike_cache.get(epoch_ts)
+            old_price = old_entry[0] if old_entry else initial_strike
+            verify_source = "RTDS_FIRST_TICK" if self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts) else "HTTP_FALLBACK"
+            self._epoch_strike_cache[epoch_ts] = (verified, f"VERIFIED_{verify_source}")
 
             logger.warning("strike_price_verified",
-                           source="RTDS_FIRST_TICK" if self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts) else "HTTP_FALLBACK",
+                           source=verify_source,
                            epoch=epoch_ts,
                            old_price=round(old_price, 2),
                            new_price=round(verified, 2),

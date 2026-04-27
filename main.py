@@ -83,6 +83,7 @@ from src.signal_generator import SignalGenerator
 from src.spread_filter import SpreadFilter
 from src.telegram_notifier import TelegramNotifier
 from src.database import DatabaseManager
+from src.vatic_feed import VaticFeed
 from sqlalchemy import text
 
 SLUG_PREFIX = os.getenv("POLYMARKET_SLUG_PREFIX", "btc-updown-5m")
@@ -120,6 +121,7 @@ class TradingBot:
         self._binance = BinanceFeed(self._config)
         self._dual_feed = DualFeed(self._config, self._binance)
         self._discovery = MarketDiscovery(self._config, self._dual_feed)
+        self._vatic_feed = VaticFeed(on_strike_price=self._discovery.inject_vatic_strike)
         self._clob = CLOBFeed(self._config)
         self._feature_engine = FeatureEngine(self._config)
         self._model = ModelEnsemble(self._config)
@@ -446,6 +448,7 @@ class TradingBot:
         tasks = [
             asyncio.create_task(self._binance.start(), name="binance_feed"),
             asyncio.create_task(self._dual_feed.start(), name="dual_feed_rtds"),
+            asyncio.create_task(self._vatic_feed.start(), name="vatic_feed"),
             asyncio.create_task(self._discovery.start(), name="market_discovery"),
             asyncio.create_task(self._clob.start(), name="clob_ws_loop"),
             asyncio.create_task(self._run_clob_loop(), name="clob_feed"),
