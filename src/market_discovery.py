@@ -538,7 +538,9 @@ class MarketDiscovery:
                             window_ts = (int(synthetic_open.timestamp()) // 300) * 300
                             vatic_strike = await self._get_strike_price(m_patched, window_ts)
                             if vatic_strike:
+                                # Patch both fields used by _parse_strike_from_market
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
+                                m_patched["strike_price"] = str(vatic_strike)
 
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
@@ -643,7 +645,9 @@ class MarketDiscovery:
                                     epoch_aligned = (epoch_raw // 300) * 300
                                     vatic_strike = await self._get_strike_price(m, epoch_aligned)
                                     if vatic_strike:
+                                        # Patch both fields used by _parse_strike_from_market
                                         m["groupItemThreshold"] = str(vatic_strike)
+                                        m["strike_price"] = str(vatic_strike)
                             except (ValueError, IndexError):
                                 pass
 
@@ -1032,10 +1036,10 @@ class MarketDiscovery:
             return strike
 
         # --- LAYER 3: Binance Approximation ---
-        # Only use if market is fresh (TTR > 4 minutes) to avoid massive basis risk
+        # Only use if market is fresh enough (TTR > 60s)
         now = datetime.now(timezone.utc)
         ttr_sec = epoch_ts + 300 - int(now.timestamp())
-        if ttr_sec > 240:
+        if ttr_sec > 60:
             spot = await self._fetch_binance_spot()
             if spot:
                 logger.warning("strike_approximate_fallback", epoch=epoch_ts, strike=spot, reason="all_sources_failed")
