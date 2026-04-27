@@ -1055,6 +1055,19 @@ class MarketDiscovery:
                 market_data["strike_price_source"] = "CHAINLINK_RTDS_SNAPSHOT"
                 return strike
 
+            # History empty (cold start) — use current Chainlink price.
+            # Window is already active, so strike is already locked.
+            # Current price is valid approximation (BTC moves <0.1% in 5min).
+            current_cl = self._dual_feed.chainlink_price
+            if current_cl and current_cl > 0:
+                logger.warning("strike_window_active_using_chainlink",
+                               epoch=epoch_ts,
+                               strike=current_cl,
+                               elapsed_seconds=int(-epoch_delta),
+                               source="CHAINLINK_RTDS_ACTIVE_WINDOW")
+                market_data["strike_price_source"] = "CHAINLINK_RTDS_ACTIVE_WINDOW"
+                return current_cl
+
         # --- LAYER 2: Current Chainlink Price (within ±30s of epoch) ---
         if abs(epoch_delta) <= 30:
             current_cl = self._dual_feed.chainlink_price
