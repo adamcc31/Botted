@@ -534,8 +534,8 @@ class MarketDiscovery:
                             m_patched["createdAt"] = iso_open
 
                             # --- VATIC ORACLE HYDRATION ---
-                            # Use window start time as the oracle epoch
-                            window_ts = int(synthetic_open.timestamp())
+                            # Use window start time as the oracle epoch, forced to 5-min boundary
+                            window_ts = (int(synthetic_open.timestamp()) // 300) * 300
                             vatic_strike = await self._fetch_vatic_strike(window_ts)
                             if vatic_strike:
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
@@ -630,6 +630,20 @@ class MarketDiscovery:
 
                         if not self._is_btc_up_down_market(m):
                             continue
+
+                        # --- Path B Vatic Hydration ---
+                        slug = m.get("slug", "")
+                        if slug:
+                            try:
+                                # Extract epoch from slug (e.g., btc-updown-5m-1712345600)
+                                epoch_str = slug.split("-")[-1]
+                                epoch_raw = int(epoch_str)
+                                epoch_aligned = (epoch_raw // 300) * 300
+                                vatic_strike = await self._fetch_vatic_strike(epoch_aligned)
+                                if vatic_strike:
+                                    m["groupItemThreshold"] = str(vatic_strike)
+                            except (ValueError, IndexError):
+                                pass
 
                         volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
                         if volume < min_volume:
@@ -973,6 +987,9 @@ class MarketDiscovery:
 
     async def _fetch_vatic_strike(self, epoch_ts: int) -> Optional[float]:
         """Fetch precise strike price from Vatic Oracle with epoch caching."""
+        # Force exact 5-minute boundary alignment
+        epoch_ts = (epoch_ts // 300) * 300
+
         if self._vatic_cache["epoch"] == epoch_ts and self._vatic_cache["price"] is not None:
             return self._vatic_cache["price"]
 
@@ -985,16 +1002,28 @@ class MarketDiscovery:
                 )
                 if resp.is_success:
                     data = resp.json()
-                    # Per the documentation, they provide strike price absolute based on epoch timestamp.
                     price = data.get("target_price") or data.get("target") or data.get("price")
                     if price:
                         price_float = float(price)
-                        # Simpan ke cache
                         self._vatic_cache = {"epoch": epoch_ts, "price": price_float}
-                        logger.info("vatic_oracle_strike_acquired", epoch=epoch_ts, strike=price_float)
+                        logger.info("vatic_strike_fetch_success", 
+                                    epoch=epoch_ts, 
+                                    strike=price_float)
                         return price_float
+                    else:
+                        logger.warning("vatic_strike_missing_in_payload", 
+                                       epoch=epoch_ts, 
+                                       payload=data)
+                else:
+                    logger.error("vatic_strike_fetch_http_error",
+                                 epoch=epoch_ts,
+                                 status_code=resp.status_code,
+                                 response=resp.text[:200])
         except Exception as e:
-            logger.debug("vatic_api_fetch_failed", epoch=epoch_ts, error=str(e))
+            logger.error("vatic_strike_fetch_failed",
+                         epoch=epoch_ts,
+                         error=str(e),
+                         error_type=type(e).__name__)
             
         return None
 
