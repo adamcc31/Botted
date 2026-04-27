@@ -1173,8 +1173,14 @@ class MarketDiscovery:
         # --- LAYER 1: First Chainlink Tick AT/AFTER Epoch (most accurate) ---
         if epoch_delta < 0:  # epoch is in the past
             strike = self._dual_feed.get_chainlink_first_tick_at_epoch(epoch_ts)
-            if strike:
-                # Cache it for future lookups
+
+            # Validate that the RTDS buffer actually covers the epoch boundary.
+            # If the bot started mid-epoch, the buffer's earliest tick will be
+            # AFTER epoch_ts, making 'strike' a stale mid-window price — not T+0.
+            rtds_covers_epoch = self._dual_feed.rtds_buffer_covers_epoch(epoch_ts)
+
+            if strike and rtds_covers_epoch:
+                # Buffer has data from before/at epoch_ts → this is the true opening price
                 self._epoch_strike_cache[epoch_ts] = (strike, "CHAINLINK_FIRST_TICK")
                 logger.info("strike_from_chainlink_first_tick",
                             epoch=epoch_ts,
@@ -1184,8 +1190,25 @@ class MarketDiscovery:
                 market_data["strike_price_source"] = "CHAINLINK_FIRST_TICK"
                 return strike
 
-            # Layer 1b: History empty (cold start) — use current Chainlink price.
-            # Window is already active, so strike is already locked.
+            # Buffer doesn't cover epoch_ts (cold start / mid-epoch bot start).
+            # Fetch historical price directly from HTTP — do NOT use mid-window price.
+            logger.warning("rtds_buffer_stale_fetching_historical",
+                           epoch=epoch_ts,
+                           epoch_delta_seconds=int(epoch_delta),
+                           rtds_covers_epoch=rtds_covers_epoch)
+            historical_strike = await self._fetch_historical_strike_at_epoch(epoch_ts)
+            if historical_strike and historical_strike > 0:
+                self._epoch_strike_cache[epoch_ts] = (historical_strike, "CHAINLINK_HISTORICAL_HTTP")
+                logger.info("strike_from_chainlink_historical",
+                            epoch=epoch_ts,
+                            strike=historical_strike,
+                            epoch_delta_seconds=int(epoch_delta),
+                            source="CHAINLINK_HISTORICAL_HTTP")
+                market_data["strike_price_source"] = "CHAINLINK_HISTORICAL_HTTP"
+                return historical_strike
+
+            # Layer 1b: All historical sources failed — use current Chainlink price as last resort.
+            # This is intentionally a warning: the strike will be approximate.
             current_cl = self._dual_feed.chainlink_price
             if current_cl and current_cl > 0:
                 logger.warning("strike_window_active_using_chainlink",
@@ -1307,6 +1330,126 @@ class MarketDiscovery:
                         epoch=epoch_ts,
                         strike=round(verified, 2),
                         diff_usd=round(diff, 2))
+
+    async def _fetch_historical_strike_at_epoch(self, epoch_ts: int) -> Optional[float]:
+        """
+        Fetch the precise BTC/USD price at epoch_ts from historical HTTP sources.
+
+        Called when the RTDS buffer doesn't cover epoch_ts (bot started mid-epoch
+        or Vatic was down at window open). Tries two sources in order:
+
+        1. Chainlink aggregator on-chain via Polygon RPC (most accurate — same
+           oracle that Polymarket uses for resolution).
+        2. CryptoCompare histominute OPEN price (reliable fallback, ~1s granularity
+           at the minute boundary, uses open not close to approximate T+0).
+        """
+        import time as _time
+
+        # ── Source 1: Chainlink on-chain via Polygon RPC ─────────────────
+        # Query latestRoundData before epoch_ts using binary search on round IDs.
+        # For simplicity we use a known approximate round and walk forward.
+        try:
+            BTC_USD_FEED = "0xc907E116054Ad103354f2D350FD2514433D57F6f"  # Polygon mainnet
+            POLYGON_RPC  = "https://polygon-rpc.com"
+
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                # latestRoundData() → (roundId, answer, startedAt, updatedAt, answeredInRound)
+                payload = {
+                    "jsonrpc": "2.0", "method": "eth_call",
+                    "params": [{"to": BTC_USD_FEED, "data": "0xfeaf968c"}, "latest"],
+                    "id": 1,
+                }
+                r = await client.post(POLYGON_RPC, json=payload, timeout=8.0)
+                r.raise_for_status()
+                result_hex = r.json().get("result", "")
+                if result_hex and len(result_hex) >= 2 + 5 * 64:
+                    # Decode ABI tuple: each field is 32 bytes (64 hex chars)
+                    # skip 0x prefix
+                    data = result_hex[2:]
+                    round_id  = int(data[0:64],   16)
+                    answer    = int(data[64:128],  16) / 1e8   # 8 decimals
+                    updated_at = int(data[192:256], 16)         # unix timestamp
+
+                    # If the latest round is AFTER epoch_ts, walk back one round.
+                    # Chainlink Polygon typically updates every ~20-30 seconds.
+                    # We iterate up to 20 rounds to find the one closest to epoch_ts.
+                    best_price: Optional[float] = None
+                    best_delta = float("inf")
+
+                    for offset in range(20):
+                        rid = round_id - offset
+                        # getRoundData(uint80 _roundId)
+                        rid_hex = hex(rid)[2:].zfill(64)
+                        r2 = await client.post(POLYGON_RPC, json={
+                            "jsonrpc": "2.0", "method": "eth_call",
+                            "params": [{"to": BTC_USD_FEED,
+                                        "data": "0x9a6fc8f5" + rid_hex}, "latest"],
+                            "id": 2 + offset,
+                        }, timeout=8.0)
+                        res2 = r2.json().get("result", "")
+                        if not res2 or len(res2) < 2 + 5 * 64:
+                            break
+                        d2 = res2[2:]
+                        r_answer    = int(d2[64:128],  16) / 1e8
+                        r_updated   = int(d2[192:256], 16)
+
+                        if r_updated <= epoch_ts:
+                            # This round updated BEFORE or AT epoch — best candidate so far
+                            delta = epoch_ts - r_updated
+                            if delta < best_delta and r_answer > 1000:
+                                best_delta = delta
+                                best_price = r_answer
+                            # Once we've gone past the boundary, we have the answer
+                            break
+                        # Round is after epoch — keep walking back
+
+                    if best_price and best_price > 1000 and best_delta < 120:
+                        logger.info("historical_strike_chainlink_onchain",
+                                    epoch=epoch_ts,
+                                    price=round(best_price, 2),
+                                    round_delta_seconds=int(best_delta))
+                        return best_price
+
+        except Exception as e:
+            logger.debug("historical_strike_chainlink_rpc_failed", error=str(e))
+
+        # ── Source 2: CryptoCompare histominute OPEN price ────────────────
+        # Uses the OPEN of the minute candle that contains epoch_ts.
+        # OPEN ≈ first tick of the minute → better approximation than CLOSE.
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(
+                    "https://min-api.cryptocompare.com/data/v2/histominute",
+                    params={
+                        "fsym": "BTC",
+                        "tsym": "USD",
+                        "limit": 2,
+                        "toTs": epoch_ts + 60,   # fetch the minute that contains epoch_ts
+                        "aggregate": 1,
+                    },
+                    timeout=8.0,
+                )
+                if resp.is_success:
+                    candles = resp.json().get("Data", {}).get("Data", [])
+                    # Find the candle whose open time <= epoch_ts
+                    for candle in sorted(candles, key=lambda c: c.get("time", 0)):
+                        c_time  = candle.get("time", 0)
+                        c_open  = float(candle.get("open", 0))
+                        c_close = float(candle.get("close", 0))
+                        if c_time <= epoch_ts and c_open > 1000:
+                            # Prefer open price as approximation for T+0
+                            price = c_open if abs(c_time - epoch_ts) < 60 else c_close
+                            logger.info("historical_strike_cryptocompare",
+                                        epoch=epoch_ts,
+                                        candle_time=c_time,
+                                        price=round(price, 2),
+                                        used_field="open" if price == c_open else "close")
+                            return price
+        except Exception as e:
+            logger.debug("historical_strike_cryptocompare_failed", error=str(e))
+
+        logger.error("historical_strike_all_sources_failed", epoch=epoch_ts)
+        return None
 
     def _parse_strike_from_market(self, market_data: dict) -> Optional[float]:
         """Extract strike price from raw Polymarket payload fields or text."""
