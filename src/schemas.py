@@ -112,6 +112,14 @@ class ActiveMarket(BaseModel):
             "Parsed from market rules. Used to assess basis risk."
         ),
     )
+    strike_price_source: Optional[str] = Field(
+        default=None,
+        description=(
+            "Source of the strike price (e.g. 'VATIC_WS_LIVE', 'VATIC_WS_SNAPSHOT', "
+            "'CHAINLINK_FIRST_TICK', 'CHAINLINK_HISTORICAL_HTTP', 'POLYMARKET_PAYLOAD'). "
+            "Set by VaticFeed callback or Chainlink fallback resolution."
+        ),
+    )
 
     @field_validator("strike_price")
     @classmethod

@@ -330,10 +330,8 @@ class MarketDiscovery:
         ):
             old_strike = self._active_market.strike_price
             self._active_market = self._active_market.model_copy(
-                update={"strike_price": price}
+                update={"strike_price": price, "strike_price_source": source}
             )
-            # Set the dynamic property for tracking source
-            self._active_market.strike_price_source = source
             logger.info("vatic_override_active_market_strike",
                         epoch=epoch_ts,
                         old_strike=round(old_strike, 2),
