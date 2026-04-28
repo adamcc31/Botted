@@ -116,7 +116,7 @@ class ExecutionClient:
             # Step 1: Create temporary client with just the private key
             temp_client = ClobClient(
                 host="https://clob.polymarket.com",
-                chain_id=137,  # Polygon mainnet
+                chain=137,  # Polygon mainnet
                 key=private_key,
             )
 
@@ -129,11 +129,22 @@ class ExecutionClient:
             # Step 3: Initialize the full trading client
             self._clob_client = ClobClient(
                 host="https://clob.polymarket.com",
-                chain_id=137,
+                chain=137,
                 key=private_key,
                 creds=api_creds,
-                signature_type=0,  # 0=EOA, 1=POLY_GNOSIS_SAFE, 2=POLY_PROXY
             )
+
+            # V2_MIGRATION: Startup check for API key invalidation
+            try:
+                self._clob_client.get_order_book(token_id="test")
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    logger.critical(
+                        "v2_auth_failed_regenerate_api_keys",
+                        error=str(e),
+                        action="Login to Polymarket UI after 12:00 UTC April 28, regenerate L2 API keys"
+                    )
+                    raise SystemExit(1)
 
             logger.info("clob_client_initialized", signature_type="EOA")
 
@@ -223,14 +234,17 @@ class ExecutionClient:
                 edge=round(edge, 6),
             )
 
-            order = self._clob_client.create_and_post_order(
-                token_id=token_id,
-                price=order_price,
-                size=approved_bet.bet_size,
-                side="BUY",
-            )
-
-            order_id = order.get("id") or order.get("orderID", "")
+            # TODO: V2_MIGRATION — re-enable after dry-run confirmed working
+            # order = self._clob_client.create_and_post_order(
+            #     token_id=token_id,
+            #     price=order_price,
+            #     size=approved_bet.bet_size,
+            #     side="BUY",
+            # )
+            # order_id = order.get("id") or order.get("orderID", "")
+            logger.info("V2_MIGRATION: write/execute function disabled for dry-run validation")
+            order = {"id": "mock_id_v2_migration"}
+            order_id = "mock_id_v2_migration"
 
             if order_id:
                 return await self._monitor_fill(order_id)

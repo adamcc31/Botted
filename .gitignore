@@ -29,4 +29,11 @@ models/
 Thumbs.db
 
 #example project
-example_project
+example_project/*
+
+# other file
+dataset/
+models/
+model_training/
+plugin/
+tmp/

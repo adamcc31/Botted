@@ -247,11 +247,11 @@ def _build_active_market(row: Dict[str, Any], cfg: ConfigManager) -> ActiveMarke
         T_resolution=t_resolution,
         TTR_minutes=ttr_minutes,
         clob_token_ids={"YES": "", "NO": ""},
-        settlement_exchange="BINANCE",
+        settlement_exchange="CHAINLINK",
         settlement_instrument="BTCUSDT",
         settlement_granularity="1m",
         settlement_price_type="close",
-        resolution_source="Binance",
+        resolution_source="Chainlink",
     )
 
 

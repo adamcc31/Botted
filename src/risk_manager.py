@@ -243,7 +243,14 @@ class RiskManager:
         bet_size = raw_bet * time_mult * vig_mult
         bet_size = max(bet_size, min_bet)
         bet_size = min(bet_size, capital * max_bet_frac)
-        bet_size = round(bet_size, 2)  # USDC 2-decimal precision
+        
+        # Custom integer rounding: <= 0.5 rounds down, > 0.5 rounds up
+        int_part = int(bet_size)
+        dec_part = bet_size - int_part
+        if dec_part <= 0.5:
+            bet_size = float(int_part)
+        else:
+            bet_size = float(int_part + 1)
 
         return bet_size, kelly_fraction, kelly_multiplier
 

@@ -128,22 +128,9 @@ class ModelEnsemble:
 
     def load_latest(self) -> bool:
         """Load the latest model version from disk."""
-        model_dir = _get_model_dir()
-
-        # Find latest LGBM model file
-        lgbm_files = sorted(
-            glob.glob(str(model_dir / "model_lgbm_v*.pkl")),
-            reverse=True,
-        )
-
-        if not lgbm_files:
-            logger.warning("no_model_files_found", dir=str(model_dir))
-            return False
-
-        latest_lgbm = Path(lgbm_files[0])
-        version = latest_lgbm.stem.replace("model_lgbm_", "")
-
-        return self.load_version(version)
+        # V2_MIGRATION: AI Amnesia Mode - Model loading disabled for Rule Engine deterministic execution
+        logger.warning("AI_AMNESIA_MODE_ACTIVE_MODEL_LOADING_DISABLED")
+        return False
 
     def load_version(self, version: str) -> bool:
         """Load a specific model version."""

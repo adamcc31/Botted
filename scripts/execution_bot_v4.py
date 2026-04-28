@@ -79,15 +79,22 @@ class SlowSkewBotV4:
                 f.write("trigger_ts,z_score,poly_up_ask,poly_up_bid,ask_size,bid_size,latency_ms,status,source\n")
 
     def init_clob_client(self):
-        api_key = os.environ.get("POLY_BUILDER_API_KEY")
-        api_secret = os.environ.get("POLY_BUILDER_SECRET")
-        api_passphrase = os.environ.get("POLY_BUILDER_PASSPHRASE")
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
-        if not all([api_key, api_secret, api_passphrase, private_key]):
+        if not private_key:
             return False
         try:
-            creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
-            self.clob_client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137, creds=creds)
+            temp_client = ClobClient(host="https://clob.polymarket.com", chain=137, key=private_key)
+            creds = temp_client.derive_api_key()
+            self.clob_client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain=137, creds=creds)
+            
+            # V2_MIGRATION: API key startup check
+            try:
+                self.clob_client.get_order_book("test")
+            except Exception as e:
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    logger.critical("v2_auth_failed_regenerate_api_keys", extra={"error": str(e), "action": "Login to Polymarket UI after 12:00 UTC April 28, regenerate L2 API keys"})
+                    sys.exit(1)
+                    
             logger.info("Polymarket CLOB Client Initialized.")
             return True
         except Exception:
@@ -346,9 +353,9 @@ class SlowSkewBotV4:
             if self.clob_client and self.yes_token_id:
                 book = self.clob_client.get_order_book(self.yes_token_id)
                 if book.asks:
-                    ask, ask_sz = float(book.asks[0].price), float(book.asks[0].size)
+                    ask, ask_sz = float(book.asks[-1].price), float(book.asks[-1].size)
                 if book.bids:
-                    bid, bid_sz = float(book.bids[0].price), float(book.bids[0].size)
+                    bid, bid_sz = float(book.bids[-1].price), float(book.bids[-1].size)
             
             latency = time.time() * 1000 - start_ms
             with open(self.telemetry_file, "a") as f:

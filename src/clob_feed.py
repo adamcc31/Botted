@@ -121,7 +121,14 @@ class CLOBFeed:
                     self._ws_connection = ws
                     logger.info("clob_ws_connected", tokens=list(self._active_tokens))
                     
-                    sub_msg = {"auth": {}, "type": "MARKET", "assets_ids": list(self._active_tokens)}
+                    # V2_MIGRATION: Defensive WS subscription (assets_ids vs market_ids)
+                    sub_msg = {
+                        "auth": {}, 
+                        "type": "MARKET", 
+                        "assets_ids": list(self._active_tokens),
+                        "market_ids": list(self._active_tokens),
+                        "assets": list(self._active_tokens)
+                    }
                     await ws.send(json.dumps(sub_msg))
                     
                     async for raw_msg in ws:
@@ -331,31 +338,34 @@ class CLOBFeed:
     @staticmethod
     def _best_ask(book: dict) -> float:
         """Extract best (lowest) ask price."""
-        asks = book.get("asks", [])
+        # V2_MIGRATION: asks are sorted DESC, best ask is at the end
+        asks = book.get("asks") or book.get("ask") or book.get("data", {}).get("asks") or []
         if not asks:
             return 1.0  # No asks → max price
         try:
-            prices = [float(a.get("price", 1.0)) for a in asks]
-            return min(prices) if prices else 1.0
-        except (ValueError, TypeError):
+            best_ask_obj = asks[-1]
+            return float(best_ask_obj.get("price", 1.0))
+        except (ValueError, TypeError, IndexError, AttributeError):
             return 1.0
 
     @staticmethod
     def _best_bid(book: dict) -> float:
         """Extract best (highest) bid price."""
-        bids = book.get("bids", [])
+        # V2_MIGRATION: bids are sorted DESC, best bid is at the beginning
+        bids = book.get("bids") or book.get("bid") or book.get("data", {}).get("bids") or []
         if not bids:
             return 0.0  # No bids → min price
         try:
-            prices = [float(b.get("price", 0.0)) for b in bids]
-            return max(prices) if prices else 0.0
-        except (ValueError, TypeError):
+            best_bid_obj = bids[0]
+            return float(best_bid_obj.get("price", 0.0))
+        except (ValueError, TypeError, IndexError, AttributeError):
             return 0.0
 
     @staticmethod
     def _calc_depth_near_ask(book: dict, best_ask: float, pct: float = 0.03) -> float:
         """Calculate total USDC depth within pct% of best ask."""
-        asks = book.get("asks", [])
+        # V2_MIGRATION: field name may have changed
+        asks = book.get("asks") or book.get("ask") or book.get("data", {}).get("asks") or []
         total_depth = 0.0
         upper_bound = best_ask * (1.0 + pct)
 

@@ -1,6 +1,6 @@
 polars==1.39.3
 python-binance==1.0.36
-py-clob-client==0.34.6
+py-clob-client-v2
 numpy==2.2.3
 pandas==2.2.3
 dateparser==1.4.0

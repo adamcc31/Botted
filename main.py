@@ -1154,16 +1154,27 @@ class TradingBot:
         wait_seconds = (market.T_resolution - now).total_seconds()
 
         if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds + 5)  # +5s buffer for price settlement
+            await asyncio.sleep(wait_seconds + 16)  # +16s buffer for Vatic to arrive
 
-        # Get BTC price at resolution
-        price = await self._binance.get_1m_settlement_price(
-            resolution_time=market.T_resolution,
-            price_type=(market.settlement_price_type or "close"),
-        )
-        if price is None:
-            # Final fallback: use last observed price (less correct than candle-aligned resolution).
-            price = self._binance.latest_price
+        # Get BTC price at resolution using VATIC API / Chainlink (No Binance Fallback)
+        epoch_ts = int(market.T_resolution.timestamp())
+        cached_sot = self._discovery._epoch_strike_cache.get(epoch_ts)
+        
+        if cached_sot:
+            price = cached_sot[0]
+        else:
+            oracle_price, oracle_source = self._dual_feed.get_oracle_price_with_source()
+            if oracle_price is not None and oracle_source != "UNAVAILABLE":
+                price = oracle_price
+            else:
+                price = float('nan')
+                logger.error("resolution_price_unavailable", 
+                             trade_id=trade.trade_id, 
+                             market_id=trade.market_id)
+
+        if np.isnan(price):
+            logger.warning("skipping_trade_resolution_due_to_nan_price", trade_id=trade.trade_id)
+            return
 
         resolved = await self._dry_run.resolve_trade(trade, price)
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
@@ -1198,27 +1209,34 @@ class TradingBot:
         now = datetime.now(timezone.utc)
         wait_seconds = (market.T_resolution - now).total_seconds()
         
-        # Wait until the market officially resolves + 5 seconds buffer
+        # Wait until the market officially resolves + 16 seconds buffer for Vatic
         if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds + 5)
+            await asyncio.sleep(wait_seconds + 16)
             
         m_id = market.market_id
         strike_price = market.strike_price
         
-        # ── SETTLEMENT PRICE (Use Chainlink from dual_feed) ──
-        snapshot = self._dual_feed.get_snapshot()
+        # ── SETTLEMENT PRICE (Use Vatic / Chainlink from dual_feed) ──
+        epoch_ts = int(market.T_resolution.timestamp())
+        cached_sot = self._discovery._epoch_strike_cache.get(epoch_ts)
         
-        if snapshot and not snapshot.is_stale:
-            settlement_price = snapshot.chainlink_price
-            price_source = "CHAINLINK"
+        if cached_sot:
+            settlement_price = cached_sot[0]
+            price_source = cached_sot[1]
         else:
-            settlement_price = self._binance.latest_price
-            price_source = "BINANCE_FALLBACK"
-            logger.warning("settlement_price_fallback", 
-                           market_id=m_id, 
-                           reason="chainlink_stale_or_unavailable")
+            oracle_price, oracle_source = self._dual_feed.get_oracle_price_with_source()
         
-        if settlement_price is not None:
+        if oracle_price is not None and oracle_source != "UNAVAILABLE":
+            settlement_price = oracle_price
+            price_source = oracle_source
+        else:
+            settlement_price = float('nan')
+            price_source = "UNAVAILABLE"
+            logger.error("settlement_price_unavailable", 
+                           market_id=m_id, 
+                           reason="chainlink_and_vatic_unavailable_no_binance_fallback")
+        
+        if settlement_price is not None and not np.isnan(settlement_price):
             actual_outcome = "BUY_UP" if settlement_price >= strike_price else "BUY_DOWN"
             
             try:
