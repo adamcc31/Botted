@@ -951,7 +951,7 @@ class TradingBot:
             if signal.abstain_reason:
                 stats["reasons"][signal.abstain_reason] += 1
             
-            current_max_edge = max(signal.edge_yes, signal.edge_no)
+            current_max_edge = max(signal.edge_yes or 0.0, signal.edge_no or 0.0)
             if current_max_edge > stats["max_edge"]:
                 stats["max_edge"] = current_max_edge
             return
@@ -1217,6 +1217,8 @@ class TradingBot:
         strike_price = market.strike_price
         
         # ── SETTLEMENT PRICE (Use Vatic / Chainlink from dual_feed) ──
+        oracle_price = None
+        oracle_source = "UNAVAILABLE"
         epoch_ts = int(market.T_resolution.timestamp())
         cached_sot = self._discovery._epoch_strike_cache.get(epoch_ts)
         
@@ -1226,15 +1228,15 @@ class TradingBot:
         else:
             oracle_price, oracle_source = self._dual_feed.get_oracle_price_with_source()
         
-        if oracle_price is not None and oracle_source != "UNAVAILABLE":
-            settlement_price = oracle_price
-            price_source = oracle_source
-        else:
-            settlement_price = float('nan')
-            price_source = "UNAVAILABLE"
-            logger.error("settlement_price_unavailable", 
-                           market_id=m_id, 
-                           reason="chainlink_and_vatic_unavailable_no_binance_fallback")
+            if oracle_price is not None and oracle_source != "UNAVAILABLE":
+                settlement_price = oracle_price
+                price_source = oracle_source
+            else:
+                settlement_price = float('nan')
+                price_source = "UNAVAILABLE"
+                logger.error("settlement_price_unavailable", 
+                               market_id=m_id, 
+                               reason="chainlink_and_vatic_unavailable_no_binance_fallback")
         
         if settlement_price is not None and not np.isnan(settlement_price):
             actual_outcome = "BUY_UP" if settlement_price >= strike_price else "BUY_DOWN"

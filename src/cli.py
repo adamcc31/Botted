@@ -133,16 +133,19 @@ def build_model_panel(signal: Optional[SignalResult]) -> Panel:
             border_style="dim",
         )
 
-    # Edge display
-    edge_yes_style = "green bold" if signal.edge_yes > 0.05 else "dim"
-    edge_no_style = "green bold" if signal.edge_no > 0.05 else "dim"
+    # Edge display (guard None — edge_yes/edge_no are Optional[float])
+    edge_yes = signal.edge_yes if signal.edge_yes is not None else 0.0
+    edge_no = signal.edge_no if signal.edge_no is not None else 0.0
 
-    edge_yes_txt = f"[{edge_yes_style}]{signal.edge_yes:+.3f}[/]"
-    edge_no_txt = f"[{edge_no_style}]{signal.edge_no:+.3f}[/]"
+    edge_yes_style = "green bold" if edge_yes > 0.05 else "dim"
+    edge_no_style = "green bold" if edge_no > 0.05 else "dim"
 
-    if signal.edge_yes > 0.05:
+    edge_yes_txt = f"[{edge_yes_style}]{edge_yes:+.3f}[/]"
+    edge_no_txt = f"[{edge_no_style}]{edge_no:+.3f}[/]"
+
+    if edge_yes > 0.05:
         edge_yes_txt += " ■ SIGNAL"
-    if signal.edge_no > 0.05:
+    if edge_no > 0.05:
         edge_no_txt += " ■ SIGNAL"
 
     # Signal direction

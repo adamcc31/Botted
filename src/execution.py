@@ -91,13 +91,14 @@ class ExecutionClient:
         """
         Initialize py-clob-client SDK.
 
-        AUTHENTICATION ARCHITECTURE (from Polymarket docs):
+        AUTHENTICATION ARCHITECTURE (V2 Migration):
           - CLOB trading credentials are DERIVED from wallet private key.
           - There is NO separate API key/secret for CLOB trading.
-          - py-clob-client.createOrDeriveApiKey() generates CLOB creds
+          - py-clob-client-v2 derive_api_key() generates CLOB creds
             deterministically from the wallet's private key signature.
-          - Builder API Keys (POLY_BUILDER_*) are ONLY for the gasless
-            relayer (on-chain ops like approve/redeem), NOT for trading.
+          - V2: POLY_BUILDER_* env vars are FULLY DEPRECATED (removed).
+            Builder attribution now uses builderCode (bytes32) per order.
+          - V2: Collateral is pUSD (not USDC.e). Wrap via Collateral Onramp.
         """
         try:
             # Lazy import — only needed for live mode
@@ -151,7 +152,7 @@ class ExecutionClient:
         except ImportError:
             logger.error(
                 "py_clob_client_not_installed",
-                fix="pip install py-clob-client",
+                fix="pip install py-clob-client-v2",
             )
             self._confirmed = False
         except Exception as e:
@@ -235,6 +236,9 @@ class ExecutionClient:
             )
 
             # TODO: V2_MIGRATION — re-enable after dry-run confirmed working
+            # V2 API: feeRateBps, nonce, taker are REMOVED.
+            # Optional: builderCode for builder attribution.
+            # Collateral: pUSD (not USDC.e). Ensure wrap() before first trade.
             # order = self._clob_client.create_and_post_order(
             #     token_id=token_id,
             #     price=order_price,
