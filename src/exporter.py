@@ -38,46 +38,44 @@ class Exporter:
 
     # ── Trades Export ─────────────────────────────────────────
 
-    def export_trades(self, trades: List[PaperTrade]) -> Path:
-        """Export resolved trades to CSV per Appendix B trades.csv schema."""
-        if not trades:
-            logger.info("no_trades_to_export")
-            return self._session_dir / "trades.csv"
-
-        records = []
-        for t in trades:
-            records.append({
-                "trade_id": t.trade_id,
-                "session_id": t.session_id,
-                "market_id": t.market_id,
-                "timestamp_signal": t.timestamp_signal.isoformat() if t.timestamp_signal else "",
-                "trigger_timestamp": t.trigger_timestamp.isoformat() if t.trigger_timestamp else "",
-                "timestamp_resolution": t.timestamp_resolution.isoformat() if t.timestamp_resolution else "",
-                "signal_type": t.signal_type,
-                "P_model": t.P_model,
-                "synthetic_edge": t.synthetic_edge,
-                "live_edge": t.live_edge,
-                "entry_price_usdc": t.entry_price,
-                "bet_size_usd": t.bet_size,
-                "kelly_fraction": t.kelly_fraction,
-                "kelly_multiplier": t.kelly_multiplier,
-                "strike_price": t.strike_price,
-                "btc_price_at_trigger": t.btc_price_at_trigger,
-                "btc_distance_to_strike": t.btc_distance_to_strike,
-                "TTR_minutes": t.TTR_at_entry,
-                "btc_at_resolution": t.btc_at_resolution,
-                "outcome": t.outcome,
-                "pnl_usd": t.pnl_usd,
-                "pnl_pct_capital": t.pnl_pct_capital,
-                "capital_before": t.capital_before,
-                "capital_after": t.capital_after,
-                "mode": "DRY",
-            })
-
-        df = pd.DataFrame(records)
+    def append_trade(self, t: PaperTrade) -> None:
+        """Append a single resolved trade to trades.csv in real-time."""
         path = self._session_dir / "trades.csv"
-        df.to_csv(path, index=False)
-        logger.info("trades_exported", path=str(path), count=len(records))
+        file_exists = path.exists()
+
+        record = {
+            "trade_id": t.trade_id,
+            "session_id": t.session_id,
+            "market_id": t.market_id,
+            "timestamp_signal": t.timestamp_signal.isoformat() if t.timestamp_signal else "",
+            "trigger_timestamp": t.trigger_timestamp.isoformat() if t.trigger_timestamp else "",
+            "timestamp_resolution": t.timestamp_resolution.isoformat() if t.timestamp_resolution else "",
+            "signal_type": t.signal_type,
+            "P_model": t.P_model,
+            "synthetic_edge": t.synthetic_edge,
+            "live_edge": t.live_edge,
+            "entry_price_usdc": t.entry_price,
+            "bet_size_usd": t.bet_size,
+            "kelly_fraction": t.kelly_fraction,
+            "kelly_multiplier": t.kelly_multiplier,
+            "strike_price": t.strike_price,
+            "btc_price_at_trigger": t.btc_price_at_trigger,
+            "btc_distance_to_strike": t.btc_distance_to_strike,
+            "TTR_minutes": t.TTR_at_entry,
+            "btc_at_resolution": t.btc_at_resolution,
+            "outcome": t.outcome,
+            "pnl_usd": t.pnl_usd,
+            "pnl_pct_capital": t.pnl_pct_capital,
+            "capital_before": t.capital_before,
+            "capital_after": t.capital_after,
+            "mode": "DRY",
+        }
+        df = pd.DataFrame([record])
+        df.to_csv(path, mode='a', header=not file_exists, index=False)
+
+    def export_trades(self, trades: List[PaperTrade]) -> Path:
+        """Legacy export method for shutdown."""
+        path = self._session_dir / "trades.csv"
         return path
 
     # ── Performance Export ────────────────────────────────────
@@ -100,8 +98,11 @@ class Exporter:
     # ── CLOB Log ──────────────────────────────────────────────
 
     def record_clob_snapshot(self, clob_state: CLOBState, ttr_minutes: float) -> None:
-        """Record CLOB snapshot for clob_log.csv."""
-        self._clob_log.append({
+        """Record CLOB snapshot and append immediately to clob_log.csv."""
+        path = self._session_dir / "clob_log.csv"
+        file_exists = path.exists()
+
+        record = {
             "timestamp": clob_state.timestamp.isoformat(),
             "market_id": clob_state.market_id,
             "TTR_minutes": round(ttr_minutes, 2),
@@ -113,15 +114,13 @@ class Exporter:
             "no_depth_usd": round(clob_state.no_depth_usd, 2),
             "market_vig": round(clob_state.market_vig, 4),
             "is_liquid": clob_state.is_liquid,
-        })
+        }
+        df = pd.DataFrame([record])
+        df.to_csv(path, mode='a', header=not file_exists, index=False)
 
     def export_clob_log(self) -> Path:
-        """Export accumulated CLOB log to CSV."""
+        """Legacy export method for shutdown."""
         path = self._session_dir / "clob_log.csv"
-        if self._clob_log:
-            df = pd.DataFrame(self._clob_log)
-            df.to_csv(path, index=False)
-            logger.info("clob_log_exported", path=str(path), snapshots=len(self._clob_log))
         return path
 
     # ── Equity Curve ──────────────────────────────────────────

@@ -1179,6 +1179,10 @@ class TradingBot:
         resolved = await self._dry_run.resolve_trade(trade, price)
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
 
+        # Real-time CSV append for safety against container crashes
+        if self._exporter:
+            self._exporter.append_trade(resolved)
+
         # Clear one-bet-per-market lock
         self._active_bets.pop(trade.market_id, None)
 
@@ -1409,6 +1413,11 @@ class TradingBot:
                         cutoff = now - timedelta(seconds=90)
                         while self._odds_history[m_id] and self._odds_history[m_id][0][0] < cutoff:
                             self._odds_history[m_id].popleft()
+                            
+                        # Real-time CLOB log append
+                        if self._exporter:
+                            ttr_minutes = (market.T_resolution - now).total_seconds() / 60.0
+                            self._exporter.record_clob_snapshot(state, ttr_minutes)
                 except Exception as e:
                     logger.error("clob_loop_error", error=str(e))
 
