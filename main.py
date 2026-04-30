@@ -796,36 +796,7 @@ class TradingBot:
         q_fair = fair.q_fair
         uncertainty_u = fair.uncertainty_u
 
-        # ── Probability Source Selection (explicit policy) ────
-        p_model = q_fair
-        if fv and self._xgboost_gate.is_loaded:
-            # Reconstruct raw features dict expected by predict_quality
-            raw_features = dict(zip(fv.feature_names, fv.values))
-            
-            # Predict quality
-            gate_res = self._xgboost_gate.evaluate_signal(
-                raw_features=raw_features,
-                entry_odds=clob_state.yes_ask if clob_state else 0.5
-            )
-            
-            if gate_res["decision"] == "PASS":
-                p_model = gate_res["p_win"]
-                logger.info(
-                    "ml_model_signal_passed",
-                    p_win=round(p_model, 4),
-                    ev=round(gate_res["ev"], 4),
-                )
-            else:
-                logger.debug("ml_model_signal_rejected", reason=gate_res["reason"])
-        
-        logger.info(
-            "probability_source_applied",
-            q_fair=round(q_fair, 4),
-            p_model=round(p_model, 4),
-            uncertainty_u=round(uncertainty_u, 4),
-        )
-
-        # ── ML Features Collection ────────────────────────────
+        # ── ML Features Collection (MUST happen before XGBoost gate) ─
         ml_features = {}
         if fv:
             ml_features = dict(zip(fv.feature_names, fv.values))
@@ -845,6 +816,67 @@ class TradingBot:
             ml_features["btc_return_1m"] = (current_btc - btc_60s_ago) / btc_60s_ago
         else:
             ml_features["btc_return_1m"] = None
+
+        # ── Build RAW_FEATURES dict for XGBoost gate ──────────────
+        # Map FeatureEngine 24-feature names → training CSV column names
+        # that inference.py / build_features() expects.
+        obi_val = ml_features.get("OBI")
+        tfm_val = ml_features.get("TFM_normalized")
+        vol_pct = ml_features.get("vol_percentile")
+        
+        xgb_raw_features = {
+            # Microstructure (from FeatureEngine)
+            "obi_value":           obi_val,
+            "tfm_value":           tfm_val,
+            "depth_ratio":         ml_features.get("depth_ratio"),
+            "obi_tfm_product":     (obi_val or 0) * (tfm_val or 0),
+            "obi_tfm_alignment":   1.0 if (obi_val or 0) * (tfm_val or 0) > 0 else 0.0,
+            # Volatility
+            "rv_value":            ml_features.get("RV"),
+            "vol_percentile":      vol_pct,
+            # Strike-relative
+            "strike_distance_pct": ml_features.get("strike_distance_pct"),
+            "contest_urgency":     ml_features.get("contest_urgency"),
+            "ttr_seconds":         (market.T_resolution - datetime.now(timezone.utc)).total_seconds(),
+            # CLOB / Market odds
+            "odds_yes":            clob_state.yes_ask if clob_state else None,
+            "odds_no":             clob_state.no_ask if clob_state else None,
+            "entry_odds":          clob_state.yes_ask if clob_state else None,
+            "odds_yes_60s_ago":    odds_60s_ago,
+            "odds_delta_60s":      ml_features.get("odds_delta_60s"),
+            # Price / Spread
+            "spread_pct":          getattr(spread_result, "spread_pct", None),
+            "btc_return_1m":       ml_features.get("btc_return_1m"),
+            # Signal engine
+            "confidence_score":    q_fair,
+            # Timestamp for hour_wib / is_weekend features
+            "timestamp":           datetime.now(timezone.utc).isoformat(),
+        }
+
+        # ── Probability Source Selection (XGBoost Alpha V1) ────
+        p_model = q_fair
+        if fv and self._xgboost_gate.is_loaded:
+            gate_res = self._xgboost_gate.evaluate_signal(
+                raw_features=xgb_raw_features,
+                entry_odds=clob_state.yes_ask if clob_state else 0.5,
+            )
+            
+            if gate_res["decision"] == "PASS":
+                p_model = gate_res["p_win"]
+                logger.info(
+                    "ml_model_signal_passed",
+                    p_win=round(p_model, 4),
+                    ev=round(gate_res["ev"], 4),
+                )
+            else:
+                logger.debug("ml_model_signal_rejected", reason=gate_res["reason"])
+        
+        logger.info(
+            "probability_source_applied",
+            q_fair=round(q_fair, 4),
+            p_model=round(p_model, 4),
+            uncertainty_u=round(uncertainty_u, 4),
+        )
 
         # Determine confidence bucket based on ML probability
         # Determine quantitative confidence bucket for ML features
