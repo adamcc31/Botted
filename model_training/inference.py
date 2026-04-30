@@ -342,6 +342,45 @@ class XGBoostGate:
         if ev_threshold is None:
             ev_threshold = EV_CFG.ev_threshold
 
+        # ── HARD GATE: Reject immediately if critical features are missing ──
+        # These are the RAW inputs that feed the 5 SELECTED_FEATURES.
+        # obi_vol_interaction is ENGINEERED (obi_value × vol_percentile),
+        # so we check its parents instead.
+        # If ANY is missing or NaN, the model output is meaningless.
+        # p_win=0.0 guarantees EV=-1.0 → never executes.
+        REQUIRED_FEATURES = [
+            "entry_odds", "contest_urgency", "depth_ratio",
+            "tfm_value", "obi_value", "vol_percentile",
+        ]
+        missing_critical = []
+        for feat in REQUIRED_FEATURES:
+            val = raw_features.get(feat)
+            if val is None:
+                missing_critical.append(feat)
+            else:
+                try:
+                    if np.isnan(float(val)):
+                        missing_critical.append(feat)
+                except (TypeError, ValueError):
+                    missing_critical.append(feat)
+
+        if missing_critical:
+            reason = f"HARD REJECT: missing critical features: {missing_critical}"
+            logger.warning("missing_features_hard_reject: %s", missing_critical)
+            return {
+                "decision": "REJECT",
+                "reason": reason,
+                "p_win": 0.0,
+                "p_win_raw": 0.0,
+                "ev": -1.0,
+                "entry_odds": entry_odds,
+                "ev_threshold": ev_threshold,
+                "confidence": "REJECTED",
+                "kelly_fraction": 0.0,
+                "model_version": self._model_version,
+                "missing_features": missing_critical,
+            }
+
         # Predict
         prediction = self.predict_quality(raw_features)
         p_win = prediction["p_win"]
