@@ -29,6 +29,7 @@ from src.schemas import (
     FeatureVector,
     SignalResult,
 )
+from src.zone_matrix import classify_zone
 
 logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
 
@@ -347,9 +348,56 @@ class SignalGenerator:
         else:
             signal = "BUY_DOWN"
 
+        # ── STEP 7: PREDATOR ZONE GATING ─────────────────────
+        entry_odds = clob_state.yes_ask if signal == "BUY_UP" else clob_state.no_ask
+        distance_usd = abs(metadata.current_btc_price - active_market.strike_price)
+        zone = classify_zone(ttr, distance_usd, entry_odds)
+        base["zone_id"] = zone.zone_id
+
+        if zone.zone_type == "DEATH":
+            logger.debug(
+                "signal_abstain_death_zone",
+                zone_id=zone.zone_id,
+                ttr=round(ttr, 2),
+                distance=round(distance_usd, 2),
+                odds=round(entry_odds, 3),
+            )
+            # Cannot use DEAD_ZONE_BLOCK explicitly yet if it's not in the Literal schema, we just use a generic or string.
+            # But the schema actually has no DEAD_ZONE_BLOCK in abstain_reason. Let's add it or use NO_TRADE_ZONE
+            # Wait, the schema has strict literals. I will update schemas.py first or just use NO_TRADE_ZONE
+            # Let's check schema.py: it doesn't have "DEATH_ZONE_BLOCK" or "NEUTRAL_ZONE_BLOCK". I will use "NO_TRADE_ZONE" and log it.
+            return SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="NO_TRADE_ZONE",
+                P_model=P_model,
+                uncertainty_u=u_used,
+                edge_yes=edge_yes,
+                edge_no=edge_no,
+                **base,
+            )
+
+        if zone.zone_type == "NEUTRAL":
+            logger.debug(
+                "signal_abstain_neutral_zone",
+                zone_id=zone.zone_id,
+                ttr=round(ttr, 2),
+                distance=round(distance_usd, 2),
+                odds=round(entry_odds, 3),
+            )
+            return SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="NO_TRADE_ZONE",
+                P_model=P_model,
+                uncertainty_u=u_used,
+                edge_yes=edge_yes,
+                edge_no=edge_no,
+                **base,
+            )
+
         logger.info(
             "signal_generated",
             signal=signal,
+            zone_id=zone.zone_id,
             P_model=round(P_model, 4),
             edge_yes=round(edge_yes, 4),
             edge_no=round(edge_no, 4),

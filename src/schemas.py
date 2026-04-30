@@ -228,6 +228,9 @@ class SignalResult(BaseModel):
     live_edge: Optional[float] = None
 
     # ── Dual Feed / Spread Filter fields ─────────────────────
+    zone_id: Optional[str] = Field(
+        default=None, description="Alpha/Death zone classification ID"
+    )
     binance_price_at_signal: Optional[float] = Field(
         default=None, description="Binance BTC price at signal time (from RTDS)"
     )

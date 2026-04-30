@@ -21,7 +21,10 @@ except ModuleNotFoundError:  # pragma: no cover
 import logging
 
 from src.config_manager import ConfigManager
+from src.database import DatabaseManager
 from src.schemas import ApprovedBet, RejectedBet, SignalResult
+from src.zone_matrix import classify_zone
+from sqlalchemy import text
 
 logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
 
@@ -34,20 +37,22 @@ class RiskManager:
     Dynamic multiplier reduces exposure after consecutive losses.
     """
 
-    def __init__(self, config: ConfigManager) -> None:
+    def __init__(self, config: ConfigManager, db: DatabaseManager) -> None:
         self._config = config
+        self._db = db
         self._position_lock = asyncio.Lock()
-        self._open_positions: int = 0
         self._daily_pnl: float = 0.0
         self._session_pnl: float = 0.0
         self._consecutive_losses: int = 0
         self._trade_history: List[dict] = []
+        # Memory-based pending tracking to bridge the gap between approval and DB insertion
+        self._pending_approvals: List[dict] = []
 
     # ── Public Properties ─────────────────────────────────────
 
     @property
     def open_positions(self) -> int:
-        return self._open_positions
+        return len(self._pending_approvals)
 
     @property
     def daily_pnl(self) -> float:
@@ -61,6 +66,37 @@ class RiskManager:
     def consecutive_losses(self) -> int:
         return self._consecutive_losses
 
+    # ── Database Sync ─────────────────────────────────────────
+
+    async def _get_db_exposure(self) -> tuple[int, float]:
+        """
+        Query the database for trades still marked as PENDING.
+        We also clear any stale memory approvals that are older than 30 seconds
+        to prevent memory leaks if a DB insertion failed silently.
+        """
+        now = datetime.utcnow()
+        # Clean up stale memory approvals (> 30 seconds old)
+        self._pending_approvals = [
+            p for p in self._pending_approvals 
+            if (now - p["approved_at"]).total_seconds() < 30.0
+        ]
+        
+        async with self._db.get_session() as session:
+            # Time-lock query: count actual pending trades.
+            # Even if outcome='PENDING', if it's older than max TTR (~1 hour), ignore it to prevent deadlocks.
+            query = text("""
+                SELECT COUNT(trade_id), COALESCE(SUM(bet_size_usd), 0.0)
+                FROM trades
+                WHERE outcome = 'PENDING'
+                  AND timestamp_entry >= datetime('now', '-60 minutes')
+            """)
+            result = await session.execute(query)
+            row = result.fetchone()
+            db_count = row[0] if row else 0
+            db_exposure = row[1] if row else 0.0
+            
+            return db_count, db_exposure
+
     # ── Trade Approval ────────────────────────────────────────
 
     async def approve(
@@ -73,62 +109,63 @@ class RiskManager:
         Uses asyncio.Lock to prevent race conditions on position tracking.
         """
         async with self._position_lock:
-            # ── Hard Limit Checks ─────────────────────────────
+            # 1. Real-time Database Synchronization
+            db_open, db_exposure = await self._get_db_exposure()
+            
+            # Combine DB state with uncommitted memory state
+            total_open = db_open + len(self._pending_approvals)
+            mem_exposure = sum(p["bet_size"] for p in self._pending_approvals)
+            total_exposure = db_exposure + mem_exposure
 
+            # ── Hard Limit Checks ─────────────────────────────
             daily_loss_limit = self._config.get("risk.daily_loss_limit_pct", 0.05)
             session_loss_limit = self._config.get("risk.session_loss_limit_pct", 0.03)
-            max_positions = 1
+            max_positions = int(self._config.get("risk.max_positions", 3))
+            max_exposure_pct = float(self._config.get("risk.max_exposure_pct", 0.60))
             min_capital_floor = 5.0
 
             if self._daily_pnl < -(daily_loss_limit * capital):
-                logger.warning(
-                    "daily_loss_limit_hit",
-                    daily_pnl=round(self._daily_pnl, 2),
-                    limit=round(-daily_loss_limit * capital, 2),
-                )
                 return RejectedBet(signal=signal, reason="DAILY_LOSS_LIMIT_HIT")
 
             if self._session_pnl < -(session_loss_limit * capital):
-                logger.warning(
-                    "session_loss_limit_hit",
-                    session_pnl=round(self._session_pnl, 2),
-                    limit=round(-session_loss_limit * capital, 2),
-                )
                 return RejectedBet(signal=signal, reason="SESSION_LOSS_LIMIT_HIT")
 
-            if self._open_positions >= max_positions:
+            if total_open >= max_positions:
                 return RejectedBet(signal=signal, reason="MAX_POSITIONS_REACHED")
+                
+            available_exposure = max(0.0, (capital * max_exposure_pct) - total_exposure)
+            min_bet = self._config.get("risk.min_bet_usd", 1.00)
+            
+            if available_exposure < min_bet:
+                return RejectedBet(signal=signal, reason="MAX_EXPOSURE_REACHED")
 
             if capital < min_capital_floor:
-                logger.critical(
-                    "capital_below_floor",
-                    capital=round(capital, 2),
-                    floor=min_capital_floor,
-                )
                 return RejectedBet(signal=signal, reason="CAPITAL_BELOW_FLOOR")
 
             # ── Bet Sizing ────────────────────────────────────
-
             bet_size, kelly_fraction, kelly_multiplier = self._compute_bet_size(
-                signal, capital
+                signal, capital, available_exposure
             )
 
-            min_bet = self._config.get("risk.min_bet_usd", 1.00)
             if bet_size < min_bet:
                 return RejectedBet(signal=signal, reason="BET_BELOW_MINIMUM")
 
             # ── Approve ───────────────────────────────────────
-
-            self._open_positions += 1
+            # Register in memory until DB insertion catches up
+            self._pending_approvals.append({
+                "signal_id": getattr(signal, "signal_id", signal.market_id),
+                "bet_size": bet_size,
+                "approved_at": datetime.utcnow()
+            })
 
             logger.info(
                 "trade_approved",
                 signal=signal.signal,
+                zone_id=signal.zone_id,
                 bet_size=round(bet_size, 2),
                 kelly_fraction=round(kelly_fraction, 4),
-                kelly_multiplier=round(kelly_multiplier, 2),
-                capital=round(capital, 2),
-                consecutive_losses=self._consecutive_losses,
+                open_positions=total_open + 1,
+                total_exposure=round(total_exposure + bet_size, 2),
             )
 
             return ApprovedBet(
@@ -181,44 +218,28 @@ class RiskManager:
     # ── Kelly Computation ─────────────────────────────────────
 
     def _compute_bet_size(
-        self, signal: SignalResult, capital: float
+        self, signal: SignalResult, capital: float, available_exposure: float
     ) -> tuple[float, float, float]:
         """
-        Compute bet size using Half-Kelly with dynamic multiplier.
-
+        Compute bet size using empirical Zone-Aware Kelly with dynamic multiplier.
         Returns: (bet_size_usd, kelly_fraction, kelly_multiplier)
         """
-        kelly_divisor = self._config.get("risk.kelly_divisor", 2)
-        max_bet_frac = self._config.get("risk.max_bet_fraction", 0.10)
+        from src.zone_matrix import ALPHA_ZONES
+
         min_bet = self._config.get("risk.min_bet_usd", 1.00)
-        multiplier_decay = self._config.get("risk.consecutive_loss_multiplier", 0.15)
-        kelly_floor = self._config.get("risk.kelly_floor_multiplier", 0.25)
+        multiplier_decay = self._config.get("risk.consecutive_loss_multiplier", 0.10)
+        kelly_floor = self._config.get("risk.kelly_floor_multiplier", 0.50)
 
-        # ── Decimal odds from CLOB ────────────────────────────
-        if signal.signal == "BUY_UP":
-            clob_ask = signal.clob_yes_ask
-            # Conservative probability: subtract uncertainty from the event we bet on.
-            p_win = max(0.0, min(1.0, signal.P_model - signal.uncertainty_u))
-        else:  # BUY_DOWN
-            clob_ask = signal.clob_no_ask
-            p_win = max(0.0, min(1.0, (1.0 - signal.P_model) - signal.uncertainty_u))
-
-        # b = decimal odds: profit per unit wagered if win
-        # For binary: buy at clob_ask, payout $1 → profit = 1/clob_ask - 1
-        if clob_ask <= 0 or clob_ask >= 1:
-            return (min_bet, 0.0, 0.0)
-
-        b = (1.0 - clob_ask) / clob_ask
-
-        # ── Full Kelly Fraction ───────────────────────────────
-        # f* = (p * b - (1 - p)) / b
-        full_kelly = (p_win * b - (1.0 - p_win)) / b
-
-        if full_kelly <= 0:
-            return (min_bet, 0.0, 0.0)
-
-        # ── Half-Kelly ────────────────────────────────────────
-        half_kelly = max(0.0, full_kelly / kelly_divisor)
+        # ── Zone-Aware Kelly Fraction ──────────────────────────
+        # Default to 0 if not found, but it should be found because signal_generator gates it.
+        base_kelly = 0.0
+        for z in ALPHA_ZONES:
+            if z["zone_id"] == signal.zone_id:
+                base_kelly = z.get("kelly", 0.0)
+                break
+                
+        if base_kelly <= 0:
+            return (0.0, 0.0, 0.0)
 
         # ── Dynamic Multiplier (consecutive loss decay) ───────
         kelly_multiplier = max(
@@ -226,31 +247,22 @@ class RiskManager:
             1.0 - self._consecutive_losses * multiplier_decay,
         )
 
-        kelly_fraction = half_kelly
+        kelly_fraction = base_kelly
 
         # ── Final Bet Size ────────────────────────────────────
-        raw_bet = capital * half_kelly * kelly_multiplier
+        raw_bet = capital * base_kelly * kelly_multiplier
+        bet_size = min(raw_bet, available_exposure)
 
-        # Time-aware shrink factor: reduce exposure as resolution approaches.
-        ttr_scale = float(self._config.get("risk.ttr_size_scale_minutes", 10.0))
-        time_mult = min(1.0, max(0.25, float(signal.TTR_minutes) / (ttr_scale + 1e-8)))
-
-        # Liquidity proxy: scale down in more aggressive books (higher vig).
-        vig = float(signal.clob_yes_ask + signal.clob_no_ask - 1.0)
-        max_vig = float(self._config.get("risk.max_vig_for_sizing", 0.07))
-        vig_mult = min(1.0, max(0.25, 1.0 - (max(0.0, vig) / (max_vig + 1e-8))))
-
-        bet_size = raw_bet * time_mult * vig_mult
-        bet_size = max(bet_size, min_bet)
-        bet_size = min(bet_size, capital * max_bet_frac)
-        
-        # Custom integer rounding: <= 0.5 rounds down, > 0.5 rounds up
+        if bet_size < min_bet:
+            return (0.0, 0.0, 0.0)
+            
+        # Integer rounding: <= 0.5 rounds down, > 0.5 rounds up
         int_part = int(bet_size)
         dec_part = bet_size - int_part
         if dec_part <= 0.5:
-            bet_size = float(int_part)
+            bet_size = max(min_bet, float(int_part))
         else:
-            bet_size = float(int_part + 1)
+            bet_size = max(min_bet, float(int_part + 1))
 
         return bet_size, kelly_fraction, kelly_multiplier
 
