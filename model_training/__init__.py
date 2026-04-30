@@ -25,7 +25,14 @@ from .config import (
     EV_CFG,
     DRIFT_CFG,
 )
-from .inference import XGBoostGate
+
+# Lazy import for XGBoostGate — avoid pulling in joblib/xgboost/sklearn
+# at module load time if they haven't been installed yet.
+def __getattr__(name):
+    if name == "XGBoostGate":
+        from .inference import XGBoostGate
+        return XGBoostGate
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ALL_FEATURES",

@@ -35,6 +35,5 @@ example_project/*
 dataset/
 models/
 !models/alpha_v1/
-model_training/
 plugin/
 tmp/
