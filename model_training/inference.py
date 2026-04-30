@@ -239,8 +239,8 @@ class XGBoostGate:
                 )[0]
             )
 
-        # Clip ke [0, 1] untuk safety
-        p_cal = float(np.clip(p_cal, 0.0, 1.0))
+        # Clip ke [0.30, 0.72] berdasarkan reality-accurate backtest
+        p_cal = float(np.clip(p_cal, 0.30, 0.72))
         p_raw = float(np.clip(p_raw, 0.0, 1.0))
 
         # --- Confidence tier ---
@@ -307,10 +307,14 @@ class XGBoostGate:
             return float("-inf")
 
         # Clip p_win
-        p_win = float(np.clip(p_win, 0.0, 1.0))
+        p_win = float(np.clip(p_win, 0.30, 0.72))
 
-        # EV = P(WIN) × payout_if_win - P(LOSE) × stake
-        payout_multiplier = (1.0 / entry_odds) - 1.0
+        # Fee/slippage accounting
+        POLYMARKET_FEE = 0.02
+        SLIPPAGE_ESTIMATE = 0.005
+
+        # EV = P(WIN) × net_payout_if_win - P(LOSE) × stake
+        payout_multiplier = ((1.0 / entry_odds) - 1.0) * (1.0 - POLYMARKET_FEE - SLIPPAGE_ESTIMATE)
         ev = p_win * payout_multiplier - (1.0 - p_win)
 
         return float(ev)
@@ -458,9 +462,13 @@ class XGBoostGate:
         if entry_odds <= 0 or np.isnan(p_win) or np.isnan(entry_odds):
             return 0.0
 
-        p = float(np.clip(p_win, 0.0, 1.0))
+        p = float(np.clip(p_win, 0.30, 0.72))
         q = 1.0 - p
-        b = (1.0 / entry_odds) - 1.0
+        
+        # Fee/slippage accounting untuk net odds
+        POLYMARKET_FEE = 0.02
+        SLIPPAGE_ESTIMATE = 0.005
+        b = ((1.0 / entry_odds) - 1.0) * (1.0 - POLYMARKET_FEE - SLIPPAGE_ESTIMATE)
 
         if b <= 0:
             return 0.0
@@ -469,9 +477,9 @@ class XGBoostGate:
         if full_kelly <= 0:
             return 0.0
 
-        # Apply fractional Kelly + cap
-        sized = full_kelly * EV_CFG.kelly_fraction
-        capped = min(sized, EV_CFG.max_kelly_pct)
+        # Apply Quarter-Kelly + 3% hard cap
+        quarter_kelly = full_kelly * 0.25
+        capped = min(quarter_kelly, 0.03)
 
         return round(float(capped), 6)
 
