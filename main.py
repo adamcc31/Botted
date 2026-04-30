@@ -76,7 +76,7 @@ from src.execution import ExecutionClient
 from src.exporter import Exporter
 from src.feature_engine import FeatureEngine
 from src.market_discovery import MarketDiscovery
-from src.model import ModelEnsemble
+from model_training.inference import XGBoostGate
 from src.fair_probability import FairProbabilityEngine
 from src.risk_manager import RiskManager
 from src.signal_generator import SignalGenerator
@@ -134,7 +134,7 @@ class TradingBot:
         self._vatic_feed = VaticFeed(on_strike_price=self._discovery.inject_vatic_strike)
         self._clob = CLOBFeed(self._config)
         self._feature_engine = FeatureEngine(self._config)
-        self._model = ModelEnsemble(self._config)
+        self._xgboost_gate = XGBoostGate()
         self._signal_gen = SignalGenerator(self._config)
         self._risk_mgr = RiskManager(self._config)
         self._execution = ExecutionClient(self._config)
@@ -338,7 +338,7 @@ class TradingBot:
                 break
                 
             try:
-                metrics = self._dry_run.compute_session_metrics(self._model.version)
+                metrics = self._dry_run.compute_session_metrics(self._xgboost_gate.version)
                 summary = {
                     "trades_executed": metrics.trades_executed,
                     "win_rate (trades)": f"{metrics.win_rate*100:.1f}%" if metrics.win_rate is not None else "N/A",
@@ -396,10 +396,12 @@ class TradingBot:
         logger.info("market_filter_active", slug_prefix=SLUG_PREFIX, is_ultrashort=IS_ULTRASHORT)
 
         # Load model
-        if not self._model.load_latest():
+        try:
+            self._xgboost_gate.load_model(Path("models/alpha_v1"))
+        except Exception as e:
             logger.warning(
                 "no_model_loaded_running_in_data_collection_mode",
-                info="ML model not available; trading uses settlement-aligned fair probability.",
+                info=f"ML model not available: {e}. Trading uses settlement-aligned fair probability.",
             )
 
         # Bootstrap historical data
@@ -536,7 +538,7 @@ class TradingBot:
         await self._db.close()
 
         # Export session data
-        metrics = self._dry_run.compute_session_metrics(self._model.version)
+        metrics = self._dry_run.compute_session_metrics(self._xgboost_gate.version)
         if self._exporter:
             self._exporter.export_session(
                 trades=self._dry_run._resolved_trades,
@@ -795,28 +797,33 @@ class TradingBot:
         uncertainty_u = fair.uncertainty_u
 
         # ── Probability Source Selection (explicit policy) ────
-        prob_source = str(
-            self._config.get("signal.probability_source", "fair")
-        ).lower()
         p_model = q_fair
-        if prob_source in ("ensemble", "hybrid"):
-            model_prob = self._model.predict(np.array(fv.values))
-            if prob_source == "ensemble":
-                p_model = model_prob
-            else:
-                # Hybrid: fair value remains anchor, model contributes directional prior.
-                fair_w = float(self._config.get("signal.hybrid_fair_weight", 0.7))
-                model_w = float(self._config.get("signal.hybrid_model_weight", 0.3))
-                total_w = max(1e-8, fair_w + model_w)
-                p_model = ((fair_w * q_fair) + (model_w * model_prob)) / total_w
-                p_model = max(0.0, min(1.0, p_model))
-            logger.info(
-                "probability_source_applied",
-                source=prob_source,
-                q_fair=round(q_fair, 4),
-                p_model=round(p_model, 4),
-                uncertainty_u=round(uncertainty_u, 4),
+        if fv and self._xgboost_gate.is_loaded:
+            # Reconstruct raw features dict expected by predict_quality
+            raw_features = dict(zip(fv.feature_names, fv.values))
+            
+            # Predict quality
+            gate_res = self._xgboost_gate.evaluate_signal(
+                raw_features=raw_features,
+                entry_odds=clob_state.yes_ask if clob_state else 0.5
             )
+            
+            if gate_res["decision"] == "PASS":
+                p_model = gate_res["p_win"]
+                logger.info(
+                    "ml_model_signal_passed",
+                    p_win=round(p_model, 4),
+                    ev=round(gate_res["ev"], 4),
+                )
+            else:
+                logger.debug("ml_model_signal_rejected", reason=gate_res["reason"])
+        
+        logger.info(
+            "probability_source_applied",
+            q_fair=round(q_fair, 4),
+            p_model=round(p_model, 4),
+            uncertainty_u=round(uncertainty_u, 4),
+        )
 
         # ── ML Features Collection ────────────────────────────
         ml_features = {}
