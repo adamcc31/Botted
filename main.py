@@ -104,10 +104,20 @@ class TradingBot:
 
     def __init__(self, mode: str = "dry-run", confirm_live: bool = False) -> None:
         self._requested_mode = mode
-        # Effective mode: always start with dry-run simulation when user requests live,
-        # then enable live only after the go-live gate passes.
-        self._mode = "dry-run" if mode == "live" else mode
-        self._confirm_live = confirm_live
+        # ── DRY-RUN HARD LOCK UNTUK ALPHA V1 ENDURANCE RUN (Hingga 4 Mei 2026) ──
+        # Kunci absolut: Bot TIDAK DIIZINKAN untuk melakukan trading live
+        # dan hanya menulis status transaksi ke SQLite / trades.csv (Mock Trade).
+        lock_expiry = datetime(2026, 5, 4, tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) < lock_expiry:
+            if mode == "live":
+                logger.warning("DRY_RUN_HARD_LOCK_ACTIVE: Mengubah mode 'live' menjadi 'dry-run' secara paksa hingga 4 Mei 2026.")
+            self._mode = "dry-run"
+            self._requested_mode = "dry-run"
+            self._confirm_live = False
+        else:
+            self._mode = "dry-run" if mode == "live" else mode
+            self._confirm_live = confirm_live
+
         self._running = False
         self._live_enabled = False
         self._go_live_pass_streak = 0
@@ -424,6 +434,7 @@ class TradingBot:
         )
 
         # Live mode gate (arm live client), but effective trading starts after go-live metrics pass.
+        # HARD LOCK: Tidak akan pernah dijalankan jika tanggal < 4 Mei 2026.
         if self._requested_mode == "live":
             if not self._execution.confirm_live(cli_flag=self._confirm_live):
                 logger.error("live_mode_not_confirmed_falling_back_to_dry_run")
