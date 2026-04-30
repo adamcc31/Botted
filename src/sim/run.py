@@ -284,7 +284,9 @@ async def run_backtest(
     df = df.sort("signal_timestamp_ms")
 
     dry = DryRunEngine(effective_cfg, initial_capital=float(effective_cfg.get("sim.initial_capital", 100.0)))
-    risk = RiskManager(effective_cfg)
+    from src.database import DatabaseManager
+    db = DatabaseManager()
+    risk = RiskManager(effective_cfg, db)
     fair_engine = FairProbabilityEngine(effective_cfg)
     signal_gen = SignalGenerator(effective_cfg)
 

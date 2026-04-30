@@ -136,13 +136,13 @@ class TradingBot:
         self._feature_engine = FeatureEngine(self._config)
         self._xgboost_gate = XGBoostGate()
         self._signal_gen = SignalGenerator(self._config)
-        self._risk_mgr = RiskManager(self._config)
+        self._db = DatabaseManager()
+        self._risk_mgr = RiskManager(self._config, self._db)
         self._execution = ExecutionClient(self._config)
         self._fair_prob_engine = FairProbabilityEngine(self._config)
         self._spread_filter = SpreadFilter(self._config)
         self._exporter: Exporter | None = None
         self._telegram = TelegramNotifier(self._config)
-        self._db = DatabaseManager()
 
         # Dry run / live engine
         initial_capital = 50.0 if self._requested_mode == "dry-run" else 50.0
@@ -230,6 +230,9 @@ class TradingBot:
                     if latest_signal
                     else "N/A",
                     "edge_no": round(getattr(latest_signal, "edge_no", 0.0), 6)
+                    if latest_signal
+                    else "N/A",
+                    "zone_id": getattr(latest_signal, "zone_id", "N/A")
                     if latest_signal
                     else "N/A",
                 }
@@ -424,10 +427,12 @@ class TradingBot:
             "SYSTEM HEALTH START",
             self._tg_kv(
                 {
+                    "architecture": "Predator V3 (Zoned Kelly)",
                     "status": "ACTIVE",
                     "session_id": self._dry_run.session_id,
                     "requested_mode": self._requested_mode,
                     "effective_mode": self._mode,
+                    "max_positions": self._config.get("risk.max_positions", 3),
                     "binance_connected": bool(self._binance.latest_price),
                     "clob_state_present": clob_health is not None,
                     "heartbeat_minutes": self._telegram_heartbeat_minutes,
