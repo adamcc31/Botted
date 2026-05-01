@@ -221,42 +221,67 @@ class RiskManager:
         self, signal: SignalResult, capital: float, available_exposure: float
     ) -> tuple[float, float, float]:
         """
-        Compute bet size using empirical Zone-Aware Kelly with dynamic multiplier.
+        Compute bet size using empirical Zone-Aware Kelly V4 with dynamic multiplier.
         Returns: (bet_size_usd, kelly_fraction, kelly_multiplier)
         """
-        from src.zone_matrix import ALPHA_ZONES
+        from src.zone_matrix import classify_zone
 
         min_bet = self._config.get("risk.min_bet_usd", 1.00)
+        use_flat_bet = self._config.get("risk.use_flat_bet", True)
+        flat_bet_size = self._config.get("risk.flat_bet_size_usd", 1.00)
+        
+        # ── Zone-Aware Kelly V4 ──────────────────────────────
+        # We re-classify to get the V4 properties (fraction and cap)
+        ttr = getattr(signal, "TTR_minutes", 0.0)
+        dist = abs(getattr(signal, "current_price", 0.0) - getattr(signal, "strike_price", 0.0))
+        odds = getattr(signal, "entry_odds", 0.5)
+        
+        zone = classify_zone(ttr, dist, odds)
+        
+        if zone.zone_type != "ALPHA" or zone.kelly_fraction <= 0:
+            return (0.0, 0.0, 0.0)
+
+        if use_flat_bet:
+            # Flat bet mode: return constant size if within available exposure
+            bet_size = min(flat_bet_size, available_exposure)
+            return bet_size, 0.0, 1.0
+
+        # ── Dynamic Kelly Sizing ──────────────────────────────
         multiplier_decay = self._config.get("risk.consecutive_loss_multiplier", 0.10)
         kelly_floor = self._config.get("risk.kelly_floor_multiplier", 0.50)
 
-        # ── Zone-Aware Kelly Fraction ──────────────────────────
-        # Default to 0 if not found, but it should be found because signal_generator gates it.
-        base_kelly = 0.0
-        for z in ALPHA_ZONES:
-            if z["zone_id"] == signal.zone_id:
-                base_kelly = z.get("kelly", 0.0)
-                break
-                
-        if base_kelly <= 0:
-            return (0.0, 0.0, 0.0)
-
-        # ── Dynamic Multiplier (consecutive loss decay) ───────
+        # Dynamic Multiplier (consecutive loss decay)
         kelly_multiplier = max(
             kelly_floor,
             1.0 - self._consecutive_losses * multiplier_decay,
         )
 
-        kelly_fraction = base_kelly
-
-        # ── Final Bet Size ────────────────────────────────────
-        raw_bet = capital * base_kelly * kelly_multiplier
-        bet_size = min(raw_bet, available_exposure)
+        # Signal edge (ML/FairProb derived) - used for Kelly formula base
+        # If signal.live_edge is not available, we could use a conservative edge based on zone.empirical_ev
+        # but the standard approach is to use the model's edge if available.
+        edge = getattr(signal, "live_edge", zone.empirical_ev)
+        if edge <= 0:
+            edge = 0.01 # minimal edge placeholder if somehow missing
+            
+        # raw_kelly = edge / (1 - edge) is for odds=1 (Binary). 
+        # For odds b:1, Kelly is (bp - q) / b. 
+        # Here p = win_prob, q = 1-p. entry_odds = 1 / (b+1).
+        # However, user code specifically said: raw_kelly = edge / (1 - edge)
+        # We will use the user's simplified formula or the zone's empirical edge.
+        
+        raw_kelly = edge / (1 - edge) if edge < 1 else 0.5
+        fractional_kelly = raw_kelly * zone.kelly_fraction * kelly_multiplier
+        
+        bet_size = min(
+            fractional_kelly * capital,
+            zone.kelly_cap * capital,
+            available_exposure
+        )
 
         if bet_size < min_bet:
             return (0.0, 0.0, 0.0)
             
-        # Integer rounding: <= 0.5 rounds down, > 0.5 rounds up
+        # Integer rounding for cleaner execution
         int_part = int(bet_size)
         dec_part = bet_size - int_part
         if dec_part <= 0.5:
@@ -264,7 +289,7 @@ class RiskManager:
         else:
             bet_size = max(min_bet, float(int_part + 1))
 
-        return bet_size, kelly_fraction, kelly_multiplier
+        return bet_size, zone.kelly_fraction, kelly_multiplier
 
     # ── Utility ───────────────────────────────────────────────
 
