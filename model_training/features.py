@@ -67,9 +67,11 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     # odds_delta_60s / odds_yes_60s_ago mengukur kecepatan pergerakan
     # crowd. Crowd yang bergerak cepat ke satu arah → FOMO signal.
     # ------------------------------------------------------------------
-    df["odds_momentum"] = df["odds_delta_60s"] / (
-        df["odds_yes_60s_ago"].abs() + 1e-6
-    )
+    # Ensure numeric and fill NaN to prevent abs() NoneType error
+    odds_yes_60s = pd.to_numeric(df["odds_yes_60s_ago"], errors='coerce').fillna(0.0)
+    odds_delta_60s = pd.to_numeric(df["odds_delta_60s"], errors='coerce').fillna(0.0)
+    
+    df["odds_momentum"] = odds_delta_60s / (odds_yes_60s.abs() + 1e-6)
     # clip ekstrem
     df["odds_momentum"] = df["odds_momentum"].clip(-5.0, 5.0)
 
