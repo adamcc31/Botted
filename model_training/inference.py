@@ -23,6 +23,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
+# Silence Pandas downcasting warning
+pd.set_option('future.no_silent_downcasting', True)
+
 from .config import (
     RAW_FEATURES, ENGINEERED_FEATURES, SELECTED_FEATURES,
     EV_CFG, DRIFT_CFG,
