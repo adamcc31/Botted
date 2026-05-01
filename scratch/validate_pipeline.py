@@ -35,39 +35,39 @@ def test_feature_engineering():
         
         df_out = build_features(df)
         print("Success: build_features completed calculation without NoneType error.")
-        print("Odds Momentum values:")
-        print(df_out["odds_momentum"].values)
         
         # Restore
         mf.ALL_FEATURES = original_all
     except Exception as e:
         print(f"Error: build_features failed: {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
 
 def test_main_imports():
     print("\nTesting main.py imports...")
     try:
-        # We don't want to run the whole main, just check if Counter is there
         import main
-        if hasattr(main, 'Counter'):
-            print("Success: Counter is defined in main.py.")
-        else:
+        if not hasattr(main, 'Counter'):
             print("Error: Counter NOT found in main.py.")
             sys.exit(1)
-    except Exception as e:
-        # main.py might fail on other things (env vars), but we check if NameError happened during import
-        if "Counter" in str(e):
-            print(f"Error: Counter NameError in main.py during import: {e}")
+        if not hasattr(main, 'html'):
+            print("Error: html NOT found in main.py.")
             sys.exit(1)
+        
+        # Test html.escape as used in main.py
+        test_html = main.html.escape("<b>test</b>")
+        if test_html == "&lt;b&gt;test&lt;/b&gt;":
+             print("Success: html.escape is working in main.py.")
         else:
-            # Other errors are fine for this specific test as long as it's not NameError on Counter
-            print(f"Note: main.py import triggered other expected error (env/config): {e}")
-            # If it's a NameError for something else, we should know, but Counter is our focus
-            if isinstance(e, NameError) and "Counter" in str(e):
-                sys.exit(1)
-            print("Success: Counter NameError was NOT triggered.")
+             print(f"Error: html.escape output mismatch: {test_html}")
+             sys.exit(1)
+             
+        print("Success: Critical imports (Counter, html) found in main.py.")
+    except Exception as e:
+        if "Counter" in str(e) or "html" in str(e):
+            print(f"Error: Critical import NameError in main.py: {e}")
+            sys.exit(1)
+        print(f"Note: main.py import triggered other expected error: {e}")
+        print("Success: Critical NameErrors were NOT triggered.")
 
 if __name__ == "__main__":
     test_feature_engineering()
