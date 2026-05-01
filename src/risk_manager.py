@@ -12,6 +12,7 @@ Implements:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from typing import List, Optional, Union
 
 try:
@@ -233,7 +234,15 @@ class RiskManager:
         # ── Zone-Aware Kelly V4 ──────────────────────────────
         # We re-classify to get the V4 properties (fraction and cap)
         ttr = getattr(signal, "TTR_minutes", 0.0)
-        dist = abs(getattr(signal, "current_price", 0.0) - getattr(signal, "strike_price", 0.0))
+        
+        curr_price = getattr(signal, "current_price", None)
+        strike_price = getattr(signal, "strike_price", None)
+        
+        if curr_price is None or strike_price is None:
+            logger.warning("risk_calc_missing_prices", market_id=signal.market_id)
+            return (0.0, 0.0, 0.0)
+            
+        dist = abs(curr_price - strike_price)
         odds = getattr(signal, "entry_odds", 0.5)
         
         zone = classify_zone(ttr, dist, odds)

@@ -147,6 +147,10 @@ class TradingBot:
         # Dry run / live engine
         initial_capital = 50.0 if self._requested_mode == "dry-run" else 50.0
         self._dry_run = DryRunEngine(self._config, self._db, initial_capital=initial_capital)
+        
+        from src.paper_trading import PaperTradingEngine
+        self._paper_engine = PaperTradingEngine(self._config, self._clob)
+        
         self._exporter = Exporter(self._dry_run.session_id)
 
         # Dashboard state
@@ -450,13 +454,18 @@ class TradingBot:
             else:
                 logger.info("live_preflight_ready")
 
-        # Register signal handlers for graceful shutdown
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(
-                sig,
-                lambda: asyncio.create_task(self._graceful_shutdown())
-            )
+        # Register signal handlers for graceful shutdown (POSIX only)
+        if os.name != 'nt':
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(
+                    sig,
+                    lambda: asyncio.create_task(self._graceful_shutdown())
+                )
+        else:
+            # On Windows, signal handling is limited in asyncio. 
+            # SIGINT (Ctrl+C) is usually handled by the default loop's KeyboardInterrupt.
+            pass
 
         # Register bar close and price update callbacks
         self._binance.set_on_bar_close(self._on_bar_close)
@@ -1021,6 +1030,11 @@ class TradingBot:
         synthetic_edge = signal.edge_yes if signal.signal == "BUY_UP" else signal.edge_no
         p_outcome = signal.P_model if signal.signal == "BUY_UP" else (1.0 - signal.P_model)
         live_edge = p_outcome - signal.uncertainty_u - real_best_ask
+        
+        if synthetic_edge is None or live_edge is None:
+            logger.warning("edge_verification_null", market_id=market.market_id)
+            return
+            
         edge_deviation = abs(synthetic_edge - live_edge)
 
         max_buy_price = float(self._config.get("risk.max_buy_price", 0.75))
@@ -1066,8 +1080,20 @@ class TradingBot:
         approved = result
         assert isinstance(approved, ApprovedBet)
 
-        # ── Execute Trade (Dry Run) ───────────────────────────
+        # ── Execute Trade (Dry Run / Paper Trading) ───────────────────────────
         if self._mode == "dry-run":
+            # High-fidelity Paper Trading Execution
+            from src.zone_matrix import classify_zone
+            zone_res = classify_zone(signal.TTR_minutes, signal.strike_distance, signal.clob_yes_ask)
+            
+            paper_record = await self._paper_engine.execute_paper_trade(
+                signal=signal,
+                zone_result=zone_res,
+                bet_size=approved.bet_size,
+                market=market
+            )
+            
+            # Note: we still use DryRunEngine to maintain existing SQLite/CSV logs for legacy dashboards
             trade = self._dry_run.simulate_trade(signal, approved, market)
             self._discovery.mark_trade_executed()
             self._active_bets[market.market_id] = signal  # Register active bet
@@ -1075,18 +1101,19 @@ class TradingBot:
             # Telegram: trade opened (paper order).
             asyncio.create_task(
                 self._send_telegram(
-                    "ORDER EXECUTION (DRY-RUN)",
+                    "ORDER EXECUTION (PAPER-V4)",
                     self._tg_kv(
                         {
                             "session_id": self._dry_run.session_id,
-                            "trade_id": trade.trade_id,
+                            "trade_id": paper_record.trade_id if paper_record else trade.trade_id,
                             "market_id": trade.market_id,
                             "signal": trade.signal_type,
-                            "entry_price": trade.entry_price,
+                            "entry_price": paper_record.simulated_fill_price if paper_record else trade.entry_price,
                             "bet_size": trade.bet_size,
                             "strike_price": trade.strike_price,
                             "btc_now": self._binance.latest_price,
                             "ttr_minutes": trade.TTR_at_entry,
+                            "status": "EXECUTED" if paper_record else "SLIPPED"
                         }
                     ),
                 ),
@@ -1095,7 +1122,7 @@ class TradingBot:
 
             # Schedule resolution
             asyncio.create_task(
-                self._schedule_resolution(trade, market),
+                self._schedule_resolution(trade, market, paper_record),
                 name=f"resolve_{trade.trade_id[:8]}",
             )
         else:
@@ -1203,8 +1230,9 @@ class TradingBot:
         while self._binance_price_history and self._binance_price_history[0][0] < cutoff:
             self._binance_price_history.popleft()
 
-    async def _schedule_resolution(self, trade, market) -> None:
+    async def _schedule_resolution(self, trade, market, paper_record=None) -> None:
         """Wait for market resolution and settle trade."""
+        from src.zone_matrix import classify_zone
         now = datetime.now(timezone.utc)
         wait_seconds = (market.T_resolution - now).total_seconds()
 
@@ -1232,6 +1260,15 @@ class TradingBot:
             return
 
         resolved = await self._dry_run.resolve_trade(trade, price)
+        
+        # Resolve Paper Trade if exists
+        if paper_record:
+            self._paper_engine.resolve_position(
+                market_id=trade.market_id,
+                winner=resolved.outcome,
+                settlement_price=float(price)
+            )
+            
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
 
         # Real-time CSV append for safety against container crashes
@@ -1403,7 +1440,12 @@ class TradingBot:
             if market is None:
                 continue
 
-            is_ultrashort = (IS_ULTRASHORT and SLUG_PREFIX in market.slug) or (market.T_resolution - market.T_open).total_seconds() <= 600
+            if market.T_resolution is None or market.T_open is None:
+                logger.warning("ultrashort_loop_missing_timestamps", market_id=market.market_id)
+                continue
+                
+            lifespan_sec = (market.T_resolution - market.T_open).total_seconds()
+            is_ultrashort = (IS_ULTRASHORT and SLUG_PREFIX in market.slug) or lifespan_sec <= 600
             if not is_ultrashort:
                 continue
 
@@ -1597,7 +1639,7 @@ def main(
         return
 
     # Trading mode
-    click.echo(f"\n🚀 Starting Polymarket Bot — Mode: {mode.upper()}\n")
+    click.echo(f"\nStarting Polymarket Bot - Mode: {mode.upper()}\n")
 
     bot = TradingBot(mode=mode, confirm_live=confirm_live)
 

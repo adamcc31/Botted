@@ -301,6 +301,18 @@ class SignalGenerator:
         # Bypass deadband for ultra-short markets – we WANT to trade at the money
         is_ultrashort = "5m" in active_market.slug or (active_market.T_resolution - active_market.T_open).total_seconds() / 60.0 <= 10.0
         
+        if mid_yes is None:
+            logger.warning("mid_yes_null_abstain", market_id=active_market.market_id)
+            return SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="LIQUIDITY_BLOCK",
+                P_model=P_model,
+                uncertainty_u=u_used,
+                edge_yes=edge_yes,
+                edge_no=edge_no,
+                **base,
+            )
+
         if not is_ultrashort and abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
             logger.debug(
                 "signal_abstain_no_trade_zone",
@@ -350,7 +362,24 @@ class SignalGenerator:
 
         # ── STEP 7: PREDATOR ZONE GATING ─────────────────────
         entry_odds = clob_state.yes_ask if signal == "BUY_UP" else clob_state.no_ask
-        distance_usd = abs(metadata.current_btc_price - active_market.strike_price)
+        
+        curr_price = metadata.current_btc_price
+        strike_price = active_market.strike_price
+        
+        if curr_price is None or strike_price is None:
+            logger.warning("signal_gating_missing_prices", market_id=active_market.market_id)
+            # Fallback to neutral or abstain
+            return SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="ORACLE_UNAVAILABLE",
+                P_model=P_model,
+                uncertainty_u=u_used,
+                edge_yes=edge_yes,
+                edge_no=edge_no,
+                **base,
+            )
+            
+        distance_usd = abs(curr_price - strike_price)
         zone = classify_zone(ttr, distance_usd, entry_odds)
         base["zone_id"] = zone.zone_id
 
