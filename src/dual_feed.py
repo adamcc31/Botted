@@ -138,6 +138,9 @@ class DualFeed:
 
         source = "CHAINLINK_LIVE" if age <= self._stale_threshold_s else "CHAINLINK_CACHED"
 
+        if bp is None or self._chainlink_price is None or self._chainlink_price == 0:
+            return None
+            
         spread = bp - self._chainlink_price
         spread_pct = abs(spread) / self._chainlink_price * 100.0
 
@@ -212,7 +215,7 @@ class DualFeed:
         spreads_pct = [
             abs((bp - cp) / cp) * 100.0
             for _, bp, cp in recent
-            if cp > 0
+            if cp is not None and bp is not None and cp > 0
         ]
 
         if not spreads_pct:
@@ -431,6 +434,8 @@ class DualFeed:
         min_diff = float('inf')
         
         for ts, val in reversed(history):
+            if ts is None or target_ts is None:
+                continue
             diff = abs(ts - target_ts)
             if diff < min_diff:
                 min_diff = diff

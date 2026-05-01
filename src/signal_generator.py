@@ -299,7 +299,17 @@ class SignalGenerator:
         mid_yes = (clob_state.yes_bid + clob_state.yes_ask) / 2.0
         
         # Bypass deadband for ultra-short markets – we WANT to trade at the money
-        is_ultrashort = "5m" in active_market.slug or (active_market.T_resolution - active_market.T_open).total_seconds() / 60.0 <= 10.0
+        res_time = getattr(active_market, "T_resolution", None)
+        open_time = getattr(active_market, "T_open", None)
+        if res_time is None or open_time is None:
+             is_ultrashort = "5m" in active_market.slug
+        else:
+             is_ultrashort = "5m" in active_market.slug or (res_time - open_time).total_seconds() / 60.0 <= 10.0
+        
+        # Guard clause for deadband calculation
+        mid_yes = None
+        if clob_state.yes_bid is not None and clob_state.yes_ask is not None:
+            mid_yes = (clob_state.yes_bid + clob_state.yes_ask) / 2.0
         
         if mid_yes is None:
             logger.warning("mid_yes_null_abstain", market_id=active_market.market_id)
@@ -313,23 +323,24 @@ class SignalGenerator:
                 **base,
             )
 
-        if not is_ultrashort and abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
-            logger.debug(
-                "signal_abstain_no_trade_zone",
-                fair_prob=round(P_model, 4),
-                mid_yes=round(mid_yes, 4),
-                deadband=round(no_trade_zone_p, 4),
-                uncertainty_u=round(u_used, 4),
-            )
-            return SignalResult(
-                signal="ABSTAIN",
-                abstain_reason="NO_TRADE_ZONE",
-                P_model=P_model,
-                uncertainty_u=u_used,
-                edge_yes=edge_yes,
-                edge_no=edge_no,
-                **base,
-            )
+        if not is_ultrashort and mid_yes is not None and P_model is not None and u_used is not None:
+            if abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
+                logger.debug(
+                    "signal_abstain_no_trade_zone",
+                    fair_prob=round(P_model, 4),
+                    mid_yes=round(mid_yes, 4),
+                    deadband=round(no_trade_zone_p, 4),
+                    uncertainty_u=round(u_used, 4),
+                )
+                return SignalResult(
+                    signal="ABSTAIN",
+                    abstain_reason="NO_TRADE_ZONE",
+                    P_model=P_model,
+                    uncertainty_u=u_used,
+                    edge_yes=edge_yes,
+                    edge_no=edge_no,
+                    **base,
+                )
 
         # ── STEP 5: MARGIN OF SAFETY CHECK ───────────────────
         margin = self._config.get("signal.margin_of_safety", 0.05)

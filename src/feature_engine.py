@@ -173,11 +173,15 @@ class FeatureEngine:
             # ── 16: Strike distance ───────────────────────────
             # BUG-1 FIX: use oracle reference_price, NOT Binance
             strike = active_market.strike_price
-            strike_distance_pct = (reference_price - strike) / strike * 100.0
+            if strike is None or reference_price is None or strike == 0:
+                strike_distance_pct = 0.0
+            else:
+                strike_distance_pct = (reference_price - strike) / strike * 100.0
+            
             features["strike_distance_pct"] = strike_distance_pct
-
+ 
             # ── 17: Contest urgency ───────────────────────────
-            features["contest_urgency"] = abs(strike_distance_pct) * (1.0 - ttr_normalized)
+            features["contest_urgency"] = abs(strike_distance_pct) * (1.0 - ttr_normalized) if strike_distance_pct is not None else 0.0
 
             # ── 18-20: Interaction features ───────────────────
             features["ttr_x_obi"] = ttr_normalized * features["OBI"]

@@ -325,7 +325,7 @@ class MarketDiscovery:
         # ── FIX Q4: Override active_market jika pakai harga fallback ──
         if (
             self._active_market
-            and self._active_market.strike_price is not None
+            and self._active_market.T_open is not None
             and abs(self._active_market.T_open.timestamp() - epoch_ts) < 1
         ):
             old_strike = self._active_market.strike_price
@@ -1041,19 +1041,24 @@ class MarketDiscovery:
         """
         volume_score = max(0.0, min(1.0, math.log1p(max(0.0, volume_24h)) / 12.0))
 
-        if yes_prob is None:
+        if yes_prob is None or self._target_yes_prob is None:
             prob_score = 0.5
         else:
             prob_score = max(0.0, 1.0 - abs(yes_prob - self._target_yes_prob) * 2.0)
 
-        ttr_delta = abs(market.TTR_minutes - self._target_ttr_minutes)
-        ttr_score = max(0.0, 1.0 - (ttr_delta / max(30.0, self._target_ttr_minutes)))
+        ttr_val = market.TTR_minutes
+        if ttr_val is None or self._target_ttr_minutes is None:
+            ttr_delta = 0.0
+            ttr_score = 0.5
+        else:
+            ttr_delta = abs(ttr_val - self._target_ttr_minutes)
+            ttr_score = max(0.0, 1.0 - (ttr_delta / max(30.0, self._target_ttr_minutes)))
 
         # Additional rationality score: strike should not be absurdly far from spot
         strike_score = 0.5
         horizon_score = 0.5
         hard_penalty = 0.0
-        if spot_price is not None and spot_price > 0:
+        if spot_price is not None and spot_price > 0 and market.strike_price is not None:
             strike_dist_pct = abs(market.strike_price - spot_price) / spot_price
             strike_soft_cap = float(
                 self._config.get("market_discovery.strike_distance_soft_cap_pct", 0.20)
@@ -1075,7 +1080,11 @@ class MarketDiscovery:
                 targets = [float(v) for v in target_horizons if float(v) > 0]
             except Exception:
                 targets = [60.0, 240.0, 480.0, 720.0]
-            nearest = min(abs(market.TTR_minutes - t) for t in targets) if targets else 0.0
+            ttr_val_h = market.TTR_minutes
+            if ttr_val_h is not None:
+                nearest = min(abs(ttr_val_h - t) for t in targets) if targets else 0.0
+            else:
+                nearest = 0.0
             denom = max(30.0, min(targets) if targets else 60.0)
             horizon_score = max(0.0, 1.0 - (nearest / denom))
 
@@ -1339,6 +1348,10 @@ class MarketDiscovery:
             logger.debug("strike_verify_no_data", epoch=epoch_ts)
             return
 
+        if verified is None or initial_strike is None:
+            logger.debug("strike_verify_null_inputs", epoch=epoch_ts)
+            return
+
         diff = abs(verified - initial_strike)
         diff_pct = (diff / initial_strike) * 100 if initial_strike > 0 else 0
 
@@ -1359,7 +1372,8 @@ class MarketDiscovery:
 
             # Update active market strike_price if it matches this epoch
             if (self._active_market and
-                self._active_market.strike_price and
+                self._active_market.strike_price is not None and
+                initial_strike is not None and
                 abs(self._active_market.strike_price - initial_strike) < 1.0):
                 self._active_market = self._active_market.model_copy(
                     update={"strike_price": verified}

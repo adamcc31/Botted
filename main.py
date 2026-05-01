@@ -16,8 +16,8 @@ import html
 import os
 import signal
 import sys
-from collections import Counter
-from datetime import datetime, timezone
+import traceback
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import numpy as np
 
@@ -1029,6 +1029,11 @@ class TradingBot:
         real_best_ask = fresh_clob.yes_ask if signal.signal == "BUY_UP" else fresh_clob.no_ask
         synthetic_edge = signal.edge_yes if signal.signal == "BUY_UP" else signal.edge_no
         p_outcome = signal.P_model if signal.signal == "BUY_UP" else (1.0 - signal.P_model)
+        # Guard clause for edge calculation
+        if signal.uncertainty_u is None or real_best_ask is None:
+            logger.warning("edge_verification_missing_input", market_id=market.market_id)
+            return
+
         live_edge = p_outcome - signal.uncertainty_u - real_best_ask
         
         if synthetic_edge is None or live_edge is None:
@@ -1478,7 +1483,7 @@ class TradingBot:
             try:
                 await self._on_bar_close(synthetic_bar)
             except Exception as e:
-                logger.error("ultrashort_loop_error", error=str(e))
+                logger.error("ultrashort_loop_error", error=str(e), traceback=traceback.format_exc())
 
     # ── CLOB Polling Loop ─────────────────────────────────────
 
