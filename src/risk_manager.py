@@ -48,6 +48,7 @@ class RiskManager:
         self._trade_history: List[dict] = []
         # Memory-based pending tracking to bridge the gap between approval and DB insertion
         self._pending_approvals: List[dict] = []
+        self._open_positions: int = 0
 
     # ── Public Properties ─────────────────────────────────────
 

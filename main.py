@@ -1273,11 +1273,24 @@ class TradingBot:
         
         # Resolve Paper Trade if exists
         if paper_record:
-            self._paper_engine.resolve_position(
+            updated_paper_record = self._paper_engine.resolve_position(
                 market_id=trade.market_id,
                 winner=resolved.outcome,
                 settlement_price=float(price)
             )
+            if updated_paper_record:
+                # Kirim notifikasi Telegram khusus Paper Trade
+                msg = (
+                    f"ID: {updated_paper_record.trade_id[:8]}\n"
+                    f"Zone: {updated_paper_record.zone_id}\n"
+                    f"Result: {'✅ WIN' if updated_paper_record.actual_outcome == 'WIN' else '❌ LOSS'}\n"
+                    f"PnL: ${updated_paper_record.actual_pnl_usd:+.2f}\n"
+                    f"Edge at entry: {updated_paper_record.live_edge:.2%}"
+                )
+                asyncio.create_task(
+                    self._send_telegram("📊 Paper Trade Resolved", msg),
+                    name=f"tg_paper_resolve_{updated_paper_record.trade_id[:8]}"
+                )
             
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
 

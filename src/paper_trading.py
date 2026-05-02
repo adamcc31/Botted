@@ -173,9 +173,9 @@ class PaperTradingEngine:
         # Wait, the caller should pass the winner
         pass # Placeholder for logic below
 
-    def resolve_position(self, market_id: str, winner: str, settlement_price: float):
+    def resolve_position(self, market_id: str, winner: str, settlement_price: float) -> Optional[PaperTradeRecord]:
         if market_id not in self.open_positions:
-            return
+            return None
             
         record = self.open_positions[market_id]
         won = (record.signal_direction == winner)
@@ -202,6 +202,8 @@ class PaperTradingEngine:
                     trade_id=record.trade_id, 
                     outcome=record.actual_outcome, 
                     pnl=round(record.actual_pnl_usd, 2))
+                    
+        return record
 
     def _update_summary(self, record: PaperTradeRecord):
         summary_path = os.path.join(self.output_dir, "paper_trades_summary.csv")
@@ -243,6 +245,11 @@ class PaperTradingEngine:
         if not os.path.exists(file_path):
             return
         df = pd.read_csv(file_path)
+        
+        # Pastikan kolom timestamp_resolution bertipe object/string agar tidak error saat diisi string ISO
+        if 'timestamp_resolution' in df.columns:
+            df['timestamp_resolution'] = df['timestamp_resolution'].astype(object)
+            
         if record.trade_id in df['trade_id'].values:
             idx = df[df['trade_id'] == record.trade_id].index[0]
             for field in fields(record):
