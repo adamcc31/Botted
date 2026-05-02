@@ -82,7 +82,8 @@ class RiskManager:
             if (now - p["approved_at"]).total_seconds() < 30.0
         ]
         
-        async with self._db.get_session() as session:
+        session = await self._db.get_session()
+        try:
             # Time-lock query: count actual pending trades.
             # Even if outcome='PENDING', if it's older than max TTR (~1 hour), ignore it to prevent deadlocks.
             query = text("""
@@ -97,6 +98,8 @@ class RiskManager:
             db_exposure = row[1] if row else 0.0
             
             return db_count, db_exposure
+        finally:
+            await session.close()
 
     # ── Trade Approval ────────────────────────────────────────
 
