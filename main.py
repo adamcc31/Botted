@@ -347,7 +347,8 @@ class TradingBot:
                 break
                 
             try:
-                metrics = self._dry_run.compute_session_metrics(self._xgboost_gate.version)
+                xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+                metrics = self._dry_run.compute_session_metrics(xgb_version)
                 summary = {
                     "trades_executed": metrics.trades_executed,
                     "win_rate (trades)": f"{metrics.win_rate*100:.1f}%" if metrics.win_rate is not None else "N/A",
@@ -554,7 +555,8 @@ class TradingBot:
         await self._db.close()
 
         # Export session data
-        metrics = self._dry_run.compute_session_metrics(self._xgboost_gate.version)
+        xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+        metrics = self._dry_run.compute_session_metrics(xgb_version)
         if self._exporter:
             self._exporter.export_session(
                 trades=self._dry_run._resolved_trades,
@@ -1215,8 +1217,9 @@ class TradingBot:
             asyncio.create_task(self.stop(), name="stop_after_abort")
 
         # Update metrics
+        xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
         self._latest_metrics = self._dry_run.compute_session_metrics(
-            self._model.version
+            xgb_version
         )
 
     def _on_binance_price_update(self, price: float) -> None:
@@ -1400,7 +1403,8 @@ class TradingBot:
             self._config.get("dry_run.go_live_min_total_trades", 100)
         )
         consec_pass = int(self._config.get("dry_run.go_live_consecutive_pass", 5))
-        metrics = self._dry_run.compute_session_metrics(self._model.version)
+        xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+        metrics = self._dry_run.compute_session_metrics(xgb_version)
 
         if metrics.trades_executed >= min_total_trades and metrics.pass_fail == "PASS":
             self._go_live_pass_streak += 1
