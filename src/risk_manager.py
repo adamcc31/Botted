@@ -247,7 +247,7 @@ class RiskManager:
             return (0.0, 0.0, 0.0)
             
         dist = abs(curr_price - strike_price)
-        odds = signal.entry_odds
+        odds = signal.entry_odds if signal.entry_odds is not None else 0.5
         
         if use_flat_bet:
             # Flat bet mode: return constant size if within available exposure.

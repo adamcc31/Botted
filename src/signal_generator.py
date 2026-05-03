@@ -110,7 +110,7 @@ class SignalGenerator:
             "clob_yes_bid": clob_state.yes_bid,
             "clob_no_ask": clob_state.no_ask,
             "clob_no_bid": clob_state.no_bid,
-            "entry_odds": 0.5, # Placeholder, will be updated before SignalResult creation
+            "entry_odds": None, # Placeholder, will be updated for active signals
             "TTR_minutes": metadata.TTR_minutes,
             "strike_price": active_market.strike_price,
             "current_price": metadata.current_btc_price,
