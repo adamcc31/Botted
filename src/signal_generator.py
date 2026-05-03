@@ -110,6 +110,7 @@ class SignalGenerator:
             "clob_yes_bid": clob_state.yes_bid,
             "clob_no_ask": clob_state.no_ask,
             "clob_no_bid": clob_state.no_bid,
+            "entry_odds": 0.5, # Placeholder, will be updated before SignalResult creation
             "TTR_minutes": metadata.TTR_minutes,
             "strike_price": active_market.strike_price,
             "current_price": metadata.current_btc_price,
@@ -373,6 +374,7 @@ class SignalGenerator:
 
         # ── STEP 7: PREDATOR ZONE GATING ─────────────────────
         entry_odds = clob_state.yes_ask if signal == "BUY_UP" else clob_state.no_ask
+        base["entry_odds"] = entry_odds
         
         curr_price = metadata.current_btc_price
         strike_price = active_market.strike_price

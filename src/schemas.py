@@ -217,6 +217,7 @@ class SignalResult(BaseModel):
     strike_price: float
     current_price: float
     strike_distance: float
+    entry_odds: float = Field(..., ge=0.0, le=1.0, description="Price at which signal was generated (YES/NO depending on direction)")
     market_id: str
     timestamp: datetime
     features: Dict[str, float] = Field(

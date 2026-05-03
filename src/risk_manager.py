@@ -247,17 +247,18 @@ class RiskManager:
             return (0.0, 0.0, 0.0)
             
         dist = abs(curr_price - strike_price)
-        odds = getattr(signal, "entry_odds", 0.5)
+        odds = signal.entry_odds
         
+        if use_flat_bet:
+            # Flat bet mode: return constant size if within available exposure.
+            # In V4, flat bet bypasses zone classification as requested.
+            bet_size = min(flat_bet_size, available_exposure)
+            return bet_size, 0.0, 1.0
+
         zone = classify_zone(ttr, dist, odds)
         
         if zone.zone_type != "ALPHA" or zone.kelly_fraction <= 0:
             return (0.0, 0.0, 0.0)
-
-        if use_flat_bet:
-            # Flat bet mode: return constant size if within available exposure
-            bet_size = min(flat_bet_size, available_exposure)
-            return bet_size, 0.0, 1.0
 
         # ── Dynamic Kelly Sizing ──────────────────────────────
         multiplier_decay = self._config.get("risk.consecutive_loss_multiplier", 0.10)
