@@ -173,12 +173,12 @@ class PaperTradingEngine:
         # Wait, the caller should pass the winner
         pass # Placeholder for logic below
 
-    def resolve_position(self, market_id: str, winner: str, settlement_price: float) -> Optional[PaperTradeRecord]:
+    def resolve_position(self, market_id: str, won: bool, settlement_price: float, current_capital: float) -> Optional[PaperTradeRecord]:
         if market_id not in self.open_positions:
             return None
             
         record = self.open_positions[market_id]
-        won = (record.signal_direction == winner)
+        # won parameter is now passed from the source of truth (DryRunEngine)
         
         fee_pct = float(self.config.get("risk.fee_pct", 0.02))
         gas_flat = float(self.config.get("risk.gas_flat_usd", 0.01))
@@ -201,7 +201,8 @@ class PaperTradingEngine:
         logger.info("paper_trade_resolved", 
                     trade_id=record.trade_id, 
                     outcome=record.actual_outcome, 
-                    pnl=round(record.actual_pnl_usd, 2))
+                    pnl=round(record.actual_pnl_usd, 2),
+                    capital=round(current_capital, 2))
                     
         return record
 

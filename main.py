@@ -1275,8 +1275,9 @@ class TradingBot:
         if paper_record:
             updated_paper_record = self._paper_engine.resolve_position(
                 market_id=trade.market_id,
-                winner=resolved.outcome,
-                settlement_price=float(price)
+                won=(resolved.outcome == "WIN"),
+                settlement_price=float(price),
+                current_capital=resolved.capital_after
             )
             if updated_paper_record:
                 # Kirim notifikasi Telegram khusus Paper Trade
