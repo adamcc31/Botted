@@ -84,8 +84,15 @@ class PaperTradingEngine:
             assert record.zone_id.startswith("V4-")
             assert record.data_source == "paper_v4"
             return True
-        except AssertionError as e:
-            logger.error("paper_trade_validation_failed", trade_id=record.trade_id, error=str(e))
+        except Exception as e:
+            import traceback as tb
+            logger.error("paper_trade_validation_failed",
+                error_type=type(e).__name__,
+                error_repr=repr(e),
+                traceback_last_line=tb.format_exc().strip().split('\n')[-1],
+                full_traceback=tb.format_exc(),
+                trade_id=record.trade_id
+            )
             return False
 
     async def execute_paper_trade(
