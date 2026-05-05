@@ -9,6 +9,7 @@ identical to live trades for future model training.
 import os
 import uuid
 import asyncio
+import csv
 import pandas as pd
 from datetime import datetime, timezone
 from dataclasses import dataclass, asdict, fields
@@ -71,6 +72,31 @@ class PaperTradingEngine:
         self.output_dir = "app/data/exports/paper_trades"
         self.slippage_log_path = os.path.join(self.output_dir, "slippage_log.csv")
         os.makedirs(self.output_dir, exist_ok=True)
+        
+        # O(1) Buffers for high-performance I/O
+        self._trade_buffer: List[PaperTradeRecord] = []
+        self._summary_cache: Dict[str, dict] = {}
+        self._load_summary_cache()
+
+    def _load_summary_cache(self):
+        """Load existing summary into memory to avoid R/W overhead in loop."""
+        summary_path = os.path.join(self.output_dir, "paper_trades_summary.csv")
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, mode='r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        date_str = row['date']
+                        self._summary_cache[date_str] = {
+                            "date": date_str,
+                            "total_trades": int(row['total_trades']),
+                            "wins": int(row['wins']),
+                            "losses": int(row['losses']),
+                            "total_pnl": float(row['total_pnl']),
+                            "win_rate": float(row['win_rate'])
+                        }
+            except Exception as e:
+                logger.error("paper_trade_load_summary_failed", error=str(e))
 
     def _get_daily_file(self) -> str:
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -214,58 +240,79 @@ class PaperTradingEngine:
         return record
 
     def _update_summary(self, record: PaperTradeRecord):
-        summary_path = os.path.join(self.output_dir, "paper_trades_summary.csv")
-        if os.path.exists(summary_path):
-            df = pd.read_csv(summary_path)
-        else:
-            df = pd.DataFrame(columns=["date", "total_trades", "wins", "losses", "total_pnl", "win_rate"])
-        
+        """Updates summary in memory and flushes periodically (Opsi A - Batching)."""
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if date_str in df['date'].values:
-            idx = df[df['date'] == date_str].index[0]
-            df.at[idx, 'total_trades'] += 1
-            if record.actual_outcome == "WIN":
-                df.at[idx, 'wins'] += 1
-            else:
-                df.at[idx, 'losses'] += 1
-            df.at[idx, 'total_pnl'] += record.actual_pnl_usd
-            df.at[idx, 'win_rate'] = df.at[idx, 'wins'] / (df.at[idx, 'wins'] + df.at[idx, 'losses'])
-        else:
-            new_row = {
+        
+        if date_str not in self._summary_cache:
+            self._summary_cache[date_str] = {
                 "date": date_str,
-                "total_trades": 1,
-                "wins": 1 if record.actual_outcome == "WIN" else 0,
-                "losses": 0 if record.actual_outcome == "WIN" else 1,
-                "total_pnl": record.actual_pnl_usd,
-                "win_rate": 1.0 if record.actual_outcome == "WIN" else 0.0
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl": 0.0,
+                "win_rate": 0.0
             }
-            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+        
+        stats = self._summary_cache[date_str]
+        stats['total_trades'] += 1
+        if record.actual_outcome == "WIN":
+            stats['wins'] += 1
+        else:
+            stats['losses'] += 1
+        
+        stats['total_pnl'] += record.actual_pnl_usd
+        total = stats['wins'] + stats['losses']
+        stats['win_rate'] = stats['wins'] / total if total > 0 else 0.0
+        
+        # Immediate save for summary (since it's small, Opsi B style but using memory cache to avoid pd.concat)
+        self._flush_summary()
+
+    def _flush_summary(self):
+        """Write memory summary cache to CSV using Pandas (Opsi A implementation)."""
+        summary_path = os.path.join(self.output_dir, "paper_trades_summary.csv")
+        if not self._summary_cache:
+            return
             
+        df = pd.DataFrame(list(self._summary_cache.values()))
+        # Sort by date to keep it clean
+        df = df.sort_values('date')
         df.to_csv(summary_path, index=False)
 
     def _append_to_csv(self, file_path: str, record: PaperTradeRecord):
-        df = pd.DataFrame([asdict(record)])
+        """Direct CSV Append (Opsi B) - No Pandas, O(1) performance."""
+        data = asdict(record)
         header = not os.path.exists(file_path)
-        df.to_csv(file_path, mode='a', header=header, index=False)
+        
+        with open(file_path, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=data.keys())
+            if header:
+                writer.writeheader()
+            writer.writerow(data)
+            
+        # Also keep in buffer for Task 1
+        self._trade_buffer.append(record)
 
     def _update_csv(self, file_path: str, record: PaperTradeRecord):
-        """Update the resolution fields in the CSV."""
+        """
+        Update the resolution fields in the CSV. 
+        Still uses Pandas for existing file updates as CSV is not row-addressable,
+        but we eliminate pd.concat and futurewarnings.
+        """
         if not os.path.exists(file_path):
             return
-        df = pd.read_csv(file_path)
         
-        # Pastikan kolom timestamp_resolution bertipe object/string agar tidak error saat diisi string ISO
-        if 'timestamp_resolution' in df.columns:
-            df['timestamp_resolution'] = df['timestamp_resolution'].astype(object)
-            
+        # Optimization: only read if needed
+        df = pd.read_csv(file_path)
         if record.trade_id in df['trade_id'].values:
             idx = df[df['trade_id'] == record.trade_id].index[0]
             for field in fields(record):
                 val = getattr(record, field.name)
+                # Avoid setting NaNs or incompatible types if possible
                 df.at[idx, field.name] = val
             df.to_csv(file_path, index=False)
 
     def _log_slippage(self, signal, fresh_clob, edge):
+        """Direct CSV Append (Opsi B) for slippage logs."""
         log_entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "market_id": signal.market_id,
@@ -276,7 +323,12 @@ class PaperTradingEngine:
             "edge": edge,
             "reason": "SLIPPAGE_NEGATIVE_EDGE"
         }
-        df = pd.DataFrame([log_entry])
+        
         header = not os.path.exists(self.slippage_log_path)
-        df.to_csv(self.slippage_log_path, mode='a', header=header, index=False)
+        with open(self.slippage_log_path, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=log_entry.keys())
+            if header:
+                writer.writeheader()
+            writer.writerow(log_entry)
+            
         logger.info("paper_trade_slippage", market_id=signal.market_id, edge=round(edge, 4))

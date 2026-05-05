@@ -1,94 +1,87 @@
 import os
 import sys
-import glob
 import pandas as pd
 import numpy as np
-from pathlib import Path
+import httpx
+import asyncio
+from datetime import datetime, timezone
 
-def download_clob_log():
-    clob_path = Path("dataset/clob_log.csv")
-    if not clob_path.exists():
-        print("clob_log.csv not found, pulling from railway via SSH...")
-        os.makedirs("dataset", exist_ok=True)
-        # Using Option B logic: python concatenation via SSH to avoid spinner interference in stdout
-        # We use a list comprehension to keep it a single line valid for python -c
-        python_cmd = (
-            "import glob, sys; "
-            "files = sorted(glob.glob('/app/data/exports/*/clob_log.csv')); "
-            "[sys.stdout.write(''.join(open(f).readlines()[1:] if i > 0 else open(f).readlines())) "
-            "for i, f in enumerate(files)]"
-        )
-        # Execute railway ssh and redirect to file
-        os.system(f'railway ssh "python3 -c \\"{python_cmd}\\"" > dataset/clob_log.csv')
-        print("Download completed: dataset/clob_log.csv")
+# Config
+DATA_TRADES_API = "https://data-api.polymarket.com/trades"
 
-def main():
-    download_clob_log()
-    
-    print("Loading datasets...")
+async def fetch_trades(market_id):
+    """Fetch trades for a market ID from Polymarket Data API."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            resp = await client.get(DATA_TRADES_API, params={"market": market_id})
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
+async def main():
+    print("Loading dry run dataset...")
     dry_path = "dataset/processed/dry_run_master_clean.csv"
-    clob_path = "dataset/clob_log.csv"
-    
     if not os.path.exists(dry_path):
         print(f"Error: {dry_path} not found.")
         return
         
-    dry = pd.read_csv(dry_path, low_memory=False)
-    clob = pd.read_csv(clob_path, low_memory=False)
+    df = pd.read_csv(dry_path, low_memory=False)
+    df['entry_timestamp_dt'] = pd.to_datetime(df['timestamp'], utc=True)
+    df['entry_timestamp_unix'] = df['entry_timestamp_dt'].astype('int64') // 10**9
     
-    # Pre-processing: timestamps and mapping entry_timestamp
-    dry['entry_timestamp'] = pd.to_datetime(dry['timestamp'], utc=True)
-    clob['timestamp'] = pd.to_datetime(clob['timestamp'], utc=True)
+    # Filter BUY signals
+    signals_mask = df['signal_direction'].isin(['BUY_UP', 'BUY_DOWN'])
+    unique_mids = df.loc[signals_mask, 'market_id'].unique().tolist()
     
-    print(f"Dataset sizes: dry={len(dry)}, clob={len(clob)}")
+    print(f"Processing {len(unique_mids)} unique markets via Data API...")
+    df['max_high_bid'] = np.nan
     
-    # Implementation: O(N log N) confirmed join
-    clob = clob.sort_values(['market_id', 'timestamp'])
-    dry = dry.sort_values(['market_id', 'entry_timestamp'])
-    
-    clob_grouped = clob.groupby('market_id')
-    
-    def get_max_high(row):
-        # Only process BUY signals
-        if row['signal_direction'] not in ['BUY_UP', 'BUY_DOWN']:
-            return np.nan
-            
-        mkt = clob_grouped.get_group(row['market_id']) \
-              if row['market_id'] in clob_grouped.groups else None
-        if mkt is None:
-            return np.nan
-            
-        # Strict No-Look-Ahead: timestamp > entry_timestamp
-        future = mkt[mkt['timestamp'] > row['entry_timestamp']]
-        if future.empty:
-            return np.nan
-            
-        if row['signal_direction'] == 'BUY_UP':
-            return future['yes_bid'].max()
-        else: # BUY_DOWN
-            return future['no_bid'].max()
+    processed_count = 0
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for mid in unique_mids:
+            trades = await fetch_trades(mid)
+            if not trades:
+                processed_count += 1
+                continue
+                
+            m_idx = df[(df['market_id'] == mid) & signals_mask].index
+            for idx in m_idx:
+                row = df.loc[idx]
+                entry_ts = row['entry_timestamp_unix']
+                direction = row['signal_direction']
+                
+                target_outcomes = ['Up', 'Yes', 'YES', 'UP'] if direction == 'BUY_UP' else ['Down', 'No', 'NO', 'DOWN']
+                
+                future_prices = [
+                    t['price'] for t in trades 
+                    if t.get('timestamp', 0) > entry_ts and t.get('outcome') in target_outcomes
+                ]
+                
+                if future_prices:
+                    df.at[idx, 'max_high_bid'] = max(future_prices)
 
-    print("Calculating max_high_bid (this may take a moment)...")
-    dry['max_high_bid'] = dry.apply(get_max_high, axis=1)
-    
-    # Save modified dataframe
+            processed_count += 1
+            if processed_count % 50 == 0:
+                print(f"Processed {processed_count}/{len(unique_mids)} markets...")
+            await asyncio.sleep(0.02)
+
+    # Save results - strictly as dataset_diagnostics.csv
     out_path = "dataset_diagnostics.csv"
-    dry.to_csv(out_path, index=False)
-    print(f"Saved modified dataframe to {out_path}\n")
+    # Drop temp columns for strict compliance
+    df_save = df.drop(columns=['entry_timestamp_dt', 'entry_timestamp_unix'])
+    df_save.to_csv(out_path, index=False)
+    print(f"\nSaved modified dataframe to {out_path}")
     
-    # --- REPORTING ---
-    df = dry.copy()
-    
-    # A. Threshold Sweep (Analisis Class Balance)
+    # --- REPORTING (Task 2) ---
+    print("\n--- HIT RATE BY THRESHOLD ---")
     thresholds = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
-    print("--- HIT RATE BY THRESHOLD ---")
     for t in thresholds:
         hit_rate = (df['max_high_bid'] >= t).mean()
         print(f"Threshold {t}: {hit_rate:.2%} hit rate")
         
-    # B. The 'Lost Alpha' Conversion Rate — Split per Arah Signal
-    # Auto-detect encoding actual_outcome (string "LOSS" atau integer 0)
-    # Mapping for this specific dataset where 'label' 0 is LOSS
+    print("\n--- LOSS CONVERTED TO WIN (LOST ALPHA) ---")
     if 'label' in df.columns and (df['actual_outcome'].astype(str) != 'LOSS').all():
         df['actual_outcome_encoded'] = df['label']
     else:
@@ -99,24 +92,19 @@ def main():
     else:
         loss_df = df[df['actual_outcome_encoded'] == 0]
 
-    print("\n--- LOSS CONVERTED TO WIN (LOST ALPHA) ---")
     print(f"Total LOSS trades: {len(loss_df)}")
-
-    # Overall
     print("\n  [ALL DIRECTIONS]")
     for t in thresholds:
-        rate = (loss_df['max_high_bid'] >= t).mean()
+        rate = (loss_df['max_high_bid'] >= t).mean() if len(loss_df) > 0 else 0
         print(f"  Threshold {t}: {rate:.2%} of LOSS trades could have been won")
 
-    # Split per arah
     for direction in ['BUY_UP', 'BUY_DOWN']:
         dir_loss = loss_df[loss_df['signal_direction'] == direction]
         print(f"\n  [{direction}] ({len(dir_loss)} trades)")
         for t in thresholds:
-            rate = (dir_loss['max_high_bid'] >= t).mean()
+            rate = (dir_loss['max_high_bid'] >= t).mean() if len(dir_loss) > 0 else 0
             print(f"  Threshold {t}: {rate:.2%}")
             
-    # C. Hit Rate × Odds Bucket (Cross-Tab Paling Kritis)
     print("\n--- HIT RATE BY ODDS BUCKET ---")
     df['odds_bucket'] = pd.cut(
         df['entry_odds'],
@@ -130,19 +118,15 @@ def main():
         avg_max_high= ('max_high_bid', 'mean')
     ).round(3).to_string())
         
-    # D. Feature Correlation Check (Sanity Check)
     print("\n--- FEATURE CORRELATION WITH SPIKE (Threshold 0.85 & 0.90) ---")
-    features = [
-        'obi_value', 'depth_ratio', 'spread_pct',
-        'tfm_value', 'rv_value', 'odds_delta_60s'
-    ]
+    features = ['obi_value', 'depth_ratio', 'spread_pct', 'tfm_value', 'rv_value', 'odds_delta_60s']
     df['target_085'] = (df['max_high_bid'] >= 0.85).astype(int)
     df['target_090'] = (df['max_high_bid'] >= 0.90).astype(int)
-
+    existing_features = [f for f in features if f in df.columns]
     print("\nCorrelation with hitting 0.85:")
-    print(df[features + ['target_085']].corr()['target_085'].drop('target_085'))
+    print(df[existing_features + ['target_085']].corr()['target_085'].drop('target_085'))
     print("\nCorrelation with hitting 0.90:")
-    print(df[features + ['target_090']].corr()['target_090'].drop('target_090'))
+    print(df[existing_features + ['target_090']].corr()['target_090'].drop('target_090'))
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

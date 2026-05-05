@@ -558,6 +558,12 @@ class TradingBot:
         await self._discovery.stop()
         await self._clob.stop()
         
+        # Flush paper trading engine buffers
+        try:
+            self._paper_engine._flush_summary()
+        except Exception as e:
+            logger.error("paper_engine_flush_failed", error=str(e))
+        
         # Export signal data before closing the DB
         signals_csv = None
         if self._exporter:
