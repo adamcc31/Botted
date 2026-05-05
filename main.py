@@ -882,6 +882,9 @@ class TradingBot:
             # Price / Spread
             "spread_pct":          getattr(spread_result, "spread_pct", None),
             "btc_return_1m":       ml_features.get("btc_return_1m"),
+            # Velocity (Task 1)
+            "clob_spread_vel":     ml_features.get("clob_spread_vel"),
+            "clob_depth_delta":    ml_features.get("clob_depth_delta"),
             # Signal engine
             "confidence_score":    q_fair,
             # Timestamp for hour_wib / is_weekend features
