@@ -397,9 +397,9 @@ class CLOBFeed:
 
     def _is_stale(self) -> bool:
         """Check if CLOB data is stale."""
-        if self._last_message_time == 0.0:
+        if self._last_fetch_time == 0.0:
             return True
-        return (time.time() - self._last_message_time) > self._stale_timeout
+        return (time.time() - self._last_fetch_time) > self._stale_timeout
 
     def get_historical_book(self, token_id: str, seconds_ago: float) -> Optional[dict]:
         """
