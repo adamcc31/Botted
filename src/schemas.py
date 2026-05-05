@@ -154,10 +154,10 @@ class CLOBState(BaseModel):
 # ============================================================
 
 class FeatureVector(BaseModel):
-    """24-feature vector output from feature engine."""
+    """26-feature vector output from feature engine."""
 
-    values: List[float] = Field(..., min_length=24, max_length=24)
-    feature_names: List[str] = Field(..., min_length=24, max_length=24)
+    values: List[float] = Field(..., min_length=24, max_length=26)
+    feature_names: List[str] = Field(..., min_length=24, max_length=26)
     metadata: FeatureMetadata
 
     class Config:

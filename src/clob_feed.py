@@ -10,8 +10,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Optional, Dict
+from typing import Optional, Dict, Deque
 
 import httpx
 import structlog
@@ -63,6 +64,10 @@ class CLOBFeed:
         self._active_tokens: set[str] = set()
         self._ws_connection: Optional[websockets.WebSocketClientProtocol] = None
         self._ws_task: Optional[asyncio.Task] = None
+
+        # Velocity tracking: history of books per token
+        self._history_maxlen = 100
+        self._clob_history: Dict[str, Deque[dict]] = {}
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -148,6 +153,16 @@ class CLOBFeed:
                                     if token_id and token_id in self._active_tokens:
                                         self._cached_books[token_id] = event
                                         self._last_fetch_time = time.time()
+                                        
+                                        # Record history for velocity features
+                                        if token_id not in self._clob_history:
+                                            self._clob_history[token_id] = deque(maxlen=self._history_maxlen)
+                                        
+                                        self._clob_history[token_id].append({
+                                            "timestamp": datetime.now(timezone.utc),
+                                            "book": event
+                                        })
+                                        
                                         logger.info("clob_book_updated", source="websocket", token_id=token_id[:16])
                         except json.JSONDecodeError:
                             continue
@@ -382,6 +397,26 @@ class CLOBFeed:
 
     def _is_stale(self) -> bool:
         """Check if CLOB data is stale."""
-        if self._last_fetch_time == 0.0:
+        if self._last_message_time == 0.0:
             return True
-        return (time.time() - self._last_fetch_time) > self._stale_timeout
+        return (time.time() - self._last_message_time) > self._stale_timeout
+
+    def get_historical_book(self, token_id: str, seconds_ago: float) -> Optional[dict]:
+        """
+        Retrieve orderbook snapshot from approximately N seconds ago.
+        Returns the snapshot book or None if history is insufficient.
+        """
+        history = self._clob_history.get(token_id)
+        if not history or len(history) < 2:
+            return None
+
+        target_time = datetime.now(timezone.utc).timestamp() - seconds_ago
+        
+        # Search from newest to oldest for the first snapshot older than target_time
+        # Since it's a deque and WebSocket updates are frequent, we just look back
+        for item in reversed(history):
+            if item["timestamp"].timestamp() <= target_time:
+                return item["book"]
+        
+        # If all items are newer than target_time, return the oldest available
+        return history[0]["book"]

@@ -22,5 +22,7 @@
   "clob_yes_mid",
   "clob_yes_spread",
   "clob_no_spread",
-  "market_vig"
+  "market_vig",
+  "clob_spread_vel",
+  "clob_depth_delta"
 ]

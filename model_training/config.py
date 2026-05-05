@@ -48,6 +48,9 @@ RAW_FEATURES: List[str] = [
     # Price / Spread
     "spread_pct",
     "btc_return_1m",
+    # Velocity (Task 1)
+    "clob_spread_vel",
+    "clob_depth_delta",
     # Signal engine output
     "confidence_score",
 ]
@@ -78,6 +81,15 @@ SELECTED_FEATURES: List[str] = [
     "contest_urgency",      # #3 SHAP — seberapa dekat ke expiry
     "tfm_value",            # #4 SHAP — trade flow momentum
     "obi_vol_interaction",  # #5 SHAP — OBI x volatilitas (engineered)
+]
+
+# Features for Model 2 (Spike Predictor)
+SELECTED_FEATURES_SPIKE: List[str] = [
+    "clob_spread_vel",      # Velocity indicator
+    "clob_depth_delta",     # Liquidity change indicator
+    "tfm_value",
+    "depth_ratio",
+    "rv_value",
 ]
 
 # ---------------------------------------------------------------------------

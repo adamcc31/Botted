@@ -79,6 +79,7 @@ from src.exporter import Exporter
 from src.feature_engine import FeatureEngine
 from src.market_discovery import MarketDiscovery
 from model_training.inference import XGBoostGate
+from model_training.dual_inference import DualXGBoostGate
 from src.fair_probability import FairProbabilityEngine
 from src.risk_manager import RiskManager
 from src.signal_generator import SignalGenerator
@@ -137,6 +138,7 @@ class TradingBot:
         self._clob = CLOBFeed(self._config)
         self._feature_engine = FeatureEngine(self._config)
         self._xgboost_gate = XGBoostGate()
+        self._dual_gate = DualXGBoostGate()
         self._signal_gen = SignalGenerator(self._config)
         self._db = DatabaseManager()
         self._risk_mgr = RiskManager(self._config, self._db)
@@ -154,6 +156,10 @@ class TradingBot:
         self._paper_engine = PaperTradingEngine(self._config, self._clob)
         
         self._exporter = Exporter(self._dry_run.session_id)
+
+        # Airgap / Shadow Mode config
+        self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
+        self._shadow_scalps: dict[str, dict] = {}
 
         # Dashboard state
         self._latest_signal = None
@@ -405,13 +411,21 @@ class TradingBot:
 
         logger.info("market_filter_active", slug_prefix=SLUG_PREFIX, is_ultrashort=IS_ULTRASHORT)
 
-        # Load model
+        # Load models
         try:
             self._xgboost_gate.load_model(Path("models/alpha_v1"))
         except Exception as e:
             logger.warning(
-                "no_model_loaded_running_in_data_collection_mode",
-                info=f"ML model not available: {e}. Trading uses settlement-aligned fair probability.",
+                "no_v1_model_loaded",
+                info=f"V1 model not available: {e}.",
+            )
+            
+        try:
+            self._dual_gate.load_models(Path("models/dual_v4_sanitized"))
+        except Exception as e:
+            logger.warning(
+                "no_v4_dual_model_loaded",
+                info=f"V4 shadow model not available: {e}.",
             )
 
         # Bootstrap historical data
@@ -491,6 +505,9 @@ class TradingBot:
             ),
             asyncio.create_task(
                 self._ultrashort_market_loop(), name="ultrashort_loop"
+            ),
+            asyncio.create_task(
+                self._shadow_scalp_monitor_loop(), name="shadow_scalp_monitor"
             ),
         ]
 
@@ -764,7 +781,7 @@ class TradingBot:
         # oracle_price is guaranteed non-None here (spread filter PROCEED)
         try:
             fv = self._feature_engine.compute(
-                self._binance, market, clob_state, oracle_price=oracle_price
+                self._binance, self._clob, market, clob_state, oracle_price=oracle_price
             )
         except ValueError as e:
             # oracle_price was None/invalid despite spread filter passing
@@ -873,21 +890,23 @@ class TradingBot:
 
         # ── Probability Source Selection (XGBoost Alpha V1) ────
         p_model = q_fair
-        if fv and self._xgboost_gate.is_loaded:
-            gate_res = self._xgboost_gate.evaluate_signal(
-                raw_features=xgb_raw_features,
-                entry_odds=clob_state.yes_ask if clob_state else 0.5,
-            )
-            
-            if gate_res["decision"] == "PASS":
-                p_model = gate_res["p_win"]
-                logger.info(
-                    "ml_model_signal_passed",
-                    p_win=round(p_model, 4),
-                    ev=round(gate_res["ev"], 4),
+        # Even if shadow mode is on, we always run V1 unless V4 has taken control
+        if not self._enable_dual_execution or not self._dual_gate.is_loaded:
+            if fv and self._xgboost_gate.is_loaded:
+                gate_res = self._xgboost_gate.evaluate_signal(
+                    raw_features=xgb_raw_features,
+                    entry_odds=clob_state.yes_ask if clob_state else 0.5,
                 )
-            else:
-                logger.debug("ml_model_signal_rejected", reason=gate_res["reason"])
+                
+                if gate_res["decision"] == "PASS":
+                    p_model = gate_res["p_win"]
+                    logger.info(
+                        "ml_model_signal_passed",
+                        p_win=round(p_model, 4),
+                        ev=round(gate_res["ev"], 4),
+                    )
+                else:
+                    logger.debug("ml_model_signal_rejected", reason=gate_res["reason"])
         
         logger.info(
             "probability_source_applied",
@@ -962,6 +981,44 @@ class TradingBot:
 
         self._latest_signal = signal
         await self._dry_run.record_signal(signal, slug=market.slug, ml_features=ml_features)
+
+        # ── Shadow Inference (V4 Dual-Spike) ──
+        # Evaluated after signal generation to ensure we have the final direction
+        if fv and self._dual_gate.is_loaded:
+            try:
+                # Use current best ask for whichever side the signal chose
+                entry_odds_v4 = signal.clob_yes_ask if "UP" in signal.signal else signal.clob_no_ask
+                
+                gate_res_v4 = self._dual_gate.evaluate_dual_signal(
+                    raw_features=xgb_raw_features,
+                    entry_odds=entry_odds_v4 if entry_odds_v4 else 0.5,
+                )
+                
+                # Tracking Scalping recommendations
+                if gate_res_v4.get("strategy") == "SCALPING" and signal.signal != "ABSTAIN":
+                    self._shadow_scalps[market.market_id] = {
+                        "direction": signal.signal,
+                        "target": gate_res_v4.get("tp_target", 0.85),
+                        "entry_time": datetime.now(timezone.utc),
+                        "entry_price": entry_odds_v4
+                    }
+                    logger.info(
+                        "shadow_scalp_recommended_v4",
+                        market_id=market.market_id,
+                        p_win=round(gate_res_v4["p_win"], 4),
+                        p_spike=round(gate_res_v4["p_spike"], 4),
+                    )
+                
+                logger.info(
+                    "shadow_inference_v4",
+                    market_id=market.market_id,
+                    p_win=round(gate_res_v4["p_win"], 4),
+                    p_spike=round(gate_res_v4.get("p_spike") or 0, 4),
+                    strategy=gate_res_v4["strategy"],
+                    v4_decision=gate_res_v4["decision"]
+                )
+            except Exception as e:
+                logger.error("shadow_inference_v4_error", error=str(e))
 
         # ── ONE-BET-PER-MARKET RULE ───────────────────────────
         # Only one active position/pending signal per market_id.
@@ -1561,6 +1618,61 @@ class TradingBot:
             await asyncio.sleep(poll_interval)
 
     # ── Dashboard ─────────────────────────────────────────────
+
+    async def _shadow_scalp_monitor_loop(self) -> None:
+        """
+        Background loop for Shadow Convergence Tracking (Task 3).
+        Checks if markets recommended for SCALPING by V4 hit their targets.
+        """
+        while self._running:
+            await asyncio.sleep(2)
+            
+            if not self._shadow_scalps:
+                continue
+                
+            now = datetime.now(timezone.utc)
+            m_ids_to_remove = []
+            
+            for m_id, data in self._shadow_scalps.items():
+                # 1. Check if expired (15m window or market resolved)
+                if now - data["entry_time"] > timedelta(minutes=15):
+                    logger.info("theoretical_spike_miss", market_id=m_id, reason="timeout_15m")
+                    m_ids_to_remove.append(m_id)
+                    continue
+                
+                # 2. Check real-time bid from CLOB cache
+                # Note: CLOBFeed stores raw books in self._cached_books[token_id]
+                # We need token IDs for the market.
+                # Since we are in Shadow Mode, we can use the discovery token IDs.
+                if self._discovery.active_market and self._discovery.active_market.market_id == m_id:
+                    market = self._discovery.active_market
+                else:
+                    # If not currently active, we can't easily check WebSocket cache without token IDs.
+                    # For simplicity in this Shadow PR, we only monitor the CURRENTLY active market.
+                    continue
+                
+                clob = self._clob.clob_state
+                if not clob or clob.market_id != m_id:
+                    continue
+                
+                # 3. Check for Spike hit
+                bid = clob.yes_bid if "UP" in data["direction"] else clob.no_bid
+                target = data["target"]
+                
+                if bid >= target:
+                    latency = (now - data["entry_time"]).total_seconds()
+                    logger.info(
+                        "theoretical_spike_hit",
+                        market_id=m_id,
+                        target=target,
+                        actual_bid=bid,
+                        latency_seconds=round(latency, 1),
+                        message="V4 SCALP TARGET HIT IN OUT-OF-SAMPLE"
+                    )
+                    m_ids_to_remove.append(m_id)
+            
+            for m_id in m_ids_to_remove:
+                self._shadow_scalps.pop(m_id, None)
 
     async def _run_dashboard(self) -> None:
         """Update Rich dashboard every 5 seconds."""
