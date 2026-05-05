@@ -35,5 +35,6 @@ example_project/*
 dataset/
 models/
 !models/alpha_v1/
+!models/dual_v4_sanitized/
 plugin/
 tmp/
