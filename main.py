@@ -1093,7 +1093,12 @@ class TradingBot:
         if self._mode == "dry-run":
             # High-fidelity Paper Trading Execution
             from src.zone_matrix import classify_zone
-            zone_res = classify_zone(signal.TTR_minutes, signal.strike_distance, signal.clob_yes_ask)
+            # V4 logic requires absolute USD distance and correct side entry odds
+            zone_res = classify_zone(
+                signal.TTR_minutes, 
+                abs(signal.current_price - signal.strike_price), 
+                signal.entry_odds
+            )
             
             paper_record = await self._paper_engine.execute_paper_trade(
                 signal=signal,
