@@ -1,0 +1,76 @@
+{
+  "calibration": {
+    "fraction_of_positives": [
+      0.037037037037037035,
+      0.4375,
+      0.6666666666666666,
+      0.75
+    ],
+    "mean_predicted": [
+      0.11427667102328053,
+      0.28125,
+      0.3684210479259491,
+      0.41578947752714157
+    ],
+    "ece": 0.21648644379995485,
+    "brier": 0.17884834525959686,
+    "auc": 0.8541666666666666,
+    "logloss": 0.5182710919312246,
+    "n_samples": 61
+  },
+  "shap_importance": {
+    "entry_odds": 0.30271,
+    "contest_urgency": 0.099448,
+    "tfm_value": 0.098046,
+    "depth_ratio": 0.029664,
+    "obi_vol_interaction": 0.014171
+  },
+  "ev_simulation": {
+    "n_total": 61,
+    "n_underdog": 19,
+    "n_executed": 2,
+    "underdog_cutoff": 0.3,
+    "ev_threshold": 0.04,
+    "win_rate": 0.0,
+    "avg_ev": 0.1728,
+    "median_ev": 0.1728,
+    "avg_odds": 0.095,
+    "avg_p_win": 0.1111,
+    "total_pnl": -2.0,
+    "avg_pnl_per_bet": -1.0,
+    "max_drawdown": -2.0,
+    "peak_pnl": -1.0,
+    "sharpe_ratio": null,
+    "pnl_curve": [
+      -1.0,
+      -2.0
+    ]
+  },
+  "classification_report": {
+    "0": {
+      "precision": 0.6557377049180327,
+      "recall": 1.0,
+      "f1-score": 0.7920792079207921,
+      "support": 40.0
+    },
+    "1": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1-score": 0.0,
+      "support": 21.0
+    },
+    "accuracy": 0.6557377049180327,
+    "macro avg": {
+      "precision": 0.32786885245901637,
+      "recall": 0.5,
+      "f1-score": 0.39603960396039606,
+      "support": 61.0
+    },
+    "weighted avg": {
+      "precision": 0.429991937651169,
+      "recall": 0.6557377049180327,
+      "f1-score": 0.5193962019152735,
+      "support": 61.0
+    }
+  }
+}

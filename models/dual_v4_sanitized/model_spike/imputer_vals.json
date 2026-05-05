@@ -1,0 +1,22 @@
+{
+  "obi_value": 0.4656346050120608,
+  "tfm_value": 0.22311715045731956,
+  "depth_ratio": 2.698414235215024,
+  "obi_tfm_product": 0.06543078364695251,
+  "obi_tfm_alignment": 1.0,
+  "rv_value": 0.1753578534471227,
+  "vol_percentile": 0.4773662551342105,
+  "strike_distance_pct": 0.00972389140911905,
+  "contest_urgency": 0.013905275518047749,
+  "ttr_seconds": 172.61098349999997,
+  "odds_yes": 0.635,
+  "odds_no": 0.375,
+  "entry_odds": 0.35,
+  "odds_yes_60s_ago": 0.515,
+  "odds_delta_60s": 0.07999999999999996,
+  "spread_pct": 0.01521749574381725,
+  "btc_return_1m": 6.385741139976528e-05,
+  "clob_spread_vel": 0.0033333333333333,
+  "clob_depth_delta": 0.06217938435892665,
+  "confidence_score": 0.5724630211274544
+}

@@ -1,0 +1,71 @@
+{
+  "version": "20260505_124102",
+  "saved_at": "2026-05-05T12:41:12Z",
+  "feature_names": [
+    "entry_odds",
+    "depth_ratio",
+    "contest_urgency",
+    "tfm_value",
+    "obi_vol_interaction"
+  ],
+  "n_features": 5,
+  "n_train": 701,
+  "n_calib": 280,
+  "best_iteration": 415,
+  "metrics": {
+    "calib_auc": 0.6571,
+    "calib_brier": 0.2156,
+    "calib_ece": 0.0
+  },
+  "cv": {
+    "mean_auc": 0.7559,
+    "std_auc": 0.0944,
+    "mean_brier": 0.2254,
+    "oof_auc": 0.7199,
+    "n_estimators_optimal": 247
+  },
+  "quality_gates": {
+    "all_pass": true,
+    "checks": {
+      "auc_cv_min": {
+        "value": 0.7559,
+        "threshold": 0.6,
+        "pass": true
+      },
+      "auc_cv_std": {
+        "value": 0.0944,
+        "threshold": 0.08,
+        "pass": false
+      },
+      "ece_calib": {
+        "value": 0.0,
+        "threshold": 0.05,
+        "pass": true
+      },
+      "brier": {
+        "value": 0.2156,
+        "threshold": 0.26,
+        "pass": true
+      },
+      "ece_test": {
+        "value": 0.10391186359117968,
+        "threshold": 0.2,
+        "pass": true
+      }
+    }
+  },
+  "calib_curve": {
+    "fraction_of_positives": [
+      0.425,
+      0.5615384615384615,
+      0.7666666666666667,
+      0.85
+    ],
+    "mean_predicted": [
+      0.42500001192092896,
+      0.5615384752933795,
+      0.7666666507720947,
+      0.8500000238418579
+    ]
+  }
+}

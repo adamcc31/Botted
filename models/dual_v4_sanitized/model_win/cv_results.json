@@ -1,0 +1,50 @@
+{
+  "folds": [
+    {
+      "fold": 1,
+      "auc": 0.819,
+      "brier": 0.2158,
+      "best_iteration": 320,
+      "n_train": 560,
+      "n_val": 141
+    },
+    {
+      "fold": 2,
+      "auc": 0.8623,
+      "brier": 0.2076,
+      "best_iteration": 302,
+      "n_train": 561,
+      "n_val": 140
+    },
+    {
+      "fold": 3,
+      "auc": 0.7342,
+      "brier": 0.2399,
+      "best_iteration": 170,
+      "n_train": 561,
+      "n_val": 140
+    },
+    {
+      "fold": 4,
+      "auc": 0.5876,
+      "brier": 0.2371,
+      "best_iteration": 151,
+      "n_train": 561,
+      "n_val": 140
+    },
+    {
+      "fold": 5,
+      "auc": 0.7765,
+      "brier": 0.2266,
+      "best_iteration": 294,
+      "n_train": 561,
+      "n_val": 140
+    }
+  ],
+  "mean_auc": 0.7559,
+  "std_auc": 0.0944,
+  "mean_brier": 0.2254,
+  "oof_auc": 0.7199,
+  "oof_ece_raw": 0.1673,
+  "n_estimators_optimal": 247
+}
