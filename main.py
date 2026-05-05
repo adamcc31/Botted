@@ -1669,6 +1669,20 @@ class TradingBot:
                         latency_seconds=round(latency, 1),
                         message="V4 SCALP TARGET HIT IN OUT-OF-SAMPLE"
                     )
+                    
+                    # TASK 2: Injeksi Telemetri Shadow V4
+                    msg = (
+                        f"🚨 <b>[SHADOW V4] 🎯 SPIKE HIT!</b>\n"
+                        f"📌 <b>Market:</b> {market.slug}\n"
+                        f"⏱️ <b>Time to Hit:</b> {round(latency, 1)} detik\n"
+                        f"📈 <b>Target Hit:</b> {target}"
+                    )
+                    # TASK 3: Non-blocking via create_task
+                    asyncio.create_task(
+                        self._telegram.send_message(title="SHADOW V4 ALERT", message=msg),
+                        name=f"shadow_alert_{m_id[:8]}"
+                    )
+                    
                     m_ids_to_remove.append(m_id)
             
             for m_id in m_ids_to_remove:
