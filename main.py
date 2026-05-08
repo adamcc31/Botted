@@ -162,6 +162,7 @@ class TradingBot:
         self._slingger = SlingshotHunterV5()
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._shadow_scalps: dict[str, dict] = {}
+        self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
         
         initial_capital = 50.0
         self._session_stats = {
