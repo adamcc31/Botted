@@ -35,5 +35,6 @@ dataset/
 models/*
 !models/alpha_v1/
 !models/slingger_hunter_v5/
+!models/slingger_hunter_v5/*.pkl
 plugin/
 tmp/
