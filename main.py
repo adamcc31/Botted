@@ -1019,8 +1019,8 @@ class TradingBot:
 
         # ── Probability Source Selection (XGBoost Alpha V1) ────
         p_model = q_fair
-        # Even if shadow mode is on, we always run V1 unless V4 has taken control
-        if not self._enable_dual_execution or not self._dual_gate.is_loaded:
+        # Even if shadow mode is on, we always run V1 unless V5 has taken control
+        if not self._enable_dual_execution or not self._slingger.is_loaded:
             if fv and self._xgboost_gate.is_loaded:
                 gate_res = self._xgboost_gate.evaluate_signal(
                     raw_features=xgb_raw_features,

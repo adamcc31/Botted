@@ -116,3 +116,4 @@ class SlingshotHunterV5:
 
 # ── Backward compatibility aliases ─────────────────────────────
 ShadowPredatorV4 = SlingshotHunterV5
+DualXGBoostGate = SlingshotHunterV5
