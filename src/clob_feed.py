@@ -420,3 +420,23 @@ class CLOBFeed:
         
         # If all items are newer than target_time, return the oldest available
         return history[0]["book"]
+
+    def cleanup_market(self, market_id: str) -> None:
+        """
+        Explicitly free all cached data for a resolved/expired market.
+
+        Called by main.py when a market is resolved, expired, or stopped.
+        Prevents progressive memory leak from unbounded _clob_history growth.
+        """
+        # Clean history deque
+        try:
+            del self._clob_history[market_id]
+            logger.info("clob_history_cleaned", market_id=market_id[:16])
+        except KeyError:
+            pass
+
+        # Clean cached books for any token_ids associated with this market
+        # (token_ids are not keyed by market_id in _cached_books, but
+        #  rotating subscriptions in fetch_clob_snapshot already handles that)
+
+        logger.debug("clob_market_cleanup_complete", market_id=market_id[:16])

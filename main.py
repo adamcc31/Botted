@@ -1373,6 +1373,13 @@ class TradingBot:
         # Clear one-bet-per-market lock
         self._active_bets.pop(trade.market_id, None)
 
+        # ── Garbage Collection: free CLOB history + shadow scalps ──
+        self._clob.cleanup_market(trade.market_id)
+        self._shadow_scalps.pop(trade.market_id, None)
+        self._odds_history.pop(trade.market_id, None)
+        self._post_mortem_tracker.pop(trade.market_id, None)
+        logger.debug("gc_market_cleaned", market_id=trade.market_id)
+
         # Telegram: trade resolved (PnL final for this paper/live record).
         asyncio.create_task(
             self._send_telegram(
@@ -1474,6 +1481,11 @@ class TradingBot:
                 max_edge_seen=round(data["max_edge"], 4),
                 top_blockers=top_blockers
             )
+
+        # ── Garbage Collection for abstain-only markets ──
+        self._clob.cleanup_market(m_id)
+        self._shadow_scalps.pop(m_id, None)
+        self._odds_history.pop(m_id, None)
 
     async def _maybe_enable_live(self) -> None:
         """Enable actual live trading after dry-run performance gates."""
@@ -1646,6 +1658,7 @@ class TradingBot:
                 # 1. Check if expired (15m window or market resolved)
                 if now - data["entry_time"] > timedelta(minutes=15):
                     logger.info("theoretical_spike_miss", market_id=m_id, reason="timeout_15m")
+                    self._clob.cleanup_market(m_id)
                     m_ids_to_remove.append(m_id)
                     continue
                 
@@ -1692,6 +1705,7 @@ class TradingBot:
                         name=f"shadow_alert_{m_id[:8]}"
                     )
                     
+                    self._clob.cleanup_market(m_id)
                     m_ids_to_remove.append(m_id)
             
             for m_id in m_ids_to_remove:

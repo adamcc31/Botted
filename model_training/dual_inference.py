@@ -37,12 +37,27 @@ class DualXGBoostGate:
         ev_threshold: float = 0.01
     ) -> Dict[str, Any]:
         """
-        Decision Matrix implementation.
+        Decision Matrix implementation with X-Ray telemetry.
         """
         # 1. Infer Model 1 (Win)
         res_win = self.gate_win.evaluate_signal(raw_features, entry_odds, ev_threshold)
         
         p_win = res_win["p_win"]
+        
+        # ── X-RAY TELEMETRY: Always log P_win ──────────────────
+        logger.info(
+            "V4_XRAY_P_WIN: p_win=%.6f, decision=%s, ev=%.4f, entry_odds=%.4f",
+            p_win, res_win["decision"], res_win.get("ev", 0.0), entry_odds,
+        )
+        
+        # ── X-RAY: Verify feature_names alignment ─────────────
+        # Log the feature_names used by the loaded model so we can
+        # cross-check against dataset_training_v4.csv columns.
+        if hasattr(self.gate_win, '_feature_names') and self.gate_win._feature_names:
+            logger.debug(
+                "V4_FEATURE_NAMES_WIN: %s",
+                self.gate_win._feature_names,
+            )
         
         # Decision Matrix
         # Default strategy
@@ -59,8 +74,29 @@ class DualXGBoostGate:
             
         # Condition B: Scalping Mode (Marginal Zone)
         if 0.40 <= p_win <= 0.75 and self.gate_spike.is_loaded:
+            # ── X-RAY: Log feature vector entering Model 2 ────
+            logger.info(
+                "V4_INPUT_XRAY: spread_vel=%s, depth_delta=%s",
+                raw_features.get('clob_spread_vel'),
+                raw_features.get('clob_depth_delta'),
+            )
+            
             res_spike = self.gate_spike.predict_quality(raw_features)
             p_spike = res_spike["p_win"] # This is p_spike because it's model_spike
+            
+            # ── X-RAY: Always log raw P_spike ─────────────────
+            logger.info(
+                "V4_XRAY_P_SPIKE: p_spike=%.6f, threshold=0.80, "
+                "passes=%s, p_win=%.6f",
+                p_spike, p_spike > 0.80, p_win,
+            )
+            
+            # ── X-RAY: Verify spike model feature_names ───────
+            if hasattr(self.gate_spike, '_feature_names') and self.gate_spike._feature_names:
+                logger.debug(
+                    "V4_FEATURE_NAMES_SPIKE: %s",
+                    self.gate_spike._feature_names,
+                )
             
             if p_spike > 0.80:
                 # Override decision if spike is high but win was marginal
