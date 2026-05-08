@@ -65,6 +65,13 @@ ENGINEERED_FEATURES: List[str] = [
     "micro_alignment",      # obi_value × tfm_value (arah sama = kuat)
     "hour_wib",             # jam WIB (UTC+7) → pola volume per jam
     "is_weekend",           # 1 jika Sabtu/Minggu → likuiditas tipis
+    # --- V5 NEW FEATURES ---
+    "odds_delta_signed",    # CLOB momentum × direction_sign (signed vector)
+    "clob_alignment",       # 1 jika CLOB bergerak searah signal
+    "odds_conviction",      # abs(entry_odds - 0.5) — distance from fair value
+    "clob_tfm_confluence",  # odds_delta_signed × tfm_signed (dual confirmation)
+    "dual_confirmation",    # 1 jika CLOB dan TFM keduanya agree
+    "depth_ratio_std",      # std depth_ratio per market (liquidity stability)
 ]
 
 ALL_FEATURES: List[str] = RAW_FEATURES + ENGINEERED_FEATURES
@@ -81,6 +88,23 @@ SELECTED_FEATURES: List[str] = [
     "contest_urgency",      # #3 SHAP — seberapa dekat ke expiry
     "tfm_value",            # #4 SHAP — trade flow momentum
     "obi_vol_interaction",  # #5 SHAP — OBI x volatilitas (engineered)
+]
+
+# ---------------------------------------------------------------------------
+# V5 Feature Sets — untuk ablation study (digunakan oleh run_v5_ablation.py)
+# ---------------------------------------------------------------------------
+# Baseline (Experiment A) = SELECTED_FEATURES (5 fitur original)
+
+V5_FEATURES_PHASE1: List[str] = SELECTED_FEATURES + [
+    "odds_delta_signed",    # CLOB momentum vector
+    "clob_alignment",       # binary CLOB agreement
+    "odds_conviction",      # distance from fair value
+]
+
+V5_FEATURES_FULL: List[str] = V5_FEATURES_PHASE1 + [
+    "depth_ratio_std",      # liquidity stability
+    "clob_tfm_confluence",  # dual confirmation interaction
+    "dual_confirmation",    # binary dual agreement
 ]
 
 # Features for Model 2 (Spike Predictor)

@@ -288,6 +288,268 @@ def get_market_groups(df: pd.DataFrame) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# V5: Load dry-run CSVs & merge into master dataset
+# ---------------------------------------------------------------------------
+
+# Kolom numerik yang mungkin menggunakan format angka Indonesia/Eropa
+# (titik sebagai ribuan separator, koma sebagai desimal)
+_NUMERIC_COLS_TO_NORMALIZE: list[str] = [
+    "ttr_seconds", "strike_price", "odds_yes", "odds_no",
+    "binance_price", "chainlink_price", "obi_value", "tfm_value",
+    "rv_value", "depth_ratio", "odds_delta_60s", "btc_return_1m",
+    "entry_odds", "confidence_score", "spread_pct",
+    "strike_distance_pct", "contest_urgency", "vol_percentile",
+    "odds_yes_60s_ago",
+]
+
+
+def _normalize_numeric_col(series: pd.Series) -> pd.Series:
+    """
+    Normalisasi kolom numerik yang mungkin menggunakan format angka
+    Indonesia/Eropa (titik sebagai ribuan, koma sebagai desimal).
+
+    Heuristik: jika ada koma DAN titik dalam satu value, asumsikan
+    titik = ribuan, koma = desimal → hapus titik, ganti koma → titik.
+    Jika hanya koma, asumsikan desimal.
+    """
+    if series.dtype in (np.float64, np.float32, np.int64, np.int32, float, int):
+        return series  # sudah numerik
+
+    s = series.astype(str)
+
+    def _fix_number(val: str) -> str:
+        val = val.strip()
+        if val in ("", "nan", "None", "N/A", "NaN"):
+            return "NaN"
+        has_comma = "," in val
+        has_dot = "." in val
+        if has_comma and has_dot:
+            # Cek posisi terakhir: jika koma setelah titik → format EN
+            last_comma = val.rfind(",")
+            last_dot = val.rfind(".")
+            if last_comma > last_dot:
+                # Format ID/EU: 1.234,56 → 1234.56
+                val = val.replace(".", "").replace(",", ".")
+            # else: format EN: 1,234.56 → 1234.56
+            else:
+                val = val.replace(",", "")
+        elif has_comma and not has_dot:
+            # Hanya koma → asumsikan desimal
+            val = val.replace(",", ".")
+        return val
+
+    return pd.to_numeric(s.apply(_fix_number), errors="coerce")
+
+
+def load_dry_run_data(file_paths: list[str | Path]) -> pd.DataFrame:
+    """
+    Load dan gabungkan beberapa file dry-run CSV.
+
+    Dry-run CSVs menggunakan comma delimiter dan tidak memiliki kolom
+    'label'. Label diderivasi dari signal_direction == actual_outcome.
+    Baris tanpa resolusi (actual_outcome PENDING/N/A/kosong) dibuang.
+    """
+    frames = []
+    for fpath in file_paths:
+        fpath = Path(fpath)
+        if not fpath.exists():
+            logger.warning("File tidak ditemukan, skip: %s", fpath)
+            continue
+
+        try:
+            df = pd.read_csv(fpath, low_memory=False)
+        except Exception as e:
+            logger.warning("Gagal baca %s: %s — skip", fpath, e)
+            continue
+
+        if len(df) == 0:
+            logger.warning("File kosong: %s — skip", fpath)
+            continue
+
+        df["_source_file"] = fpath.name
+        frames.append(df)
+        logger.info("  Loaded dry-run: %s → %d rows", fpath.name, len(df))
+
+    if not frames:
+        logger.warning("Tidak ada dry-run file yang berhasil dimuat.")
+        return pd.DataFrame()
+
+    df_all = pd.concat(frames, ignore_index=True)
+    logger.info("Total dry-run rows (raw): %d dari %d files", len(df_all), len(frames))
+    return df_all
+
+
+def merge_datasets(
+    df_train: pd.DataFrame,
+    dry_run_files: list[str | Path],
+) -> pd.DataFrame:
+    """
+    Gabungkan dataset training V4 dengan dry-run CSVs menjadi satu
+    master dataset.
+
+    Kriteria merge:
+      1. Load dan concat semua dry-run CSVs
+      2. Drop rows dengan actual_outcome == 'PENDING' atau kosong
+      3. Derive label: 1 jika signal_direction == actual_outcome, else 0
+         (hanya untuk rows yang memiliki signal_direction BUY_UP/BUY_DOWN)
+      4. Dedup berdasarkan (timestamp, market_id) — keep first
+      5. Sort ascending by timestamp
+      6. Normalisasi kolom numerik (format ID/EU)
+      7. Hitung depth_ratio_std per market_id
+
+    Args:
+        df_train:       DataFrame training v4 (sudah memiliki kolom 'label')
+        dry_run_files:  List path ke dry-run CSVs
+
+    Returns:
+        DataFrame gabungan dengan kolom 'label' yang konsisten.
+    """
+    logger.info("=" * 60)
+    logger.info("MERGE DATASETS — V4 Training + Dry-Run")
+    logger.info("=" * 60)
+
+    # --- Load dry-run ---
+    df_dry = load_dry_run_data(dry_run_files)
+
+    if len(df_dry) == 0:
+        logger.warning("Tidak ada dry-run data. Return training v4 saja.")
+        return df_train.copy()
+
+    # --- Filter dry-run: buang PENDING dan baris tanpa resolusi ---
+    if "actual_outcome" in df_dry.columns:
+        ao = df_dry["actual_outcome"].astype(str).str.strip().str.upper()
+        valid_mask = ao.isin(["BUY_UP", "BUY_DOWN"])
+        n_before = len(df_dry)
+        df_dry = df_dry[valid_mask].copy()
+        logger.info(
+            "Dry-run: dropped %d unresolved rows (PENDING/N/A/kosong), kept %d",
+            n_before - len(df_dry), len(df_dry),
+        )
+
+    # --- Derive label untuk dry-run ---
+    if "label" not in df_dry.columns:
+        df_dry["label"] = np.nan
+
+    # Label: 1 jika signal_direction == actual_outcome, else 0
+    # Hanya untuk rows dengan signal_direction yang valid (BUY_UP/BUY_DOWN)
+    sd = df_dry["signal_direction"].astype(str).str.strip().str.upper()
+    ao = df_dry["actual_outcome"].astype(str).str.strip().str.upper()
+    valid_signal = sd.isin(["BUY_UP", "BUY_DOWN"])
+
+    df_dry.loc[valid_signal, "label"] = (
+        (sd[valid_signal] == ao[valid_signal]).astype(int)
+    )
+
+    logger.info(
+        "Dry-run label derivation: %d labeled (%d valid signals), "
+        "%d unlabeled (ABSTAIN/SKIP)",
+        valid_signal.sum(),
+        int(df_dry["label"].notna().sum()),
+        int(df_dry["label"].isna().sum()),
+    )
+
+    # --- Normalisasi kolom numerik di dry-run ---
+    for col in _NUMERIC_COLS_TO_NORMALIZE:
+        if col in df_dry.columns:
+            df_dry[col] = _normalize_numeric_col(df_dry[col])
+
+    # --- Pastikan kolom timestamp konsisten ---
+    df_dry["timestamp"] = pd.to_datetime(df_dry["timestamp"], utc=True)
+
+    if "timestamp" in df_train.columns:
+        df_train = df_train.copy()
+        df_train["timestamp"] = pd.to_datetime(df_train["timestamp"], utc=True)
+
+    # --- Concat ---
+    # Align kolom — gunakan union
+    df_merged = pd.concat([df_train, df_dry], ignore_index=True, sort=False)
+    logger.info(
+        "Merged: %d (v4) + %d (dry-run) = %d total",
+        len(df_train), len(df_dry), len(df_merged),
+    )
+
+    # --- Dedup berdasarkan (timestamp, market_id) — keep first ---
+    if "market_id" in df_merged.columns and "timestamp" in df_merged.columns:
+        n_before = len(df_merged)
+        df_merged = df_merged.drop_duplicates(
+            subset=["timestamp", "market_id"], keep="first"
+        )
+        logger.info("Dedup: %d → %d (dropped %d dupes)",
+                     n_before, len(df_merged), n_before - len(df_merged))
+
+    # --- Sort by timestamp ---
+    df_merged = df_merged.sort_values("timestamp").reset_index(drop=True)
+
+    return df_merged
+
+
+def sanitize_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Sanitasi master dataset:
+      1. Drop rows tanpa label (NaN / PENDING)
+      2. Pastikan label adalah int 0/1
+      3. Normalisasi kolom numerik
+      4. Hitung depth_ratio_std per market_id (fitur batch)
+      5. Drop rows dengan entry_odds invalid (NaN, 0, >1)
+
+    Returns:
+        DataFrame yang sudah bersih dan siap untuk training.
+    """
+    logger.info("Sanitizing master dataset: %d rows input", len(df))
+    df = df.copy()
+
+    # --- Drop rows tanpa label ---
+    if "label" in df.columns:
+        n_before = len(df)
+        df["label"] = pd.to_numeric(df["label"], errors="coerce")
+        df = df[df["label"].notna()].copy()
+        df["label"] = df["label"].astype(int)
+        logger.info("Dropped %d rows tanpa label, kept %d",
+                     n_before - len(df), len(df))
+
+    # --- Normalisasi kolom numerik ---
+    for col in _NUMERIC_COLS_TO_NORMALIZE:
+        if col in df.columns:
+            df[col] = _normalize_numeric_col(df[col])
+
+    # --- Drop entry_odds invalid ---
+    if "entry_odds" in df.columns:
+        n_before = len(df)
+        df = df[
+            df["entry_odds"].notna() &
+            (df["entry_odds"] > 0) &
+            (df["entry_odds"] <= 1.0)
+        ].copy()
+        logger.info("Dropped %d rows dengan entry_odds invalid",
+                     n_before - len(df))
+
+    # --- Hitung depth_ratio_std per market_id (batch feature) ---
+    if "depth_ratio" in df.columns and "market_id" in df.columns:
+        df_std = (
+            df.groupby("market_id")["depth_ratio"]
+            .std()
+            .reset_index()
+        )
+        df_std.columns = ["market_id", "depth_ratio_std"]
+        df = df.merge(df_std, on="market_id", how="left")
+        df["depth_ratio_std"] = df["depth_ratio_std"].fillna(0.0)
+        logger.info("Computed depth_ratio_std per market_id")
+
+    # --- Pastikan kolom yang dibutuhkan ada ---
+    # Tambahkan kolom kosong untuk fitur yang mungkin tidak tersedia
+    for col in ["clob_spread_vel", "clob_depth_delta",
+                "obi_tfm_product", "obi_tfm_alignment"]:
+        if col not in df.columns:
+            df[col] = 0.0
+            logger.info("  Added missing column '%s' with default 0.0", col)
+
+    df = df.reset_index(drop=True)
+    logger.info("Sanitized dataset: %d rows, label dist: WIN=%.1f%%",
+                len(df), df["label"].mean() * 100)
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Imputer sederhana — handle edge case null values
 # ---------------------------------------------------------------------------
 

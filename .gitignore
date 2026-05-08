@@ -21,7 +21,6 @@ data/
 raw_data/
 processed_data/
 results/
-models/
 
 # VS Code / OS files
 .vscode/
@@ -33,8 +32,8 @@ example_project/*
 
 # other file
 dataset/
-models/
+models/*
 !models/alpha_v1/
-!models/dual_v4_sanitized/
+!models/slingger_hunter_v5/
 plugin/
 tmp/

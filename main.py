@@ -79,7 +79,8 @@ from src.exporter import Exporter
 from src.feature_engine import FeatureEngine
 from src.market_discovery import MarketDiscovery
 from model_training.inference import XGBoostGate
-from model_training.dual_inference import DualXGBoostGate
+from model_training.dual_inference import SlingshotHunterV5
+from src.telegram_notifier import SlingshotAlerts
 from src.fair_probability import FairProbabilityEngine
 from src.risk_manager import RiskManager
 from src.signal_generator import SignalGenerator
@@ -138,7 +139,6 @@ class TradingBot:
         self._clob = CLOBFeed(self._config)
         self._feature_engine = FeatureEngine(self._config)
         self._xgboost_gate = XGBoostGate()
-        self._dual_gate = DualXGBoostGate()
         self._signal_gen = SignalGenerator(self._config)
         self._db = DatabaseManager()
         self._risk_mgr = RiskManager(self._config, self._db)
@@ -160,6 +160,13 @@ class TradingBot:
         # Airgap / Shadow Mode config
         self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
         self._shadow_scalps: dict[str, dict] = {}
+
+        # Slingger Hunter V5
+        self._slingger = SlingshotHunterV5()
+        self._active_tasks: dict[str, asyncio.Task] = {}
+        self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
+        MAX_CONCURRENT_SLINGGER_TASKS = int(os.getenv("MAX_SLINGGER_TASKS", "10"))
+        self._max_slingger_tasks = MAX_CONCURRENT_SLINGGER_TASKS
 
         # Dashboard state
         self._latest_signal = None
@@ -420,13 +427,12 @@ class TradingBot:
                 info=f"V1 model not available: {e}.",
             )
             
+
+        # Load Slingger Hunter V5
         try:
-            self._dual_gate.load_models(Path("models/dual_v4_sanitized"))
+            self._slingger.load()
         except Exception as e:
-            logger.warning(
-                "no_v4_dual_model_loaded",
-                info=f"V4 shadow model not available: {e}.",
-            )
+            logger.warning("slingger_v5_not_loaded", info=str(e))
 
         # Bootstrap historical data
         bars_loaded = await self._binance.bootstrap_historical(limit=500)
@@ -506,10 +512,12 @@ class TradingBot:
             asyncio.create_task(
                 self._ultrashort_market_loop(), name="ultrashort_loop"
             ),
-            asyncio.create_task(
-                self._shadow_scalp_monitor_loop(), name="shadow_scalp_monitor"
-            ),
         ]
+
+        # Slingger daily summary scheduler
+        asyncio.create_task(
+            self._daily_summary_loop(), name="slingger_daily_summary"
+        )
 
         # Dry-run must finish within max duration (default 48h).
         if self._requested_mode in ("dry-run", "live"):
@@ -553,6 +561,11 @@ class TradingBot:
             return
         self._stopping = True
         self._running = False
+
+        # Path 5: Shutdown — cleanup all active slingger markets
+        for mid in list(self._shadow_scalps.keys()):
+            await self.cleanup_market(mid, source='shutdown')
+
         await self._binance.stop()
         await self._dual_feed.stop()
         await self._discovery.stop()
@@ -638,15 +651,7 @@ class TradingBot:
         market = self._discovery.active_market
         await self._discovery.refresh_ttr()
 
-        # ── STEP 1: min_ttr_minutes Gate ─────────────────────
-        min_ttr = float(self._config.get("signal.min_ttr_minutes", 1.5))
-        if market.TTR_minutes < min_ttr:
-            logger.debug(
-                "signal_skipped_late_ttr",
-                TTR_minutes=round(market.TTR_minutes, 2),
-                min_ttr=min_ttr,
-            )
-            return
+        # (Moved TTR gate down to line ~950 to prevent blocking Slingger V5)
 
         # ── Bar-close rotation check ──────────────────────────
         # Aligned here (not on an independent timer) so market switches never
@@ -837,6 +842,23 @@ class TradingBot:
         q_fair = fair.q_fair
         uncertainty_u = fair.uncertainty_u
 
+        # ── SLINGGER HUNTER V5 (Section 9) ───────────────────
+        # Runs even if TTR is low or spread is marginal.
+        try:
+            await self._run_slingger_v5(market, clob_state, fv, oracle_price)
+        except Exception as e:
+            logger.error("slingger_v5_execution_error", error=str(e), traceback=traceback.format_exc())
+
+        # ── STEP 1: min_ttr_minutes Gate (V1/V4 Directional Only) ──
+        min_ttr = float(self._config.get("signal.min_ttr_minutes", 1.5))
+        if market.TTR_minutes < min_ttr:
+            logger.debug(
+                "v1_directional_skipped_late_ttr",
+                TTR_minutes=round(market.TTR_minutes, 2),
+                min_ttr=min_ttr,
+            )
+            return
+
         # ── ML Features Collection (MUST happen before XGBoost gate) ─
         ml_features = {}
         if fv:
@@ -991,43 +1013,6 @@ class TradingBot:
         self._latest_signal = signal
         await self._dry_run.record_signal(signal, slug=market.slug, ml_features=ml_features)
 
-        # ── Shadow Inference (V4 Dual-Spike) ──
-        # Evaluated after signal generation to ensure we have the final direction
-        if fv and self._dual_gate.is_loaded:
-            try:
-                # Use current best ask for whichever side the signal chose
-                entry_odds_v4 = signal.clob_yes_ask if "UP" in signal.signal else signal.clob_no_ask
-                
-                gate_res_v4 = self._dual_gate.evaluate_dual_signal(
-                    raw_features=xgb_raw_features,
-                    entry_odds=entry_odds_v4 if entry_odds_v4 else 0.5,
-                )
-                
-                # Tracking Scalping recommendations
-                if gate_res_v4.get("strategy") == "SCALPING" and signal.signal != "ABSTAIN":
-                    self._shadow_scalps[market.market_id] = {
-                        "direction": signal.signal,
-                        "target": gate_res_v4.get("tp_target", 0.85),
-                        "entry_time": datetime.now(timezone.utc),
-                        "entry_price": entry_odds_v4
-                    }
-                    logger.info(
-                        "shadow_scalp_recommended_v4",
-                        market_id=market.market_id,
-                        p_win=round(gate_res_v4["p_win"], 4),
-                        p_spike=round(gate_res_v4["p_spike"], 4),
-                    )
-                
-                logger.info(
-                    "shadow_inference_v4",
-                    market_id=market.market_id,
-                    p_win=round(gate_res_v4["p_win"], 4),
-                    p_spike=round(gate_res_v4.get("p_spike") or 0, 4),
-                    strategy=gate_res_v4["strategy"],
-                    v4_decision=gate_res_v4["decision"]
-                )
-            except Exception as e:
-                logger.error("shadow_inference_v4_error", error=str(e))
 
         # ── ONE-BET-PER-MARKET RULE ───────────────────────────
         # Only one active position/pending signal per market_id.
@@ -1373,12 +1358,9 @@ class TradingBot:
         # Clear one-bet-per-market lock
         self._active_bets.pop(trade.market_id, None)
 
-        # ── Garbage Collection: free CLOB history + shadow scalps ──
+        # Path 4: External resolution — centralized GC
         self._clob.cleanup_market(trade.market_id)
-        self._shadow_scalps.pop(trade.market_id, None)
-        self._odds_history.pop(trade.market_id, None)
-        self._post_mortem_tracker.pop(trade.market_id, None)
-        logger.debug("gc_market_cleaned", market_id=trade.market_id)
+        await self.cleanup_market(trade.market_id, source='schedule_resolution')
 
         # Telegram: trade resolved (PnL final for this paper/live record).
         asyncio.create_task(
@@ -1484,8 +1466,7 @@ class TradingBot:
 
         # ── Garbage Collection for abstain-only markets ──
         self._clob.cleanup_market(m_id)
-        self._shadow_scalps.pop(m_id, None)
-        self._odds_history.pop(m_id, None)
+        await self.cleanup_market(m_id, source='post_mortem')
 
     async def _maybe_enable_live(self) -> None:
         """Enable actual live trading after dry-run performance gates."""
@@ -1640,76 +1621,313 @@ class TradingBot:
 
     # ── Dashboard ─────────────────────────────────────────────
 
-    async def _shadow_scalp_monitor_loop(self) -> None:
+    # ── Slingger Hunter V5: Dual-Stage Shadow Monitor ─────────
+
+    def _init_shadow_scalp(self, market_id: str, side: str, entry: float, exit: float, prob: float) -> None:
+        import time as _time
+        self._shadow_scalps[market_id] = {
+            'token_side':          side,
+            'entry_odds':          entry,
+            'exit_odds':           exit,
+            'swing_prob':          prob,
+            'phase':               'WAITING_ENTRY',
+            'entry_filled':        False,
+            'exit_filled':         False,
+            'entry_fill_price':    None,
+            'exit_fill_price':     None,
+            'entry_fill_time':      None,
+            'exit_fill_time':      None,
+            'emergency_triggered': False,
+            'emergency_decision':  None,
+            'created_at':          _time.time(),
+        }
+
+    async def _run_slingger_v5(self, market: ActiveMarket, clob_state: CLOBState, fv: FeatureVector, oracle_price: float) -> None:
         """
-        Background loop for Shadow Convergence Tracking (Task 3).
-        Checks if markets recommended for SCALPING by V4 hit their targets.
+        Inference engine for Slingger Hunter V5.
+        Detects swing patterns on YES and NO tokens independently.
         """
-        while self._running:
-            await asyncio.sleep(2)
+        if not self._slingger.is_loaded or not clob_state:
+            return
+
+        m_id = market.market_id
+        if m_id in self._active_tasks or m_id in self._shadow_scalps:
+            return # Already tracking this market
+
+        if len(self._active_tasks) >= self._max_slingger_tasks:
+            logger.warning("slingger_v5_max_tasks_reached", limit=self._max_slingger_tasks)
+            return
+
+        now = datetime.now(timezone.utc)
+        
+        # 1. Prepare Base Features (from FeatureEngine)
+        base_features = dict(zip(fv.feature_names, fv.values))
+        
+        # 2. Compute 30s Velocity proxy (using history from CLOBFeed)
+        lookback = 30.0
+        yes_token = market.clob_token_ids.get("YES", "")
+        no_token = market.clob_token_ids.get("NO", "")
+        
+        hist_yes = self._clob.get_historical_book(yes_token, lookback) if yes_token else None
+        
+        if hist_yes:
+            # Simple bid price velocity
+            curr_bid = clob_state.yes_bid
+            hist_bid = (1.0 - self._clob._best_ask(hist_yes)) # Implied bid
+            price_velocity_30s = (curr_bid - hist_bid) / lookback
+        else:
+            price_velocity_30s = 0.0
+
+        # 3. Predict for YES side swing
+        # Model expects: yes_price_t0, no_price_t0, etc.
+        yes_feat = {
+            'yes_price_t0':              clob_state.yes_bid,
+            'no_price_t0':               clob_state.no_bid,
+            'clob_spread_t0':            clob_state.yes_ask - clob_state.yes_bid,
+            'yes_depth_t0':              clob_state.yes_depth_usd,
+            'no_depth_t0':               clob_state.no_depth_usd,
+            'depth_imbalance_t0':        (clob_state.yes_depth_usd - clob_state.no_depth_usd) / max(clob_state.yes_depth_usd + clob_state.no_depth_usd, 1.0),
+            'price_velocity_30s':        price_velocity_30s,
+            'depth_trend_30s':           base_features.get("clob_depth_delta", 0.0), # Proxy
+            'btc_realized_vol_prior_30m': base_features.get("RV", 0.0),
+            'ttr_at_signal':             (market.T_resolution - now).total_seconds(),
+            'market_hour_utc':           now.hour,
+            'day_of_week':               now.weekday(),
+        }
+        
+        res_yes = self._slingger.predict(yes_feat)
+        
+        # 4. Predict for NO side swing (Swap prices/depths as seen by NO side)
+        no_feat = yes_feat.copy()
+        no_feat['yes_price_t0'] = clob_state.no_bid
+        no_feat['no_price_t0']  = clob_state.yes_bid
+        no_feat['yes_depth_t0'] = clob_state.no_depth_usd
+        no_feat['no_depth_t0']  = clob_state.yes_depth_usd
+        no_feat['depth_imbalance_t0'] = -yes_feat['depth_imbalance_t0']
+        
+        res_no = self._slingger.predict(no_feat)
+
+        # 5. Decide
+        winner = None
+        if res_yes['signal'] == 'ENTER' and res_no['signal'] == 'ENTER':
+            winner = 'YES' if res_yes['swing_probability'] >= res_no['swing_probability'] else 'NO'
+        elif res_yes['signal'] == 'ENTER':
+            winner = 'YES'
+        elif res_no['signal'] == 'ENTER':
+            winner = 'NO'
+
+        if winner:
+            res = res_yes if winner == 'YES' else res_no
+            logger.info("slingger_v5_pattern_detected", 
+                        side=winner, prob=round(res['swing_probability'], 4),
+                        tier=res['confidence_tier'])
             
-            if not self._shadow_scalps:
-                continue
-                
-            now = datetime.now(timezone.utc)
-            m_ids_to_remove = []
-            
-            for m_id, data in self._shadow_scalps.items():
-                # 1. Check if expired (15m window or market resolved)
-                if now - data["entry_time"] > timedelta(minutes=15):
-                    logger.info("theoretical_spike_miss", market_id=m_id, reason="timeout_15m")
-                    self._clob.cleanup_market(m_id)
-                    m_ids_to_remove.append(m_id)
-                    continue
-                
-                # 2. Check real-time bid from CLOB cache
-                # Note: CLOBFeed stores raw books in self._cached_books[token_id]
-                # We need token IDs for the market.
-                # Since we are in Shadow Mode, we can use the discovery token IDs.
-                if self._discovery.active_market and self._discovery.active_market.market_id == m_id:
-                    market = self._discovery.active_market
-                else:
-                    # If not currently active, we can't easily check WebSocket cache without token IDs.
-                    # For simplicity in this Shadow PR, we only monitor the CURRENTLY active market.
-                    continue
-                
+            self._init_shadow_scalp(m_id, winner, res['entry_odds'], res['exit_odds'], res['swing_probability'])
+            self._active_tasks[m_id] = asyncio.create_task(
+                self._shadow_scalp_monitor_loop(m_id),
+                name=f"slingger_monitor_{m_id[:8]}"
+            )
+
+
+    async def _shadow_scalp_monitor_loop(self, market_id: str) -> None:
+        """
+        Dual-stage monitor for one market (Slingger Hunter V5).
+        FASE 1 WAITING_ENTRY: price <= entry_odds -> virtual fill -> FASE 2
+        FASE 2 WAITING_EXIT: price >= exit_odds -> HIT | TTR<60 -> EMERGENCY
+        """
+        import time as _time
+        POLL_INTERVAL = 5
+        EMERGENCY_TTR = 60
+
+        state = self._shadow_scalps.get(market_id)
+        if not state:
+            return
+
+        # Cache market metadata at start to survive rotation
+        market = self._discovery.active_market
+        if not market or market.market_id != market_id:
+            # Fallback for late starts
+            market_slug = market_id[:16]
+            res_time = datetime.now(timezone.utc) + timedelta(minutes=5)
+        else:
+            market_slug = market.slug
+            res_time = market.T_resolution
+
+        try:
+            while state['phase'] != 'CLOSED':
+                if not self._running:
+                    break
+
                 clob = self._clob.clob_state
-                if not clob or clob.market_id != m_id:
+                # We can track the market even if it's not the primary active one,
+                # as long as self._clob still has its data in cache/history.
+                # But for polling simplicity, we assume we only track the primary.
+                if clob is None or clob.market_id != market_id:
+                    # Try to fetch fresh state for this specific market if possible
+                    # (This bot design usually assumes 1 active market at a time)
+                    await asyncio.sleep(POLL_INTERVAL)
                     continue
-                
-                # 3. Check for Spike hit
-                bid = clob.yes_bid if "UP" in data["direction"] else clob.no_bid
-                target = data["target"]
-                
-                if bid >= target:
-                    latency = (now - data["entry_time"]).total_seconds()
-                    logger.info(
-                        "theoretical_spike_hit",
-                        market_id=m_id,
-                        target=target,
-                        actual_bid=bid,
-                        latency_seconds=round(latency, 1),
-                        message="V4 SCALP TARGET HIT IN OUT-OF-SAMPLE"
-                    )
-                    
-                    # TASK 2: Injeksi Telemetri Shadow V4
-                    msg = (
-                        f"🚨 <b>[SHADOW V4] 🎯 SPIKE HIT!</b>\n"
-                        f"📌 <b>Market:</b> {market.slug}\n"
-                        f"⏱️ <b>Time to Hit:</b> {round(latency, 1)} detik\n"
-                        f"📈 <b>Target Hit:</b> {target}"
-                    )
-                    # TASK 3: Non-blocking via create_task
-                    asyncio.create_task(
-                        self._telegram.send_message(title="SHADOW V4 ALERT", message=msg),
-                        name=f"shadow_alert_{m_id[:8]}"
-                    )
-                    
-                    self._clob.cleanup_market(m_id)
-                    m_ids_to_remove.append(m_id)
-            
-            for m_id in m_ids_to_remove:
-                self._shadow_scalps.pop(m_id, None)
+
+                token_side = state['token_side']
+                ttr = int((res_time - datetime.now(timezone.utc)).total_seconds())
+
+                if token_side == 'YES':
+                    current_price = 1.0 - clob.no_ask
+                else:
+                    current_price = 1.0 - clob.yes_ask
+
+                # FASE 1: WAITING_ENTRY
+                if state['phase'] == 'WAITING_ENTRY':
+                    if current_price <= state['entry_odds']:
+                        state['entry_filled'] = True
+                        state['entry_fill_price'] = current_price
+                        state['entry_fill_time'] = _time.time()
+                        state['phase'] = 'WAITING_EXIT'
+                        msg = SlingshotAlerts.entry(
+                            market_slug, current_price, state['exit_odds'],
+                            ttr, state['swing_prob'], token_side
+                        )
+                        asyncio.create_task(
+                            self._send_telegram("SLINGGER V5", msg),
+                            name=f"slingger_entry_{market_id[:8]}"
+                        )
+                        logger.info("slingger_entry_fill", market_id=market_id, price=current_price)
+
+                # FASE 2: WAITING_EXIT
+                elif state['phase'] == 'WAITING_EXIT':
+                    latency_s = int(_time.time() - state['entry_fill_time'])
+                    entry_p = state['entry_fill_price']
+
+                    if current_price >= state['exit_odds']:
+                        profit = (current_price - entry_p) * 0.98 - 0.005
+                        state['exit_filled'] = True
+                        state['exit_fill_price'] = current_price
+                        state['exit_fill_time'] = _time.time()
+                        state['result'] = 'HIT'
+                        state['phase'] = 'CLOSED'
+                        self._slingger_daily_stats['hit'] += 1
+                        self._slingger_daily_stats['pnls'].append(profit)
+                        msg = SlingshotAlerts.exit_hit(
+                            market_slug, entry_p, current_price, latency_s, profit
+                        )
+                        asyncio.create_task(
+                            self._send_telegram("SLINGGER V5", msg),
+                            name=f"slingger_hit_{market_id[:8]}"
+                        )
+                        logger.info("slingger_hit", market_id=market_id, pnl=profit)
+                        break
+
+                    elif ttr < EMERGENCY_TTR and not state['emergency_triggered']:
+                        state['emergency_triggered'] = True
+                        ev_exit = (current_price - entry_p) * 0.98 - 0.005
+                        # Simplistic EV comparison
+                        ev_hold = (current_price * (1.0 - entry_p) * 0.98
+                                   - (1 - current_price) * entry_p - 0.005)
+                        decision = 'EXIT_NOW' if ev_exit >= ev_hold else 'HOLD_TO_MATURITY'
+                        state['emergency_decision'] = decision
+                        self._slingger_daily_stats['emergency'] += 1
+                        msg = SlingshotAlerts.emergency(
+                            market_slug, ttr, decision, max(ev_exit, ev_hold), current_price
+                        )
+                        asyncio.create_task(
+                            self._send_telegram("SLINGGER V5", msg),
+                            name=f"slingger_emerg_{market_id[:8]}"
+                        )
+                        if decision == 'HOLD_TO_MATURITY':
+                            state['result'] = 'HOLD_TO_MATURITY'
+                            state['phase'] = 'CLOSED'
+                            break
+                        else:
+                            # EXIT_NOW: close virtual position
+                            state['result'] = 'EMERGENCY_EXIT'
+                            state['phase'] = 'CLOSED'
+                            break
+
+                    elif ttr <= 0:
+                        state['result'] = 'MISS'
+                        state['phase'] = 'CLOSED'
+                        self._slingger_daily_stats['miss'] += 1
+                        msg = SlingshotAlerts.miss(market_slug, entry_p, "expired")
+                        asyncio.create_task(
+                            self._send_telegram("SLINGGER V5", msg),
+                            name=f"slingger_miss_{market_id[:8]}"
+                        )
+                        logger.info("slingger_miss", market_id=market_id)
+                        break
+
+                await asyncio.sleep(POLL_INTERVAL)
+
+        except asyncio.CancelledError:
+            logger.info("slingger_monitor_cancelled", market_id=market_id)
+        finally:
+            # Central GC anchor
+            await self.cleanup_market(market_id, source='slingger_monitor')
+
+    # ── Centralized Garbage Collection (Section 10) ───────────
+
+    async def cleanup_market(self, market_id: str, source: str = 'unknown') -> None:
+        """Central GC anchor. Called from all 5 exit paths."""
+        # Ensure underlying feed history is cleared
+        self._clob.cleanup_market(market_id)
+        
+        cleaned = []
+        for attr in ('_shadow_scalps', '_odds_history', '_post_mortem_tracker'):
+            store = getattr(self, attr, {})
+            if market_id in store:
+                if attr == '_shadow_scalps':
+                    result = store[market_id].get('result', 'UNKNOWN')
+                    cleaned.append(f'{attr}(result={result})')
+                else:
+                    cleaned.append(attr)
+                del store[market_id]
+
+        if market_id in self._active_tasks:
+            task = self._active_tasks.pop(market_id)
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            cleaned.append('_active_tasks')
+
+        if cleaned:
+            logger.debug("cleanup_market", market_id=market_id, source=source,
+                         cleared=', '.join(cleaned))
+
+        self._cleanup_count = getattr(self, '_cleanup_count', 0) + 1
+        if self._cleanup_count % 100 == 0:
+            logger.info("memory_report", cleanup_n=self._cleanup_count,
+                        shadow_scalps=len(self._shadow_scalps),
+                        active_tasks=len(self._active_tasks))
+
+    # ── Daily Summary Scheduler (Section 11) ──────────────────
+
+    def _compute_daily_stats(self) -> dict:
+        s = self._slingger_daily_stats
+        pnls = s.get('pnls', [])
+        total = s['hit'] + s['miss'] + s['emergency']
+        net_pnl = sum(pnls)
+        sharpe = (np.mean(pnls) / np.std(pnls)) if len(pnls) > 1 and np.std(pnls) > 0 else 0.0
+        return {
+            'total': total, 'hit': s['hit'], 'miss': s['miss'],
+            'emergency': s['emergency'], 'net_pnl': net_pnl, 'sharpe': sharpe,
+        }
+
+    async def _daily_summary_loop(self) -> None:
+        """Send daily summary at 00:00 UTC."""
+        while self._running:
+            now = datetime.now(timezone.utc)
+            next_midnight = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            await asyncio.sleep((next_midnight - now).total_seconds())
+            if not self._running:
+                break
+            stats = self._compute_daily_stats()
+            if stats['total'] > 0:
+                msg = SlingshotAlerts.daily_summary(**stats)
+                await self._send_telegram("Daily Summary", msg)
+            self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
 
     async def _run_dashboard(self) -> None:
         """Update Rich dashboard every 5 seconds."""

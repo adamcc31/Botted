@@ -1,0 +1,41 @@
+{
+  "model_name": "slingger_hunter_v5",
+  "version": "5.0.1",
+  "strategy": "intramarket_swing",
+  "created_at": "2026-05-08T09:03:12.089421",
+  "training_rows": 2819,
+  "n_positive_labels": 1736,
+  "n_markets": 2819,
+  "oof_roc_auc": 0.7199423643999643,
+  "fold_aucs": [
+    0.7486381842456609,
+    0.7174752578939101,
+    0.7057524478501489,
+    0.739732142857143,
+    0.7175110132158591
+  ],
+  "fold_std": 0.01584675276681883,
+  "features": [
+    "yes_price_t0",
+    "no_price_t0",
+    "clob_spread_t0",
+    "yes_depth_t0",
+    "no_depth_t0",
+    "depth_imbalance_t0",
+    "price_velocity_30s",
+    "depth_trend_30s",
+    "btc_realized_vol_prior_30m",
+    "ttr_at_signal",
+    "market_hour_utc",
+    "day_of_week"
+  ],
+  "optimal_entry_odds": 0.49,
+  "optimal_exit_odds": 0.8,
+  "min_ttr_seconds": 60,
+  "kelly_fraction": 0.15,
+  "max_position_pct": 0.05,
+  "polymarket_fee": 0.02,
+  "training_dataset": "dataset/clob_log/CLOB_MASTER.csv",
+  "predecessor": "shadow_predator_v4 (DualXGBoostGate)",
+  "gate_result": "PROCEED"
+}

@@ -1,133 +1,118 @@
 """
 model_training/dual_inference.py
 ===============================
-Dual-Model Inference Engine.
-Loads model_win and model_spike and implements the Decision Matrix.
+Slingger Hunter V5 — Intramarket Swing Trading Inference Engine.
+Replaces the legacy DualXGBoostGate / ShadowPredatorV4.
+
+Also preserves the legacy DualXGBoostGate class for backward compatibility
+with callers that have not yet been migrated.
 """
 
+import json
 import logging
+import pickle
 from pathlib import Path
 from typing import Dict, Any, Optional
+
+import numpy as np
+from xgboost import XGBClassifier
+
 from .inference import XGBoostGate
 
 logger = logging.getLogger(__name__)
 
-class DualXGBoostGate:
+
+# ═══════════════════════════════════════════════════════════════
+# NEW: Slingger Hunter V5
+# ═══════════════════════════════════════════════════════════════
+
+class SlingshotHunterV5:
+    """
+    Replaces DualXGBoostGate / ShadowPredatorV4.
+    Strategy: intramarket swing trading on Polymarket YES/NO tokens.
+    Predicts probability that a dip-then-rip (or pump-then-dump) pattern
+    completes with sufficient time remaining before resolution.
+    """
+
+    MODEL_DIR = Path("models/slingger_hunter_v5")
+
     def __init__(self):
-        self.gate_win = XGBoostGate()
-        self.gate_spike = XGBoostGate()
-        self._is_loaded = False
+        self.model: Optional[XGBClassifier] = None
+        self.calibrator = None
+        self.imputer = None
+        self.metadata: Optional[dict] = None
+        self.features: Optional[list] = None
+        self._loaded: bool = False
 
-    def load_models(self, dual_model_dir: str | Path):
-        dual_model_dir = Path(dual_model_dir)
-        self.gate_win.load_model(dual_model_dir / "model_win")
-        
-        spike_path = dual_model_dir / "model_spike"
-        if spike_path.exists():
-            self.gate_spike.load_model(spike_path)
-            self._is_loaded = True
-        else:
-            logger.warning(f"Spike model not found at {spike_path}. Running in Single-Model mode.")
-            self._is_loaded = True # Still loaded, but only win gate
+    def load(self) -> "SlingshotHunterV5":
+        """Load all artifacts from models/slingger_hunter_v5/."""
+        with open(self.MODEL_DIR / "metadata.json") as f:
+            self.metadata = json.load(f)
 
-    def evaluate_dual_signal(
-        self,
-        raw_features: Dict[str, Any],
-        entry_odds: float,
-        ev_threshold: float = 0.01
-    ) -> Dict[str, Any]:
-        """
-        Decision Matrix implementation with X-Ray telemetry.
-        """
-        # 1. Infer Model 1 (Win)
-        res_win = self.gate_win.evaluate_signal(raw_features, entry_odds, ev_threshold)
-        
-        p_win = res_win["p_win"]
-        
-        # ── X-RAY TELEMETRY: Always log P_win ──────────────────
+        self.features = self.metadata["features"]
+
+        self.model = XGBClassifier()
+        self.model.load_model(str(self.MODEL_DIR / "model.json"))
+
+        with open(self.MODEL_DIR / "calibrator.pkl", "rb") as f:
+            self.calibrator = pickle.load(f)
+
+        with open(self.MODEL_DIR / "imputer.pkl", "rb") as f:
+            self.imputer = pickle.load(f)
+
+        self._loaded = True
         logger.info(
-            "V4_XRAY_P_WIN: p_win=%.6f, decision=%s, ev=%.4f, entry_odds=%.4f",
-            p_win, res_win["decision"], res_win.get("ev", 0.0), entry_odds,
+            "[SlingshotHunterV5] Loaded | AUC: %.4f | Features: %d",
+            self.metadata["oof_roc_auc"],
+            len(self.features),
         )
-        
-        # ── X-RAY: Verify feature_names alignment ─────────────
-        # Log the feature_names used by the loaded model so we can
-        # cross-check against dataset_training_v4.csv columns.
-        if hasattr(self.gate_win, '_feature_names') and self.gate_win._feature_names:
-            logger.debug(
-                "V4_FEATURE_NAMES_WIN: %s",
-                self.gate_win._feature_names,
-            )
-        
-        # Decision Matrix
-        # Default strategy
-        strategy = "HOLD_TO_MATURITY"
-        
-        # Condition A: Conviction Hold
-        if p_win > 0.80:
-            return {
-                **res_win,
-                "strategy": "HOLD_TO_MATURITY",
-                "tp_target": 1.0,
-                "p_spike": None
-            }
-            
-        # Condition B: Scalping Mode (Marginal Zone)
-        if 0.40 <= p_win <= 0.75 and self.gate_spike.is_loaded:
-            # ── X-RAY: Log feature vector entering Model 2 ────
-            logger.info(
-                "V4_INPUT_XRAY: spread_vel=%s, depth_delta=%s",
-                raw_features.get('clob_spread_vel'),
-                raw_features.get('clob_depth_delta'),
-            )
-            
-            res_spike = self.gate_spike.predict_quality(raw_features)
-            p_spike = res_spike["p_win"] # This is p_spike because it's model_spike
-            
-            # ── X-RAY: Always log raw P_spike ─────────────────
-            logger.info(
-                "V4_XRAY_P_SPIKE: p_spike=%.6f, threshold=0.80, "
-                "passes=%s, p_win=%.6f",
-                p_spike, p_spike > 0.80, p_win,
-            )
-            
-            # ── X-RAY: Verify spike model feature_names ───────
-            if hasattr(self.gate_spike, '_feature_names') and self.gate_spike._feature_names:
-                logger.debug(
-                    "V4_FEATURE_NAMES_SPIKE: %s",
-                    self.gate_spike._feature_names,
-                )
-            
-            if p_spike > 0.80:
-                # Override decision if spike is high but win was marginal
-                return {
-                    "decision": "PASS",
-                    "reason": f"SCALP: P_win={p_win:.4f} (marginal), P_spike={p_spike:.4f} (high)",
-                    "p_win": p_win,
-                    "p_spike": p_spike,
-                    "ev": res_win["ev"], # Keep original EV
-                    "strategy": "SCALPING",
-                    "tp_target": 0.85,
-                    "entry_odds": entry_odds,
-                    "confidence": "SCALP_HIGH",
-                    "kelly_fraction": res_win["kelly_fraction"]
-                }
-            else:
-                # P_win is marginal and no spike predicted
-                # Keep original resolution from win gate
-                return {
-                    **res_win,
-                    "strategy": "HOLD_TO_MATURITY",
-                    "p_spike": p_spike
-                }
-                
-        # Fallback to single model result
+        return self
+
+    def predict(self, feature_dict: dict) -> dict:
+        """
+        Input:  dict of feature_name -> value (matches self.features list)
+        Output: dict with keys:
+                  swing_probability  : float [0,1]
+                  entry_odds         : float
+                  exit_odds          : float
+                  signal             : str   'ENTER' | 'SKIP'
+                  confidence_tier    : str   'HIGH' | 'MEDIUM' | 'LOW'
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded. Call .load() first.")
+
+        X = np.array(
+            [[feature_dict.get(f, np.nan) for f in self.features]],
+            dtype=np.float32,
+        )
+        X = self.imputer.transform(X)
+
+        raw_prob = self.model.predict_proba(X)[0][1]
+        cal_prob = float(
+            self.calibrator.predict_proba(np.array([[raw_prob]]))[0][1]
+        )
+
+        signal = "ENTER" if cal_prob >= 0.55 else "SKIP"
+
+        if cal_prob >= 0.65:
+            tier = "HIGH"
+        elif cal_prob >= 0.55:
+            tier = "MEDIUM"
+        else:
+            tier = "LOW"
+
         return {
-            **res_win,
-            "strategy": "HOLD_TO_MATURITY",
-            "p_spike": None
+            "swing_probability": cal_prob,
+            "entry_odds": self.metadata["optimal_entry_odds"],
+            "exit_odds": self.metadata["optimal_exit_odds"],
+            "signal": signal,
+            "confidence_tier": tier,
         }
 
     @property
     def is_loaded(self) -> bool:
-        return self._is_loaded
+        return self._loaded
+
+
+# ── Backward compatibility aliases ─────────────────────────────
+ShadowPredatorV4 = SlingshotHunterV5

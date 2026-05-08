@@ -122,6 +122,71 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["is_weekend"] = 0
 
+    # ==================================================================
+    # V5 NEW FEATURES — injected for ablation study
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # 9. odds_delta_signed  →  CLOB Momentum Vector (PRIORITAS TERTINGGI)
+    #
+    # Transformasi scalar odds_delta_60s menjadi vektor dengan arah
+    # relatif terhadap posisi trading. Positif = CLOB bergerak searah
+    # signal (validasi). Negatif = CLOB melawan signal (reversal risk).
+    # ------------------------------------------------------------------
+    odds_delta_60s_clean = pd.to_numeric(
+        df["odds_delta_60s"], errors="coerce"
+    ).fillna(0.0)
+
+    direction_sign = (
+        df["signal_direction"]
+        .astype(str).str.strip().str.upper()
+        .map({"BUY_UP": 1, "BUY_DOWN": -1})
+        .fillna(0)
+    )
+    df["odds_delta_signed"] = odds_delta_60s_clean * direction_sign
+
+    # ------------------------------------------------------------------
+    # 10. clob_alignment  →  Binary: CLOB agree dengan signal?
+    # ------------------------------------------------------------------
+    df["clob_alignment"] = (df["odds_delta_signed"] > 0).astype(int)
+
+    # ------------------------------------------------------------------
+    # 11. odds_conviction  →  Distance from Fair Value (0.5)
+    #
+    # Makin jauh dari 0.5, makin kuat pricing directional bet.
+    # ------------------------------------------------------------------
+    entry_odds_clean = pd.to_numeric(
+        df["entry_odds"], errors="coerce"
+    ).fillna(0.5)
+    df["odds_conviction"] = (entry_odds_clean - 0.5).abs()
+
+    # ------------------------------------------------------------------
+    # 12. clob_tfm_confluence  →  Dual Confirmation Score
+    #
+    # Ketika CLOB momentum DAN TFM order flow keduanya agree dengan
+    # arah signal, ini adalah konfirmasi terkuat.
+    # ------------------------------------------------------------------
+    tfm_clean = pd.to_numeric(df["tfm_value"], errors="coerce").fillna(0.0)
+    tfm_signed = tfm_clean * direction_sign
+    df["clob_tfm_confluence"] = df["odds_delta_signed"] * tfm_signed
+
+    # ------------------------------------------------------------------
+    # 13. dual_confirmation  →  Binary: CLOB dan TFM keduanya agree?
+    # ------------------------------------------------------------------
+    df["dual_confirmation"] = (
+        (df["odds_delta_signed"] > 0) & (tfm_signed > 0)
+    ).astype(int)
+
+    # ------------------------------------------------------------------
+    # 14. depth_ratio_std  →  Liquidity Stability (passthrough)
+    #
+    # Dihitung upstream di dataset.py (sanitize_dataset) sebagai
+    # std(depth_ratio) per market_id. Jika kolom belum ada (live
+    # inference), default ke 0.0.
+    # ------------------------------------------------------------------
+    if "depth_ratio_std" not in df.columns:
+        df["depth_ratio_std"] = 0.0
+
     # Validasi: pastikan semua fitur yang dibutuhkan tersedia
     missing = [f for f in ALL_FEATURES if f not in df.columns]
     if missing:

@@ -98,3 +98,64 @@ class TelegramNotifier:
             finally:
                 files["document"][1].close()
 
+
+class SlingshotAlerts:
+    """Centralized alert formatter for Slingger Hunter V5.
+    All Telegram f-strings live here — none in monitor loops."""
+
+    @staticmethod
+    def entry(market_slug, price, exit_target, ttr, confidence, side):
+        emoji = "\U0001f4c8" if side == 'YES' else "\U0001f4c9"
+        return (
+            f"[SLINGGER V5] \U0001f7e2 SHADOW ENTRY {emoji}\n"
+            f"Market : {market_slug}\n"
+            f"Entry  : {price:.3f}\n"
+            f"Target : {exit_target:.2f}\n"
+            f"TTR    : {ttr}s\n"
+            f"Conf   : {confidence:.1%}"
+        )
+
+    @staticmethod
+    def exit_hit(market_slug, entry_price, exit_price, latency_s, profit_per_share):
+        roi = (profit_per_share / entry_price) * 100 if entry_price else 0
+        return (
+            f"[SLINGGER V5] \U0001f3af SWING TARGET HIT\n"
+            f"Market : {market_slug}\n"
+            f"Path   : {entry_price:.3f} -> {exit_price:.3f}\n"
+            f"PnL    : +{profit_per_share:.4f}/share ({roi:.1f}%)\n"
+            f"Time   : {latency_s}s"
+        )
+
+    @staticmethod
+    def emergency(market_slug, ttr, decision, ev, current_price):
+        d_emoji = "\U0001f6aa" if decision == 'EXIT_NOW' else "\u23f3"
+        return (
+            f"[SLINGGER V5] \u26a0\ufe0f EMERGENCY\n"
+            f"Market   : {market_slug}\n"
+            f"TTR      : {ttr}s\n"
+            f"Decision : {d_emoji} {decision}\n"
+            f"Price    : {current_price:.3f}\n"
+            f"EV       : {ev:+.4f}/share"
+        )
+
+    @staticmethod
+    def miss(market_slug, entry_price, reason):
+        return (
+            f"[SLINGGER V5] \u274c MISS\n"
+            f"Market : {market_slug}\n"
+            f"Entry  : {entry_price:.3f}\n"
+            f"Reason : {reason}"
+        )
+
+    @staticmethod
+    def daily_summary(total, hit, miss, emergency, net_pnl, sharpe):
+        hit_rate = hit / max(total, 1) * 100
+        return (
+            f"[SLINGGER V5] \U0001f4ca DAILY SUMMARY\n"
+            f"Trades   : {total}\n"
+            f"Hit Rate : {hit}/{total} ({hit_rate:.1f}%)\n"
+            f"Emergency: {emergency}\n"
+            f"Net PnL  : {net_pnl:+.2f} USD\n"
+            f"Sharpe   : {sharpe:.3f}"
+        )
+

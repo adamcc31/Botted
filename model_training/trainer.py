@@ -50,6 +50,78 @@ def compute_ece(y_true: np.ndarray, y_prob: np.ndarray,
     return float(np.mean(np.abs(fraction_pos - mean_pred)))
 
 
+
+# ---------------------------------------------------------------------------
+# TemperatureScaling — V5 post-hoc calibration
+# ---------------------------------------------------------------------------
+
+class TemperatureScaling:
+    """
+    Post-hoc probability calibration via temperature scaling.
+
+    Lebih robust dari IsotonicRegression untuk dataset kecil (n < 5000 OOF samples)
+    karena hanya memiliki 1 parameter (T), sehingga tidak overfit kalibrasi.
+
+    T > 1.0 : soften probabilities (model overconfident)
+    T < 1.0 : sharpen probabilities (model underconfident)
+    T = 1.0 : no change
+
+    AUC INVARIANT: Kalibrasi tidak mengubah ranking, hanya memperbaiki
+    probabilitas absolut untuk Kelly sizing dan edge computation.
+    """
+
+    def __init__(self):
+        self.temperature: float = 1.0
+        self._is_fitted: bool = False
+
+    def fit(self, oof_probs: np.ndarray, y_true: np.ndarray) -> "TemperatureScaling":
+        """
+        Fit temperature T menggunakan OOF predictions (bukan training data).
+        Minimisasi NLL (Negative Log-Likelihood) untuk menemukan T optimal.
+
+        WAJIB menggunakan OOF predictions — jangan gunakan training predictions
+        untuk mencegah data leakage pada kalibrasi.
+        """
+        from scipy.optimize import minimize_scalar
+        from scipy.special import expit, logit
+
+        oof_logits = logit(np.clip(oof_probs, 1e-7, 1 - 1e-7))
+
+        def negative_log_likelihood(T: float) -> float:
+            scaled_probs = expit(oof_logits / T)
+            scaled_probs = np.clip(scaled_probs, 1e-7, 1 - 1e-7)
+            return -np.mean(
+                y_true * np.log(scaled_probs)
+                + (1 - y_true) * np.log(1 - scaled_probs)
+            )
+
+        result = minimize_scalar(
+            negative_log_likelihood,
+            bounds=(0.1, 10.0),
+            method="bounded"
+        )
+        self.temperature = result.x
+        self._is_fitted = True
+        logger.info("TemperatureScaling fitted: T=%.4f", self.temperature)
+        return self
+
+    def predict_proba(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Transform raw probabilities menggunakan temperature T."""
+        if not self._is_fitted:
+            raise RuntimeError("Call fit() before predict_proba()")
+        from scipy.special import expit, logit
+        logits = logit(np.clip(raw_probs, 1e-7, 1 - 1e-7))
+        return expit(logits / self.temperature)
+
+    def predict(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Alias for predict_proba — compatibility with IsotonicRegression."""
+        return self.predict_proba(raw_probs)
+
+    def __repr__(self) -> str:
+        status = f"T={self.temperature:.4f}" if self._is_fitted else "unfitted"
+        return f"TemperatureScaling({status})"
+
+
 # ---------------------------------------------------------------------------
 # GroupKFold Cross-Validation
 # ---------------------------------------------------------------------------
@@ -57,17 +129,27 @@ def compute_ece(y_true: np.ndarray, y_prob: np.ndarray,
 def cross_validate(X_train: np.ndarray,
                    y_train: np.ndarray,
                    groups: np.ndarray,
-                   xgb_cfg=None) -> dict:
+                   xgb_cfg=None,
+                   n_cv_folds: int = None,
+                   calibration_method: str = "temperature") -> dict:
     """
     GroupKFold CV — tidak ada sinyal dari market yang sama
     di training dan validation sekaligus.
 
-    Returns dict dengan metrics per fold dan agregat.
+    V5 upgrade: setelah CV loop, fit TemperatureScaling pada OOF
+    predictions dan compute ECE before/after kalibrasi.
+
+    Args:
+        calibration_method: "temperature" (V5 default) atau "isotonic" (V4 legacy)
+
+    Returns dict dengan metrics per fold, agregat, dan kalibrasi info.
     """
     if xgb_cfg is None:
         xgb_cfg = XGB_CFG
+    if n_cv_folds is None:
+        n_cv_folds = SPLIT_CFG.n_cv_folds
 
-    gkf = GroupKFold(n_splits=SPLIT_CFG.n_cv_folds)
+    gkf = GroupKFold(n_splits=n_cv_folds)
     fold_results = []
     oof_preds  = np.zeros(len(y_train))
     oof_labels = np.zeros(len(y_train))
@@ -75,7 +157,7 @@ def cross_validate(X_train: np.ndarray,
     params = asdict(xgb_cfg)
     # early_stopping_rounds passes to init in xgboost >= 2.0
 
-    logger.info("Mulai %d-fold GroupKFold CV...", SPLIT_CFG.n_cv_folds)
+    logger.info("Mulai %d-fold GroupKFold CV...", n_cv_folds)
 
     for fold_idx, (tr_idx, va_idx) in enumerate(gkf.split(X_train, y_train, groups)):
         X_tr, X_va = X_train[tr_idx], X_train[va_idx]
@@ -112,8 +194,22 @@ def cross_validate(X_train: np.ndarray,
     mean_auc   = float(np.mean([f["auc"] for f in fold_results]))
     std_auc    = float(np.std([f["auc"] for f in fold_results]))
     mean_brier = float(np.mean([f["brier"] for f in fold_results]))
-    oof_ece    = compute_ece(oof_labels, oof_preds)
+    oof_ece_raw = compute_ece(oof_labels, oof_preds)
     oof_auc    = float(roc_auc_score(oof_labels, oof_preds))
+
+    # --- V5: Fit TemperatureScaling on OOF predictions ---
+    temp_scaler = None
+    oof_ece_calibrated = oof_ece_raw
+
+    if calibration_method == "temperature":
+        temp_scaler = TemperatureScaling()
+        temp_scaler.fit(oof_preds, oof_labels)
+        oof_calibrated = temp_scaler.predict_proba(oof_preds)
+        oof_ece_calibrated = compute_ece(oof_labels, oof_calibrated)
+        logger.info(
+            "  ECE Before: %.4f | ECE After: %.4f | Temperature T: %.4f",
+            oof_ece_raw, oof_ece_calibrated, temp_scaler.temperature,
+        )
 
     cv_result = {
         "folds": fold_results,
@@ -121,8 +217,16 @@ def cross_validate(X_train: np.ndarray,
         "std_auc": round(std_auc, 4),
         "mean_brier": round(mean_brier, 4),
         "oof_auc": round(oof_auc, 4),
-        "oof_ece_raw": round(oof_ece, 4),   # sebelum Platt — biasanya lebih besar
+        "oof_ece_raw": round(oof_ece_raw, 4),
+        "oof_ece_calibrated": round(oof_ece_calibrated, 4),
         "n_estimators_optimal": int(np.mean([f["best_iteration"] for f in fold_results])),
+        # V5 calibration artifacts
+        "ece_before": round(oof_ece_raw, 4),
+        "ece_after": round(oof_ece_calibrated, 4),
+        "temperature": round(temp_scaler.temperature, 4) if temp_scaler else None,
+        "temp_scaler": temp_scaler,
+        "oof_preds": oof_preds,
+        "oof_labels": oof_labels,
     }
 
     logger.info(
@@ -139,25 +243,33 @@ def cross_validate(X_train: np.ndarray,
 def train_and_calibrate(df_train: pd.DataFrame,
                          df_calib: pd.DataFrame,
                          xgb_cfg=None,
-                         imputer_vals: Optional[pd.Series] = None) -> dict:
+                         imputer_vals: Optional[pd.Series] = None,
+                         feature_list: list = None,
+                         calibration_method: str = "temperature") -> dict:
     """
     1. Fit XGBoost final pada df_train.
-    2. Fit Platt sigmoid pada df_calib.
+    2. Fit calibrator pada df_calib (temperature scaling atau isotonic).
     3. Evaluasi kalibrasi pada df_calib.
     4. Return artefak lengkap.
+
+    Args:
+        calibration_method: "temperature" (V5 default) atau "isotonic" (V4 legacy)
+        feature_list: list fitur yang digunakan. Default SELECTED_FEATURES.
 
     Returns dict berisi model, platt, metrics, feature_names, dan metadata.
     """
     if xgb_cfg is None:
         xgb_cfg = XGB_CFG
+    if feature_list is None:
+        feature_list = SELECTED_FEATURES
 
     # Build features
     df_train = build_features(df_train)
     df_calib = build_features(df_calib)
 
-    X_tr = df_train[SELECTED_FEATURES].values.astype(np.float32)
+    X_tr = df_train[feature_list].values.astype(np.float32)
     y_tr = df_train[TARGET_COL].values.astype(np.int32)
-    X_ca = df_calib[SELECTED_FEATURES].values.astype(np.float32)
+    X_ca = df_calib[feature_list].values.astype(np.float32)
     y_ca = df_calib[TARGET_COL].values.astype(np.int32)
 
     # ------------------------------------------------------------------
@@ -183,13 +295,21 @@ def train_and_calibrate(df_train: pd.DataFrame,
                 time.time() - t0, base_model.best_iteration)
 
     # ------------------------------------------------------------------
-    # Isotonic Calibration (non-parametric — no sigmoid assumption)
+    # Calibration — V5: temperature scaling (default) or isotonic (legacy)
     # ------------------------------------------------------------------
     raw_calib = base_model.predict_proba(X_ca)[:, 1]
-    isotonic = IsotonicRegression(out_of_bounds="clip")
-    isotonic.fit(raw_calib, y_ca)
 
-    p_cal = isotonic.predict(raw_calib)
+    if calibration_method == "temperature":
+        calibrator = TemperatureScaling()
+        calibrator.fit(raw_calib, y_ca)
+        p_cal = calibrator.predict_proba(raw_calib)
+        logger.info("TemperatureScaling calibration: T=%.4f", calibrator.temperature)
+    else:
+        # Legacy: Isotonic Calibration (non-parametric)
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(raw_calib, y_ca)
+        p_cal = calibrator.predict(raw_calib)
+
     p_cal = np.clip(p_cal, 0.001, 0.999)  # prevent log(0)
 
     # ------------------------------------------------------------------
@@ -198,23 +318,26 @@ def train_and_calibrate(df_train: pd.DataFrame,
     calib_auc   = float(roc_auc_score(y_ca, p_cal))
     calib_brier = float(brier_score_loss(y_ca, p_cal))
     calib_ece   = compute_ece(y_ca, p_cal)
+    ece_before  = compute_ece(y_ca, raw_calib)  # ECE sebelum kalibrasi
 
     logger.info(
-        "Hold-out calibration: AUC=%.4f | Brier=%.4f | ECE=%.4f",
-        calib_auc, calib_brier, calib_ece
+        "Hold-out calibration: AUC=%.4f | Brier=%.4f | ECE=%.4f (before=%.4f)",
+        calib_auc, calib_brier, calib_ece, ece_before
     )
 
     calib_curve_frac, calib_curve_pred = calibration_curve(y_ca, p_cal, n_bins=10)
 
     return {
         "base_model": base_model,
-        "platt": isotonic,  # key kept as 'platt' for backward compat
+        "platt": calibrator,  # key kept as 'platt' for backward compat
         "imputer_vals": imputer_vals,
-        "feature_names": SELECTED_FEATURES,
+        "feature_names": feature_list,
+        "calibration_method": calibration_method,
         "metrics": {
             "calib_auc": round(calib_auc, 4),
             "calib_brier": round(calib_brier, 4),
             "calib_ece": round(calib_ece, 4),
+            "ece_before": round(ece_before, 4),
         },
         "calib_curve": {
             "fraction_of_positives": calib_curve_frac.tolist(),

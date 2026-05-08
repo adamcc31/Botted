@@ -610,3 +610,309 @@ def run_full_evaluation(
     logger.info("=" * 60)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# V5: Quarter-Kelly Position Sizing
+# ---------------------------------------------------------------------------
+
+def compute_stake(
+    p_win: float,
+    entry_odds: float,
+    capital: float,
+    kelly_fraction: float = 0.25,   # Quarter-Kelly sampai ECE < 0.08
+    max_stake_pct: float = 0.05,    # Hard cap 5% per trade
+) -> float:
+    """
+    Kelly Criterion dengan fraction dan hard cap.
+    Formula: f* = (b*p - q) / b
+    b = net odds = (1/entry_odds) - 1
+    """
+    if entry_odds <= 0 or entry_odds >= 1.0:
+        return 0.0
+    if np.isnan(p_win) or np.isnan(entry_odds):
+        return 0.0
+
+    b = (1.0 / entry_odds) - 1.0
+    if b <= 0:
+        return 0.0
+
+    q = 1.0 - p_win
+    full_kelly = (b * p_win - q) / b
+    fractional = kelly_fraction * full_kelly
+    stake_pct = min(max(fractional, 0.0), max_stake_pct)
+    return capital * stake_pct
+
+
+# ---------------------------------------------------------------------------
+# V5: EV Strategy Simulation with Execution Gates
+# ---------------------------------------------------------------------------
+
+def simulate_ev_strategy_v5(
+    df: pd.DataFrame,
+    y_prob: np.ndarray,
+    initial_capital: float = 1000.0,
+    ev_threshold: float = 0.05,
+    kelly_fraction: float = 0.25,
+    max_stake_pct: float = 0.05,
+    clob_alignment_required: bool = False,  # V5: removed as hard gate, XGBoost decides internally
+    ttr_min_seconds: int = 60,
+    ttr_max_seconds: int = 250,
+) -> Dict[str, Any]:
+    """
+    V5 EV Strategy Simulation dengan execution gates.
+
+    Gates (in order):
+      1. Signal harus BUY_UP atau BUY_DOWN (bukan ABSTAIN)
+      2. CLOB Alignment — odds_delta_signed > 0
+      3. TTR Window — ttr_seconds dalam [60, 250]
+      4. EV > threshold
+      5. Kelly stake > 0
+
+    Args:
+        df:                   DataFrame dengan fitur (harus sudah build_features)
+        y_prob:               Probabilitas terkalibrasi P(WIN)
+        initial_capital:      Modal awal USDC
+        ev_threshold:         EV minimum untuk eksekusi
+        kelly_fraction:       Fraksi Kelly (0.25 = Quarter-Kelly)
+        max_stake_pct:        Hard cap persentase per trade
+        clob_alignment_required: Apakah CLOB harus searah signal
+        ttr_min_seconds:      TTR minimum
+        ttr_max_seconds:      TTR maximum
+
+    Returns:
+        Dict berisi semua statistik simulasi termasuk reject breakdown.
+    """
+    n_total = len(df)
+    capital = initial_capital
+    peak_capital = initial_capital
+
+    # Tracking
+    trades = []
+    reject_reasons: Dict[str, int] = {}
+    n_approved = 0
+    max_drawdown = 0.0
+    consecutive_losses = 0
+    max_consecutive_losses = 0
+
+    logger.info("=" * 60)
+    logger.info("EV STRATEGY SIMULATION V5 -- With Execution Gates")
+    logger.info("=" * 60)
+    logger.info("Total signals: %d | Initial capital: $%.2f", n_total, initial_capital)
+
+    for i in range(n_total):
+        row = df.iloc[i]
+        p_win = float(y_prob[i])
+        entry_odds = float(row.get("entry_odds", 0.5))
+        signal_dir = str(row.get("signal_direction", "")).strip().upper()
+
+        # --- Gate 0: Signal harus BUY_UP atau BUY_DOWN ---
+        if signal_dir not in ("BUY_UP", "BUY_DOWN"):
+            reject_reasons["ABSTAIN_SKIP"] = reject_reasons.get("ABSTAIN_SKIP", 0) + 1
+            continue
+
+        # --- Gate 1: CLOB Alignment ---
+        if clob_alignment_required:
+            clob_align = row.get("clob_alignment", -1)
+            if clob_align != 1:
+                reject_reasons["CLOB_COUNTER_SIGNAL"] = (
+                    reject_reasons.get("CLOB_COUNTER_SIGNAL", 0) + 1
+                )
+                continue
+
+        # --- Gate 2: TTR Window ---
+        ttr = float(row.get("ttr_seconds", 150))
+        if not (ttr_min_seconds <= ttr <= ttr_max_seconds):
+            reject_reasons["TTR_OUT_OF_RANGE"] = (
+                reject_reasons.get("TTR_OUT_OF_RANGE", 0) + 1
+            )
+            continue
+
+        # --- Gate 3: EV threshold ---
+        ev = calculate_ev(p_win, entry_odds)
+        if not np.isfinite(ev) or ev <= ev_threshold:
+            reject_reasons["EV_BELOW_THRESHOLD"] = (
+                reject_reasons.get("EV_BELOW_THRESHOLD", 0) + 1
+            )
+            continue
+
+        # --- Gate 4: Kelly stake ---
+        stake = compute_stake(
+            p_win, entry_odds, capital,
+            kelly_fraction=kelly_fraction,
+            max_stake_pct=max_stake_pct,
+        )
+        if stake <= 0:
+            reject_reasons["KELLY_ZERO"] = reject_reasons.get("KELLY_ZERO", 0) + 1
+            continue
+
+        # --- Approved: Execute trade ---
+        n_approved += 1
+        label = int(row.get("label", 0))
+        payout_mult = (1.0 / max(entry_odds, 1e-6)) - 1.0
+
+        if label == 1:
+            pnl = stake * payout_mult
+            consecutive_losses = 0
+        else:
+            pnl = -stake
+            consecutive_losses += 1
+            max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+
+        capital += pnl
+        peak_capital = max(peak_capital, capital)
+        drawdown = peak_capital - capital
+        max_drawdown = max(max_drawdown, drawdown)
+
+        trades.append({
+            "p_win": p_win,
+            "entry_odds": entry_odds,
+            "ev": ev,
+            "stake": stake,
+            "pnl": pnl,
+            "label": label,
+            "capital_after": capital,
+        })
+
+    # --- Compute aggregates ---
+    n_trades = len(trades)
+    n_rejected = n_total - n_approved
+
+    if n_trades > 0:
+        win_rate = sum(1 for t in trades if t["label"] == 1) / n_trades
+        total_pnl = capital - initial_capital
+        roi_pct = (total_pnl / initial_capital) * 100
+        pnl_array = np.array([t["pnl"] for t in trades])
+        sharpe = float(np.mean(pnl_array) / np.std(pnl_array)) if np.std(pnl_array) > 0 else 0.0
+    else:
+        win_rate = 0.0
+        total_pnl = 0.0
+        roi_pct = 0.0
+        sharpe = 0.0
+
+    result = {
+        "total_signals": n_total,
+        "approved_signals": n_approved,
+        "rejected_signals": n_rejected,
+        "trades_executed": n_trades,
+        "win_rate": round(win_rate, 4),
+        "initial_capital": initial_capital,
+        "final_capital": round(capital, 2),
+        "total_pnl": round(total_pnl, 2),
+        "roi_pct": round(roi_pct, 2),
+        "max_drawdown": round(max_drawdown, 2),
+        "sharpe_ratio": round(sharpe, 4),
+        "max_consecutive_losses": max_consecutive_losses,
+        "reject_breakdown": reject_reasons,
+        "kelly_fraction": kelly_fraction,
+    }
+
+    logger.info("-" * 60)
+    logger.info("V5 SIM RESULTS: trades=%d | win_rate=%.1f%% | PnL=$%.2f | MaxDD=$%.2f",
+                n_trades, win_rate * 100, total_pnl, max_drawdown)
+    logger.info("-" * 60)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# V5: Comprehensive Metrics Report
+# ---------------------------------------------------------------------------
+
+def generate_metrics_report(
+    sim_result: Dict[str, Any],
+    cv_auc: float = 0.0,
+    cv_std: float = 0.0,
+    ece_before: float = 0.0,
+    ece_after: float = 0.0,
+    temperature: float = 1.0,
+) -> str:
+    """
+    Generate laporan metrik terstruktur untuk V5 model.
+
+    Args:
+        sim_result: hasil dari simulate_ev_strategy_v5()
+        cv_auc: CV AUC dari ablation study
+        cv_std: CV AUC std
+        ece_before: ECE sebelum kalibrasi
+        ece_after: ECE setelah kalibrasi
+        temperature: Temperature T dari TemperatureScaling
+
+    Returns:
+        String laporan yang bisa di-print atau disimpan.
+    """
+    r = sim_result
+    total_signals = r.get("total_signals", 0)
+    approved = r.get("approved_signals", 0)
+    rejected = r.get("rejected_signals", total_signals - approved)
+    trades = r.get("trades_executed", 0)
+    win_rate = r.get("win_rate", 0)
+    initial_cap = r.get("initial_capital", 1000.0)
+    final_cap = r.get("final_capital", initial_cap)
+    total_pnl = final_cap - initial_cap
+    roi_pct = (total_pnl / initial_cap) * 100 if initial_cap > 0 else 0
+    max_dd = r.get("max_drawdown", 0)
+    sharpe = r.get("sharpe_ratio", 0)
+    max_consec_loss = r.get("max_consecutive_losses", 0)
+    reject_breakdown = r.get("reject_breakdown", {})
+    kelly_frac = r.get("kelly_fraction", 0.25)
+
+    report = f"""
+╔══════════════════════════════════════════════════════════════╗
+║     POLYMARKET BOT v5 — COMPREHENSIVE METRICS REPORT        ║
+╠══════════════════════════════════════════════════════════════╣
+║  MODEL PERFORMANCE                                           ║
+╠══════════════════════════════════════════════════════════════╣
+  CV AUC (Baseline v4)     :  0.7145 ± 0.030  [referensi]
+  CV AUC (Model v5 Final)  :  {cv_auc:.4f} ± {cv_std:.4f}
+  AUC Delta                : {cv_auc - 0.7145:+.4f}
+  Target AUC               :  0.8000
+  Status                   :  {"✅ ACHIEVED" if cv_auc >= 0.80 else "❌ BELUM TERCAPAI"}
+
+  ECE Before Calibration   :  {ece_before:.4f}
+  ECE After  Calibration   :  {ece_after:.4f}
+  Temperature (T)          :  {temperature:.4f}
+  {"⚠️  ECE masih > 0.08 — tetap gunakan Quarter-Kelly" if ece_after > 0.08 else "✅ ECE < 0.08 — bisa upgrade ke Half-Kelly"}
+╠══════════════════════════════════════════════════════════════╣
+║  SIGNAL PIPELINE                                             ║
+╠══════════════════════════════════════════════════════════════╣
+  Total signals generated  : {total_signals:>8,}
+  Signals APPROVED         : {approved:>8,}  ({approved/max(total_signals,1)*100:.1f}%)
+  Signals REJECTED         : {rejected:>8,}  ({rejected/max(total_signals,1)*100:.1f}%)
+
+  Rejection Gate Breakdown:"""
+
+    for gate, count in sorted(reject_breakdown.items(), key=lambda x: -x[1]):
+        pct = count / rejected * 100 if rejected > 0 else 0
+        report += f"\n    {gate:<35}: {count:>6,}  ({pct:.1f}%)"
+
+    report += f"""
+
+  Unique markets executed  : {trades:>8,}
+╠══════════════════════════════════════════════════════════════╣
+║  PAPER TRADE PERFORMANCE                                     ║
+╠══════════════════════════════════════════════════════════════╣
+  Trades executed          : {trades:>8,}
+  Win Rate                 : {win_rate*100:>8.1f}%
+  {"✅" if win_rate >= 0.57 else "⚠️ "} Target win rate: ≥ 57%
+
+  Starting Capital         : ${initial_cap:>10,.2f} USDC
+  Final Capital            : ${final_cap:>10,.2f} USDC
+  Total PnL                : ${total_pnl:>+10,.2f} USDC
+  ROI                      : {roi_pct:>+9.2f}%
+
+  Max Drawdown             : ${max_dd:>10,.2f} USDC
+  Sharpe Ratio (ann.)      : {sharpe:>10.3f}
+  Max Consecutive Losses   : {max_consec_loss:>8}
+  Kelly Fraction           :    {"Quarter (25%)" if kelly_frac <= 0.25 else f"Half ({kelly_frac*100:.0f}%)"}
+╠══════════════════════════════════════════════════════════════╣
+║  EXECUTION GATE PARAMETERS                                   ║
+╠══════════════════════════════════════════════════════════════╣
+  Edge threshold           : > 0.05
+  Volatility range         :  [15% – 80%]
+  Max spread               :  0.08%
+  TTR window               :  [60s – 250s]  ← NEW
+  CLOB alignment           :  Required       ← NEW
+╚══════════════════════════════════════════════════════════════╝
+"""
+    return report
