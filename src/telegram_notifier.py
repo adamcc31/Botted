@@ -104,58 +104,364 @@ class SlingshotAlerts:
     All Telegram f-strings live here — none in monitor loops."""
 
     @staticmethod
-    def entry(market_slug, price, exit_target, ttr, confidence, side):
-        emoji = "\U0001f4c8" if side == 'YES' else "\U0001f4c9"
+    def entry(market_slug: str,
+              entry_price: float,
+              exit_target: float,
+              ttr: int,
+              confidence: float,
+              side: str,
+              stake_usd: float,
+              shares: float,
+              depth_available_usd: float,
+              btc_vs_strike_pct: float) -> str:
+
+        side_label = (
+            "UP ↑ (Above Strike)"
+            if side == 'YES'
+            else "DOWN ↓ (Below Strike)"
+        )
+
+        side_emoji = (
+            "📈"
+            if side == 'YES'
+            else "📉"
+        )
+
+        max_win = (
+            (exit_target - entry_price)
+            * 0.98
+            * shares
+            - 0.005
+        )
+
+        max_loss = -stake_usd - 0.005
+
+        roi_pct = (
+            (max_win / stake_usd) * 100
+            if stake_usd > 0
+            else 0.0
+        )
+
+        tier = (
+            "HIGH"
+            if confidence >= 0.65
+            else (
+                "MEDIUM"
+                if confidence >= 0.55
+                else "LOW"
+            )
+        )
+
+        btc_sign = (
+            "+"
+            if btc_vs_strike_pct >= 0
+            else ""
+        )
+
         return (
-            f"[SLINGGER V5] \U0001f7e2 SHADOW ENTRY {emoji}\n"
-            f"Market : {market_slug}\n"
-            f"Entry  : {price:.3f}\n"
-            f"Target : {exit_target:.2f}\n"
-            f"TTR    : {ttr}s\n"
-            f"Conf   : {confidence:.1%}"
+            f"[SLINGGER V5] 🟢 SHADOW ENTRY {side_emoji}\n"
+            f"\n"
+            f"📌 {market_slug}\n"
+            f"\n"
+            f"🎯 Entry   : {entry_price:.3f}\n"
+            f"🏁 Target  : {exit_target:.3f}\n"
+            f"📊 Side    : {side_label}\n"
+            f"💰 Stake   : ${stake_usd:.2f} "
+            f"({shares:.0f} shares)\n"
+            f"📈 Max Win : +${max_win:.2f} "
+            f"(+{roi_pct:.1f}%)\n"
+            f"⚠️  Max Loss: ${max_loss:.2f} (-100%)\n"
+            f"\n"
+            f"📉 BTC vs Strike : "
+            f"{btc_sign}{btc_vs_strike_pct:.2f}%\n"
+            f"💧 Depth @ Entry : "
+            f"${depth_available_usd:.0f} available\n"
+            f"⏱  TTR     : {ttr}s\n"
+            f"🧠 Conf    : {confidence:.1%} [{tier}]"
         )
 
     @staticmethod
-    def exit_hit(market_slug, entry_price, exit_price, latency_s, profit_per_share):
-        roi = (profit_per_share / entry_price) * 100 if entry_price else 0
+    def exit_hit(market_slug: str,
+                 entry_price: float,
+                 exit_price: float,
+                 exit_target: float,
+                 latency_s: int,
+                 ttr_at_exit: int,
+                 shares: float,
+                 stake_usd: float,
+                 daily_pnl: float,
+                 daily_wins: int,
+                 daily_losses: int) -> str:
+
+        from src.utils import fmt_money
+
+        gross_pnl = (
+            (exit_price - entry_price)
+            * shares
+        )
+
+        fee_cost = (
+            exit_price
+            * shares
+            * 0.02
+        )
+
+        net_pnl = gross_pnl - fee_cost - 0.005
+
+        roi_pct = (
+            (net_pnl / stake_usd) * 100
+            if stake_usd > 0
+            else 0.0
+        )
+
+        overshot = exit_price - exit_target
+
+        if overshot > 0.001:
+            overshot_str = (
+                f"+{overshot:.3f} above target"
+            )
+
+        elif overshot < -0.001:
+            overshot_str = (
+                f"{overshot:.3f} below target"
+            )
+
+        else:
+            overshot_str = "exactly at target"
+
         return (
-            f"[SLINGGER V5] \U0001f3af SWING TARGET HIT\n"
-            f"Market : {market_slug}\n"
-            f"Path   : {entry_price:.3f} -> {exit_price:.3f}\n"
-            f"PnL    : +{profit_per_share:.4f}/share ({roi:.1f}%)\n"
-            f"Time   : {latency_s}s"
+            f"[SLINGGER V5] 🎯 SWING TARGET HIT\n"
+            f"\n"
+            f"📌 {market_slug}\n"
+            f"\n"
+            f"📊 {entry_price:.3f} "
+            f"────────────→ "
+            f"{exit_price:.3f}\n"
+            f"💰 PnL    : "
+            f"{fmt_money(net_pnl)} "
+            f"({roi_pct:+.1f}%)\n"
+            f"   Gross  : "
+            f"{fmt_money(gross_pnl)}\n"
+            f"   Fee    : "
+            f"-${fee_cost:.2f} "
+            f"| Spread: -$0.005\n"
+            f"📦 Shares : {shares:.0f}\n"
+            f"⏱  Time   : "
+            f"{latency_s}s "
+            f"(TTR left: {ttr_at_exit}s)\n"
+            f"📈 Exit   : {overshot_str}\n"
+            f"\n"
+            f"📅 Today  : "
+            f"{fmt_money(daily_pnl)} "
+            f"| {daily_wins}W / {daily_losses}L"
         )
 
     @staticmethod
-    def emergency(market_slug, ttr, decision, ev, current_price):
-        d_emoji = "\U0001f6aa" if decision == 'EXIT_NOW' else "\u23f3"
+    def emergency(market_slug: str,
+                  ttr: int,
+                  decision: str,
+                  ev_exit: float,
+                  ev_hold: float,
+                  current_price: float,
+                  exit_target: float,
+                  stake_usd: float) -> str:
+
+        gap = exit_target - current_price
+
+        gap_str = (
+            f"{gap:+.3f} remaining"
+            if gap > 0
+            else f"{gap:+.3f} beyond target"
+        )
+
+        d_emoji = (
+            "🚪"
+            if decision == 'EXIT_NOW'
+            else "⏳"
+        )
+
         return (
-            f"[SLINGGER V5] \u26a0\ufe0f EMERGENCY\n"
-            f"Market   : {market_slug}\n"
-            f"TTR      : {ttr}s\n"
-            f"Decision : {d_emoji} {decision}\n"
-            f"Price    : {current_price:.3f}\n"
-            f"EV       : {ev:+.4f}/share"
+            f"[SLINGGER V5] ⚠️ EMERGENCY\n"
+            f"\n"
+            f"📌 {market_slug}\n"
+            f"\n"
+            f"⏱  TTR Left  : {ttr}s\n"
+            f"📊 Current   : "
+            f"{current_price:.3f} "
+            f"(target: {exit_target:.3f})\n"
+            f"📦 Gap       : {gap_str}\n"
+            f"\n"
+            f"EV EXIT NOW      : "
+            f"{ev_exit:+.4f}/share\n"
+            f"EV HOLD MATURITY : "
+            f"{ev_hold:+.4f}/share\n"
+            f"\n"
+            f"⚡ Decision  : "
+            f"{d_emoji} {decision}\n"
+            f"💰 Stake at risk : "
+            f"${stake_usd:.2f}"
         )
 
     @staticmethod
-    def miss(market_slug, entry_price, reason):
+    def miss(market_slug: str,
+             entry_price: float,
+             exit_target: float,
+             final_price: float,
+             stake_usd: float,
+             reason: str,
+             daily_pnl: float,
+             daily_wins: int,
+             daily_losses: int) -> str:
+
+        from src.utils import fmt_money
+
+        loss = -stake_usd - 0.005
+
+        gap_missed = (
+            exit_target - final_price
+        )
+
         return (
-            f"[SLINGGER V5] \u274c MISS\n"
-            f"Market : {market_slug}\n"
-            f"Entry  : {entry_price:.3f}\n"
-            f"Reason : {reason}"
+            f"[SLINGGER V5] ❌ MISS\n"
+            f"\n"
+            f"📌 {market_slug}\n"
+            f"\n"
+            f"🎯 Entry  : {entry_price:.3f}\n"
+            f"🏁 Target : "
+            f"{exit_target:.3f} "
+            f"(missed by {gap_missed:.3f})\n"
+            f"📊 Final  : {final_price:.3f}\n"
+            f"💸 Loss   : ${loss:.2f}\n"
+            f"📝 Reason : {reason}\n"
+            f"\n"
+            f"📅 Today  : "
+            f"{fmt_money(daily_pnl)} "
+            f"| {daily_wins}W / {daily_losses}L"
         )
 
     @staticmethod
-    def daily_summary(total, hit, miss, emergency, net_pnl, sharpe):
-        hit_rate = hit / max(total, 1) * 100
+    def daily_summary(date_str: str,
+                      total: int,
+                      hit: int,
+                      miss: int,
+                      emergency: int,
+                      emergency_exit_now: int,
+                      emergency_hold: int,
+                      gross_pnl: float,
+                      total_fees: float,
+                      net_pnl: float,
+                      best_trade: float,
+                      worst_trade: float,
+                      avg_win: float,
+                      avg_loss: float,
+                      avg_hold_seconds: float,
+                      sharpe_1d: float,
+                      current_capital: float) -> str:
+
+        from src.utils import fmt_money
+
+        hit_rate = (
+            hit / max(total, 1)
+        ) * 100
+
         return (
-            f"[SLINGGER V5] \U0001f4ca DAILY SUMMARY\n"
-            f"Trades   : {total}\n"
-            f"Hit Rate : {hit}/{total} ({hit_rate:.1f}%)\n"
-            f"Emergency: {emergency}\n"
-            f"Net PnL  : {net_pnl:+.2f} USD\n"
-            f"Sharpe   : {sharpe:.3f}"
+            f"[SLINGGER V5] 📊 DAILY SUMMARY\n"
+            f"{date_str} UTC\n"
+            f"\n"
+            f"Trades   : "
+            f"{total} "
+            f"({hit} hit / "
+            f"{miss} miss / "
+            f"{emergency}E)\n"
+            f"Hit Rate : {hit_rate:.1f}%\n"
+            f"\n"
+            f"💰 Gross PnL : "
+            f"{fmt_money(gross_pnl)}\n"
+            f"   Fees      : "
+            f"-${total_fees:.2f}\n"
+            f"   Net PnL   : "
+            f"{fmt_money(net_pnl)}\n"
+            f"\n"
+            f"📊 Best trade  : "
+            f"{fmt_money(best_trade)}\n"
+            f"   Worst trade : "
+            f"{fmt_money(worst_trade)}\n"
+            f"   Avg win     : "
+            f"{fmt_money(avg_win)}\n"
+            f"   Avg loss    : "
+            f"{fmt_money(avg_loss)}\n"
+            f"\n"
+            f"⚠️  Emergency  : "
+            f"{emergency} "
+            f"({emergency_exit_now} EXIT / "
+            f"{emergency_hold} HOLD)\n"
+            f"⏱  Avg hold   : "
+            f"{avg_hold_seconds:.0f}s\n"
+            f"📈 Sharpe (1D): "
+            f"{sharpe_1d:.3f}\n"
+            f"💼 Capital    : "
+            f"${current_capital:.2f}"
         )
 
+    @staticmethod
+    def system_health(data: dict) -> str:
+        return "[SLINGGER V5] 🛠 SYSTEM HEALTH START\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def heartbeat(data: dict) -> str:
+        return "[SLINGGER V5] 💓 HEARTBEAT / MARKET WATCH\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def session_report(title: str, data: dict) -> str:
+        return f"[SLINGGER V5] 📊 {title}\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def order_execution(title: str, data: dict) -> str:
+        return f"[SLINGGER V5] 📦 {title}\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def order_result(data: dict) -> str:
+        return "[SLINGGER V5] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def paper_trade_resolved(data: dict) -> str:
+        return "[SLINGGER V5] 📊 Paper Trade Resolved\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def session_aborted(reason: str, session_id: str) -> str:
+        return (
+            f"[SLINGGER V5] 🛑 SESSION ABORTED\n\n"
+            f"Reason: {reason}\n"
+            f"Session: {session_id}"
+        )
+
+    @staticmethod
+    def go_live_enabled(data: dict) -> str:
+        return "[SLINGGER V5] 🚀 GO LIVE ENABLED\n\n" + SlingshotAlerts._tg_kv(data)
+
+    @staticmethod
+    def dry_run_limit(max_hours: float, session_id: str) -> str:
+        return (
+            f"[SLINGGER V5] ⏳ DRY RUN TIME LIMIT\n\n"
+            f"Dry-run belum mencapai gate live dalam maksimal {max_hours} jam.\n"
+            f"Session: {session_id}"
+        )
+
+    @staticmethod
+    def session_finished(title: str, prefix: str, reason: str, stats_text: str) -> str:
+        return (
+            f"[SLINGGER V5] 🏁 {title}\n\n"
+            f"{prefix}\n"
+            f"Reason: {reason}\n\n"
+            f"{stats_text}"
+        )
+
+    @staticmethod
+    def _tg_kv(data: dict) -> str:
+        import html
+        lines = []
+        for k, v in data.items():
+            key = html.escape(str(k))
+            val = html.escape(str(v))
+            lines.append(f"<b>{key}</b>: {val}")
+        return "\n".join(lines)

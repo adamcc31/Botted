@@ -88,6 +88,7 @@ from src.spread_filter import SpreadFilter
 from src.telegram_notifier import TelegramNotifier
 from src.database import DatabaseManager
 from src.vatic_feed import VaticFeed
+from src.utils import compute_position_size, fmt_money
 from sqlalchemy import text
 
 SLUG_PREFIX = os.getenv("POLYMARKET_SLUG_PREFIX", "btc-updown-5m")
@@ -157,13 +158,19 @@ class TradingBot:
         
         self._exporter = Exporter(self._dry_run.session_id)
 
-        # Airgap / Shadow Mode config
-        self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
-        self._shadow_scalps: dict[str, dict] = {}
-
         # Slingger Hunter V5
         self._slingger = SlingshotHunterV5()
         self._active_tasks: dict[str, asyncio.Task] = {}
+        self._shadow_scalps: dict[str, dict] = {}
+        
+        initial_capital = 50.0
+        self._session_stats = {
+            'date':            datetime.utcnow().date().isoformat(),
+            'trades':          [],
+            'total_fees':      0.0,
+            'current_capital': initial_capital,
+        }
+        
         self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
         MAX_CONCURRENT_SLINGGER_TASKS = int(os.getenv("MAX_SLINGGER_TASKS", "10"))
         self._max_slingger_tasks = MAX_CONCURRENT_SLINGGER_TASKS
@@ -206,6 +213,88 @@ class TradingBot:
             await self._telegram.send_message(title=title, message=message)
         except Exception:
             return
+
+    def _roll_session_day_if_needed(self):
+        """
+        Auto daily rollover for session stats.
+        Sends summary and resets for the new day.
+        """
+        today = datetime.utcnow().date().isoformat()
+
+        if self._session_stats['date'] != today:
+            asyncio.create_task(self._send_daily_summary())
+
+            self._session_stats = {
+                'date': today,
+                'trades': [],
+                'total_fees': 0.0,
+                'current_capital':
+                    self._session_stats['current_capital'],
+            }
+
+    async def _send_daily_summary(self):
+        """
+        Computes and sends the daily summary via SlingshotAlerts.
+        """
+        stats = self._session_stats
+        trades = stats['trades']
+        
+        if not trades:
+            return
+
+        hit = sum(1 for t in trades if t['result'] == 'HIT')
+        miss = sum(1 for t in trades if t['result'] == 'MISS')
+        emergency = sum(1 for t in trades if t['result'] in ('EMERGENCY_EXIT', 'HOLD_TO_MATURITY'))
+        emergency_exit_now = sum(1 for t in trades if t['result'] == 'EMERGENCY_EXIT')
+        emergency_hold = sum(1 for t in trades if t['result'] == 'HOLD_TO_MATURITY')
+        
+        net_pnls = [t['net_pnl'] for t in trades]
+        # We need more detailed stats for the new daily_summary
+        # Let's assume we track these in trades
+        gross_pnl = sum(t.get('gross_pnl', 0.0) for t in trades)
+        total_fees = stats['total_fees']
+        net_pnl = sum(net_pnls)
+        
+        wins = [p for p in net_pnls if p > 0]
+        losses = [p for p in net_pnls if p <= 0]
+        
+        best_trade = max(net_pnls) if net_pnls else 0.0
+        worst_trade = min(net_pnls) if net_pnls else 0.0
+        avg_win = np.mean(wins) if wins else 0.0
+        avg_loss = np.mean(losses) if losses else 0.0
+        avg_hold_seconds = np.mean([t['hold_seconds'] for t in trades]) if trades else 0.0
+        
+        # Sharpe 1D Safety Fix
+        returns = net_pnls
+        if len(returns) < 2 or np.std(returns) == 0:
+            sharpe_1d = 0.0
+        else:
+            sharpe_1d = (
+                np.mean(returns)
+                / np.std(returns)
+            )
+
+        msg = SlingshotAlerts.daily_summary(
+            date_str=stats['date'],
+            total=len(trades),
+            hit=hit,
+            miss=miss,
+            emergency=emergency,
+            emergency_exit_now=emergency_exit_now,
+            emergency_hold=emergency_hold,
+            gross_pnl=gross_pnl,
+            total_fees=total_fees,
+            net_pnl=net_pnl,
+            best_trade=best_trade,
+            worst_trade=worst_trade,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            avg_hold_seconds=avg_hold_seconds,
+            sharpe_1d=sharpe_1d,
+            current_capital=stats['current_capital']
+        )
+        
+        await self._send_telegram("Daily Summary", msg)
 
     @staticmethod
     def _tg_kv(data: dict) -> str:
@@ -257,7 +346,7 @@ class TradingBot:
                 }
                 await self._send_telegram(
                     "HEARTBEAT / MARKET WATCH",
-                    self._tg_kv(msg),
+                    SlingshotAlerts.heartbeat(msg),
                 )
             except Exception:
                 pass
@@ -377,8 +466,9 @@ class TradingBot:
                 combined = {**sig_summary, **{"---": "---"}, **summary}
                 sum_text = self._tg_kv(combined)
                 
+                msg_text = SlingshotAlerts.session_report(f"Session Report ({report_hours:.0f}h)", combined)
                 await self._send_telegram(
-                    f"Session Report ({report_hours:.0f}h)", sum_text
+                    f"Session Report ({report_hours:.0f}h)", msg_text
                 )
                 logger.info("telegram_periodic_report_sent_text_only")
                     
@@ -399,8 +489,7 @@ class TradingBot:
         self._stop_reason = "DRY_RUN_TIME_LIMIT_EXCEEDED"
         await self._send_telegram(
             "DRY RUN TIME LIMIT",
-            f"Dry-run belum mencapai gate live dalam maksimal {max_hours} jam.\n"
-            f"session_id={self._dry_run.session_id}",
+            SlingshotAlerts.dry_run_limit(max_hours, self._dry_run.session_id),
         )
         await self.stop()
 
@@ -452,7 +541,7 @@ class TradingBot:
 
         await self._send_telegram(
             "SYSTEM HEALTH START",
-            self._tg_kv(
+            SlingshotAlerts.system_health(
                 {
                     "architecture": "Predator V3 (Zoned Kelly)",
                     "status": "ACTIVE",
@@ -611,24 +700,30 @@ class TradingBot:
             "duration_hours": f"{metrics.duration_hours:.1f}" if metrics.duration_hours else "N/A",
         }
         combined = {**sig_summary, **{"---": "---"}, **summary}
-        sum_text = self._tg_kv(combined)
+        sum_text = SlingshotAlerts._tg_kv(combined)
         
         if signals_csv and str(signals_csv).endswith(".csv"):
             try:
                 await self._telegram.send_document(
                     file_path=str(signals_csv),
-                    caption=f"{session_title}\n\n{session_prefix}\n{self._stop_reason}\n\n{sum_text}",
+                    caption=SlingshotAlerts.session_finished(
+                        session_title, session_prefix, self._stop_reason, sum_text
+                    ),
                 )
             except Exception as e:
                 logger.error("telegram_signals_send_failed", error=str(e))
                 await self._send_telegram(
                     session_title,
-                    f"{session_prefix}\nreason={self._stop_reason}\n\n{sum_text}",
+                    SlingshotAlerts.session_finished(
+                        session_title, session_prefix, self._stop_reason, sum_text
+                    ),
                 )
         else:
             await self._send_telegram(
                 session_title,
-                f"{session_prefix}\nreason={self._stop_reason}\n\n{sum_text}",
+                SlingshotAlerts.session_finished(
+                    session_title, session_prefix, self._stop_reason, sum_text
+                ),
             )
 
         self._config.stop()
@@ -643,6 +738,7 @@ class TradingBot:
         """
         from src.schemas import SignalResult
         self._dry_run.increment_bars()
+        self._roll_session_day_if_needed()
 
         # Check if we have an active market
         if not self._discovery.is_market_active:
@@ -1168,7 +1264,8 @@ class TradingBot:
             asyncio.create_task(
                 self._send_telegram(
                     "ORDER EXECUTION (PAPER-V4)",
-                    self._tg_kv(
+                    SlingshotAlerts.order_execution(
+                        "ORDER EXECUTION (PAPER-V4)",
                         {
                             "session_id": self._dry_run.session_id,
                             "trade_id": paper_record.trade_id if paper_record else trade.trade_id,
@@ -1181,7 +1278,7 @@ class TradingBot:
                             "ttr_minutes": trade.TTR_at_entry,
                             "status": "EXECUTED" if paper_record else "SLIPPED"
                         }
-                    ),
+                    )
                 ),
                 name=f"tg_open_{trade.trade_id[:8]}",
             )
@@ -1233,7 +1330,8 @@ class TradingBot:
                 asyncio.create_task(
                     self._send_telegram(
                         "ORDER EXECUTION (SHADOW LIVE)",
-                        self._tg_kv(
+                        SlingshotAlerts.order_execution(
+                            "ORDER EXECUTION (SHADOW LIVE)",
                             {
                                 "session_id": self._dry_run.session_id,
                                 "trade_id": trade.trade_id,
@@ -1248,7 +1346,7 @@ class TradingBot:
                                 "fill_price": fill_price,
                                 "filled_size": filled_size,
                             }
-                        ),
+                        )
                     ),
                     name=f"tg_open_live_{trade.trade_id[:8]}",
                 )
@@ -1265,9 +1363,7 @@ class TradingBot:
             asyncio.create_task(
                 self._send_telegram(
                     "SESSION ABORTED",
-                    "Dry-run session abort triggered.\n"
-                    f"reason={abort}\n"
-                    f"session_id={self._dry_run.session_id}",
+                    SlingshotAlerts.session_aborted(abort, self._dry_run.session_id)
                 ),
                 name="tg_abort",
             )
@@ -1338,12 +1434,14 @@ class TradingBot:
             )
             if updated_paper_record:
                 # Kirim notifikasi Telegram khusus Paper Trade
-                msg = (
-                    f"ID: {updated_paper_record.trade_id[:8]}\n"
-                    f"Zone: {updated_paper_record.zone_id}\n"
-                    f"Result: {'✅ WIN' if updated_paper_record.actual_outcome == 'WIN' else '❌ LOSS'}\n"
-                    f"PnL: ${updated_paper_record.actual_pnl_usd:+.2f}\n"
-                    f"Edge at entry: {updated_paper_record.live_edge:.2%}"
+                msg = SlingshotAlerts.paper_trade_resolved(
+                    {
+                        "ID": updated_paper_record.trade_id[:8],
+                        "Zone": updated_paper_record.zone_id,
+                        "Result": '✅ WIN' if updated_paper_record.actual_outcome == 'WIN' else '❌ LOSS',
+                        "PnL": f"${updated_paper_record.actual_pnl_usd:+.2f}",
+                        "Edge at entry": f"{updated_paper_record.live_edge:.2%}"
+                    }
                 )
                 asyncio.create_task(
                     self._send_telegram("📊 Paper Trade Resolved", msg),
@@ -1367,7 +1465,7 @@ class TradingBot:
         asyncio.create_task(
             self._send_telegram(
                 "ORDER RESULT",
-                self._tg_kv(
+                SlingshotAlerts.order_result(
                     {
                         "session_id": self._dry_run.session_id,
                         "trade_id": resolved.trade_id,
@@ -1379,7 +1477,7 @@ class TradingBot:
                         "pnl_usd": resolved.pnl_usd,
                         "capital_after": resolved.capital_after,
                     }
-                ),
+                )
             ),
             name=f"tg_resolve_{resolved.trade_id[:8]}",
         )
@@ -1505,13 +1603,16 @@ class TradingBot:
             asyncio.create_task(
                 self._send_telegram(
                     "GO LIVE ENABLED",
-                    "Go-live enabled after dry-run gate.\n"
-                    f"session_id={self._dry_run.session_id}\n"
-                    f"trades_executed={metrics.trades_executed}\n"
-                    f"win_rate={metrics.win_rate}\n"
-                    f"total_pnl_usd={metrics.total_pnl_usd}\n"
-                    f"dry_run_score={metrics.dry_run_score}\n"
-                    f"pass_fail={metrics.pass_fail}",
+                    SlingshotAlerts.go_live_enabled(
+                        {
+                            "session_id": self._dry_run.session_id,
+                            "trades_executed": metrics.trades_executed,
+                            "win_rate": metrics.win_rate,
+                            "total_pnl_usd": metrics.total_pnl_usd,
+                            "dry_run_score": metrics.dry_run_score,
+                            "pass_fail": metrics.pass_fail,
+                        }
+                    )
                 ),
                 name="tg_go_live_enabled",
             )
@@ -1624,7 +1725,9 @@ class TradingBot:
 
     # ── Slingger Hunter V5: Dual-Stage Shadow Monitor ─────────
 
-    def _init_shadow_scalp(self, market_id: str, side: str, entry: float, exit: float, prob: float) -> None:
+    def _init_shadow_scalp(self, market_id: str, side: str, entry: float, exit: float, prob: float,
+                           stake_usd: float, shares: float, depth_usd_at_entry: float,
+                           btc_vs_strike_pct: float, ttr: int) -> None:
         import time as _time
         self._shadow_scalps[market_id] = {
             'token_side':          side,
@@ -1641,6 +1744,18 @@ class TradingBot:
             'emergency_triggered': False,
             'emergency_decision':  None,
             'created_at':          _time.time(),
+            
+            # New telemetry fields
+            'stake_usd':            stake_usd,
+            'shares':               shares,
+            'depth_at_entry':       depth_usd_at_entry,
+            'btc_vs_strike_pct':    btc_vs_strike_pct,
+            'ttr_at_entry':         ttr,
+            'ttr_at_exit':          None,
+            'exit_price_actual':    None,
+            'gross_pnl':            None,
+            'fee_paid':             None,
+            'net_pnl':              None,
         }
 
     async def _run_slingger_v5(self, market: ActiveMarket, clob_state: CLOBState, fv: FeatureVector, oracle_price: float) -> None:
@@ -1719,11 +1834,36 @@ class TradingBot:
 
         if winner:
             res = res_yes if winner == 'YES' else res_no
+            
+            # Calculate position size using Kelly
+            sizing = compute_position_size(
+                capital=self._session_stats['current_capital'],
+                swing_prob=res['swing_probability'],
+                entry_odds=res['entry_odds'],
+                exit_odds=res['exit_odds']
+            )
+            
+            if sizing['stake_usd'] <= 0:
+                logger.debug("slingger_sizing_zero", market_id=m_id, side=winner, prob=res['swing_probability'])
+                return
+
             logger.info("slingger_v5_pattern_detected", 
                         side=winner, prob=round(res['swing_probability'], 4),
-                        tier=res['confidence_tier'])
+                        tier=res['confidence_tier'], stake=sizing['stake_usd'])
             
-            self._init_shadow_scalp(m_id, winner, res['entry_odds'], res['exit_odds'], res['swing_probability'])
+            # Additional Telemetry Data
+            depth_at_entry = clob_state.yes_depth_usd if winner == 'YES' else clob_state.no_depth_usd
+            btc_vs_strike_pct = ((oracle_price - market.strike_price) / market.strike_price) * 100
+            ttr = int((market.T_resolution - now).total_seconds())
+
+            self._init_shadow_scalp(
+                m_id, winner, res['entry_odds'], res['exit_odds'], res['swing_probability'],
+                stake_usd=sizing['stake_usd'],
+                shares=sizing['shares'],
+                depth_usd_at_entry=depth_at_entry,
+                btc_vs_strike_pct=btc_vs_strike_pct,
+                ttr=ttr
+            )
             self._active_tasks[m_id] = asyncio.create_task(
                 self._shadow_scalp_monitor_loop(m_id),
                 name=f"slingger_monitor_{m_id[:8]}"
@@ -1785,8 +1925,16 @@ class TradingBot:
                         state['entry_fill_time'] = _time.time()
                         state['phase'] = 'WAITING_EXIT'
                         msg = SlingshotAlerts.entry(
-                            market_slug, current_price, state['exit_odds'],
-                            ttr, state['swing_prob'], token_side
+                            market_slug=market_slug,
+                            entry_price=current_price,
+                            exit_target=state['exit_odds'],
+                            ttr=ttr,
+                            confidence=state['swing_prob'],
+                            side=token_side,
+                            stake_usd=state['stake_usd'],
+                            shares=state['shares'],
+                            depth_available_usd=state['depth_at_entry'],
+                            btc_vs_strike_pct=state['btc_vs_strike_pct']
                         )
                         asyncio.create_task(
                             self._send_telegram("SLINGGER V5", msg),
@@ -1800,55 +1948,145 @@ class TradingBot:
                     entry_p = state['entry_fill_price']
 
                     if current_price >= state['exit_odds']:
-                        profit = (current_price - entry_p) * 0.98 - 0.005
-                        state['exit_filled'] = True
-                        state['exit_fill_price'] = current_price
-                        state['exit_fill_time'] = _time.time()
-                        state['result'] = 'HIT'
-                        state['phase'] = 'CLOSED'
+                        # Finalize PnL and telemetry
+                        gross_pnl = (current_price - entry_p) * state['shares']
+                        fee_paid = current_price * state['shares'] * 0.02
+                        net_pnl = gross_pnl - fee_paid - 0.005
+                        
+                        state.update({
+                            'exit_filled':         True,
+                            'exit_fill_price':     current_price,
+                            'exit_fill_time':      _time.time(),
+                            'exit_price_actual':   current_price,
+                            'ttr_at_exit':         ttr,
+                            'gross_pnl':           gross_pnl,
+                            'fee_paid':            fee_paid,
+                            'net_pnl':             net_pnl,
+                            'result':              'HIT',
+                            'phase':               'CLOSED'
+                        })
+
+                        # Track session stats
+                        self._session_stats['trades'].append({
+                            'result': 'HIT',
+                            'net_pnl': net_pnl,
+                            'gross_pnl': gross_pnl,
+                            'hold_seconds': latency_s,
+                        })
+                        self._session_stats['current_capital'] += net_pnl
+                        self._session_stats['total_fees'] += fee_paid
+
                         self._slingger_daily_stats['hit'] += 1
-                        self._slingger_daily_stats['pnls'].append(profit)
+                        self._slingger_daily_stats['pnls'].append(net_pnl)
+                        
+                        daily_wins = sum(1 for t in self._session_stats['trades'] if t['result'] == 'HIT')
+                        daily_losses = sum(1 for t in self._session_stats['trades'] if t['result'] == 'MISS')
+                        daily_pnl = sum(t['net_pnl'] for t in self._session_stats['trades'])
+
                         msg = SlingshotAlerts.exit_hit(
-                            market_slug, entry_p, current_price, latency_s, profit
+                            market_slug=market_slug,
+                            entry_price=entry_p,
+                            exit_price=current_price,
+                            exit_target=state['exit_odds'],
+                            latency_s=latency_s,
+                            ttr_at_exit=ttr,
+                            shares=state['shares'],
+                            stake_usd=state['stake_usd'],
+                            daily_pnl=daily_pnl,
+                            daily_wins=daily_wins,
+                            daily_losses=daily_losses
                         )
                         asyncio.create_task(
                             self._send_telegram("SLINGGER V5", msg),
                             name=f"slingger_hit_{market_id[:8]}"
                         )
-                        logger.info("slingger_hit", market_id=market_id, pnl=profit)
+                        logger.info("slingger_hit", market_id=market_id, pnl=net_pnl)
                         break
 
                     elif ttr < EMERGENCY_TTR and not state['emergency_triggered']:
                         state['emergency_triggered'] = True
+                        
+                        # Use correct ROI-based EV
                         ev_exit = (current_price - entry_p) * 0.98 - 0.005
-                        # Simplistic EV comparison
                         ev_hold = (current_price * (1.0 - entry_p) * 0.98
                                    - (1 - current_price) * entry_p - 0.005)
+                        
                         decision = 'EXIT_NOW' if ev_exit >= ev_hold else 'HOLD_TO_MATURITY'
                         state['emergency_decision'] = decision
+                        
                         self._slingger_daily_stats['emergency'] += 1
+                        
                         msg = SlingshotAlerts.emergency(
-                            market_slug, ttr, decision, max(ev_exit, ev_hold), current_price
+                            market_slug=market_slug,
+                            ttr=ttr,
+                            decision=decision,
+                            ev_exit=ev_exit,
+                            ev_hold=ev_hold,
+                            current_price=current_price,
+                            exit_target=state['exit_odds'],
+                            stake_usd=state['stake_usd']
                         )
                         asyncio.create_task(
                             self._send_telegram("SLINGGER V5", msg),
                             name=f"slingger_emerg_{market_id[:8]}"
                         )
+                        
                         if decision == 'HOLD_TO_MATURITY':
                             state['result'] = 'HOLD_TO_MATURITY'
                             state['phase'] = 'CLOSED'
+                            
+                            # Track session stats (Hold to maturity doesn't have final PnL yet, but we'll count it)
+                            self._session_stats['trades'].append({
+                                'result': 'HOLD_TO_MATURITY',
+                                'net_pnl': 0.0, # Placeholder
+                                'hold_seconds': latency_s,
+                            })
                             break
                         else:
                             # EXIT_NOW: close virtual position
                             state['result'] = 'EMERGENCY_EXIT'
                             state['phase'] = 'CLOSED'
+                            
+                            net_pnl = (current_price - entry_p) * state['shares'] * 0.98 - 0.005
+                            self._session_stats['trades'].append({
+                                'result': 'EMERGENCY_EXIT',
+                                'net_pnl': net_pnl,
+                                'hold_seconds': latency_s,
+                            })
+                            self._session_stats['current_capital'] += net_pnl
                             break
 
                     elif ttr <= 0:
-                        state['result'] = 'MISS'
-                        state['phase'] = 'CLOSED'
+                        net_pnl = -state['stake_usd'] - 0.005
+                        state.update({
+                            'result': 'MISS',
+                            'phase': 'CLOSED',
+                            'net_pnl': net_pnl
+                        })
+                        self._session_stats['trades'].append({
+                            'result': 'MISS',
+                            'net_pnl': net_pnl,
+                            'hold_seconds': latency_s,
+                        })
+                        self._session_stats['current_capital'] += net_pnl
+
                         self._slingger_daily_stats['miss'] += 1
-                        msg = SlingshotAlerts.miss(market_slug, entry_p, "expired")
+                        
+                        daily_wins = sum(1 for t in self._session_stats['trades'] if t['result'] == 'HIT')
+                        daily_losses = sum(1 for t in self._session_stats['trades'] if t['result'] == 'MISS')
+                        daily_pnl = sum(t['net_pnl'] for t in self._session_stats['trades'])
+
+                        msg = SlingshotAlerts.miss(
+                            market_slug=market_slug,
+                            entry_price=entry_p,
+                            exit_target=state['exit_odds'],
+                            final_price=current_price,
+                            stake_usd=state['stake_usd'],
+                            reason="expired",
+                            daily_pnl=daily_pnl,
+                            daily_wins=daily_wins,
+                            daily_losses=daily_losses
+                        )
                         asyncio.create_task(
                             self._send_telegram("SLINGGER V5", msg),
                             name=f"slingger_miss_{market_id[:8]}"
@@ -1904,19 +2142,8 @@ class TradingBot:
 
     # ── Daily Summary Scheduler (Section 11) ──────────────────
 
-    def _compute_daily_stats(self) -> dict:
-        s = self._slingger_daily_stats
-        pnls = s.get('pnls', [])
-        total = s['hit'] + s['miss'] + s['emergency']
-        net_pnl = sum(pnls)
-        sharpe = (np.mean(pnls) / np.std(pnls)) if len(pnls) > 1 and np.std(pnls) > 0 else 0.0
-        return {
-            'total': total, 'hit': s['hit'], 'miss': s['miss'],
-            'emergency': s['emergency'], 'net_pnl': net_pnl, 'sharpe': sharpe,
-        }
-
     async def _daily_summary_loop(self) -> None:
-        """Send daily summary at 00:00 UTC."""
+        """Scheduled daily summary (legacy compatibility or secondary trigger)."""
         while self._running:
             now = datetime.now(timezone.utc)
             next_midnight = (now + timedelta(days=1)).replace(
@@ -1924,11 +2151,8 @@ class TradingBot:
             await asyncio.sleep((next_midnight - now).total_seconds())
             if not self._running:
                 break
-            stats = self._compute_daily_stats()
-            if stats['total'] > 0:
-                msg = SlingshotAlerts.daily_summary(**stats)
-                await self._send_telegram("Daily Summary", msg)
-            self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
+            # Trigger via the new roll helper
+            self._roll_session_day_if_needed()
 
     async def _run_dashboard(self) -> None:
         """Update Rich dashboard every 5 seconds."""
