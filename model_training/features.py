@@ -137,12 +137,15 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         df["odds_delta_60s"], errors="coerce"
     ).fillna(0.0)
 
-    direction_sign = (
-        df["signal_direction"]
-        .astype(str).str.strip().str.upper()
-        .map({"BUY_UP": 1, "BUY_DOWN": -1})
-        .fillna(0)
-    )
+    if "signal_direction" in df.columns:
+        direction_sign = (
+            df["signal_direction"]
+            .astype(str).str.strip().str.upper()
+            .map({"BUY_UP": 1, "BUY_DOWN": -1})
+            .fillna(0)
+        )
+    else:
+        direction_sign = 0
     df["odds_delta_signed"] = odds_delta_60s_clean * direction_sign
 
     # ------------------------------------------------------------------

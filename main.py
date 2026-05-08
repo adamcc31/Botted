@@ -915,6 +915,7 @@ class TradingBot:
             "clob_depth_delta":    ml_features.get("clob_depth_delta"),
             # Signal engine
             "confidence_score":    q_fair,
+            "signal_direction":    "BUY_UP" if q_fair > clob_state.yes_ask else "BUY_DOWN",
             # Timestamp for hour_wib / is_weekend features
             "timestamp":           datetime.now(timezone.utc).isoformat(),
         }
