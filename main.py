@@ -160,6 +160,7 @@ class TradingBot:
 
         # Slingger Hunter V5
         self._slingger = SlingshotHunterV5()
+        self._active_tasks: dict[str, asyncio.Task] = {}
         self._shadow_scalps: dict[str, dict] = {}
         self._completed_markets: set[str] = set()
         self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
