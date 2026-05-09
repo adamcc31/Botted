@@ -240,9 +240,10 @@ class CLOBFeed:
         no_bid = self._best_bid(no_book)
 
         if yes_ask is None or no_ask is None or yes_bid is None or no_bid is None:
-            # Treating partial price data as missing book to trigger fallback/stale logic
-            yes_book = None
-            no_book = None
+            logger.warning("clob_incomplete_price_data", market_id=market.market_id)
+            if self._cached_state:
+                return self._cached_state.model_copy(update={"is_stale": True})
+            return None
 
         # Calculate depth within 3% of ask
         yes_depth = self._calc_depth_near_ask(yes_book, yes_ask, pct=0.03)
