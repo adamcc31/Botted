@@ -239,6 +239,11 @@ class CLOBFeed:
         no_ask = self._best_ask(no_book)
         no_bid = self._best_bid(no_book)
 
+        if yes_ask is None or no_ask is None or yes_bid is None or no_bid is None:
+            # Treating partial price data as missing book to trigger fallback/stale logic
+            yes_book = None
+            no_book = None
+
         # Calculate depth within 3% of ask
         yes_depth = self._calc_depth_near_ask(yes_book, yes_ask, pct=0.03)
         no_depth = self._calc_depth_near_ask(no_book, no_ask, pct=0.03)
@@ -356,12 +361,12 @@ class CLOBFeed:
         # V2_MIGRATION: asks are sorted DESC, best ask is at the end
         asks = book.get("asks") or book.get("ask") or book.get("data", {}).get("asks") or []
         if not asks:
-            return 1.0  # No asks → max price
+            return None  # No asks → price unavailable
         try:
             best_ask_obj = asks[-1]
-            return float(best_ask_obj.get("price", 1.0))
+            return float(best_ask_obj.get("price", None))
         except (ValueError, TypeError, IndexError, AttributeError):
-            return 1.0
+            return None
 
     @staticmethod
     def _best_bid(book: dict) -> float:
@@ -369,12 +374,12 @@ class CLOBFeed:
         # V2_MIGRATION: bids are sorted DESC, best bid is at the beginning
         bids = book.get("bids") or book.get("bid") or book.get("data", {}).get("bids") or []
         if not bids:
-            return 0.0  # No bids → min price
+            return None  # No bids → price unavailable
         try:
             best_bid_obj = bids[0]
-            return float(best_bid_obj.get("price", 0.0))
+            return float(best_bid_obj.get("price", None))
         except (ValueError, TypeError, IndexError, AttributeError):
-            return 0.0
+            return None
 
     @staticmethod
     def _calc_depth_near_ask(book: dict, best_ask: float, pct: float = 0.03) -> float:

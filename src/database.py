@@ -332,6 +332,18 @@ class SystemHealthRecord(Base):
     )
 
 
+class V5StateRecord(Base):
+    """Slingger V5 state persistence — for recovery after restart."""
+
+    __tablename__ = "v5_state"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True) # e.g. 'session_stats', 'shadow_scalps'
+    data_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
 # ============================================================
 # Database Manager
 # ============================================================

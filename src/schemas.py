@@ -138,10 +138,10 @@ class CLOBState(BaseModel):
 
     market_id: str
     timestamp: datetime
-    yes_ask: float = Field(..., ge=0.0, le=1.0, description="Best ask YES [0,1]")
-    yes_bid: float = Field(..., ge=0.0, le=1.0, description="Best bid YES [0,1]")
-    no_ask: float = Field(..., ge=0.0, le=1.0, description="Best ask NO [0,1]")
-    no_bid: float = Field(..., ge=0.0, le=1.0, description="Best bid NO [0,1]")
+    yes_ask: Optional[float] = Field(None, ge=0.0, le=1.0, description="Best ask YES [0,1]")
+    yes_bid: Optional[float] = Field(None, ge=0.0, le=1.0, description="Best bid YES [0,1]")
+    no_ask: Optional[float] = Field(None, ge=0.0, le=1.0, description="Best ask NO [0,1]")
+    no_bid: Optional[float] = Field(None, ge=0.0, le=1.0, description="Best bid NO [0,1]")
     yes_depth_usd: float = Field(..., ge=0.0, description="Total USDC depth YES within 3% of ask")
     no_depth_usd: float = Field(..., ge=0.0, description="Total USDC depth NO within 3% of ask")
     market_vig: float = Field(..., description="yes_ask + no_ask - 1.0")

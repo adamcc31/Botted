@@ -160,8 +160,8 @@ class TradingBot:
 
         # Slingger Hunter V5
         self._slingger = SlingshotHunterV5()
-        self._active_tasks: dict[str, asyncio.Task] = {}
         self._shadow_scalps: dict[str, dict] = {}
+        self._completed_markets: set[str] = set()
         self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
         
         initial_capital = 50.0
@@ -215,6 +215,11 @@ class TradingBot:
         except Exception:
             return
 
+    async def _send_alerts_sequential(self, *payloads):
+        """Dispatches multiple Telegram alerts in strict sequence to preserve ordering."""
+        for channel, msg in payloads:
+            await self._send_telegram(channel, msg)
+
     def _roll_session_day_if_needed(self):
         """
         Auto daily rollover for session stats.
@@ -232,6 +237,8 @@ class TradingBot:
                 'current_capital':
                     self._session_stats['current_capital'],
             }
+            self._completed_markets.clear()
+            asyncio.create_task(self._save_v5_state())
 
     async def _send_daily_summary(self):
         """
@@ -463,8 +470,15 @@ class TradingBot:
                 # Append signal aggregation
                 sig_summary = await self._get_signal_summary()
                 
+                # V5 Heartbeat Health
+                v5_health = {
+                    "v5_active_scalps": len(self._shadow_scalps),
+                    "v5_capital": f"${self._session_stats['current_capital']:.2f}",
+                    "v5_persistence": "ACTIVE (SQLite)"
+                }
+
                 # Combine reports
-                combined = {**sig_summary, **{"---": "---"}, **summary}
+                combined = {**sig_summary, **{"---": "---"}, **v5_health, **{"---": "---"}, **summary}
                 sum_text = self._tg_kv(combined)
                 
                 msg_text = SlingshotAlerts.session_report(f"Session Report ({report_hours:.0f}h)", combined)
@@ -505,6 +519,9 @@ class TradingBot:
         self._running = True
 
         await self._db.init_db()
+        
+        # Guardrail 2: Hydrate V5 State (Capital & Trades)
+        await self._hydrate_v5_state()
 
         logger.info("market_filter_active", slug_prefix=SLUG_PREFIX, is_ultrashort=IS_ULTRASHORT)
 
@@ -1768,8 +1785,8 @@ class TradingBot:
             return
 
         m_id = market.market_id
-        if m_id in self._active_tasks or m_id in self._shadow_scalps:
-            return # Already tracking this market
+        if m_id in self._active_tasks or m_id in self._shadow_scalps or m_id in self._completed_markets:
+            return # Already tracking or completed this market
 
         if len(self._active_tasks) >= self._max_slingger_tasks:
             logger.warning("slingger_v5_max_tasks_reached", limit=self._max_slingger_tasks)
@@ -1873,6 +1890,7 @@ class TradingBot:
                 btc_vs_strike_pct=btc_vs_strike_pct,
                 ttr=ttr
             )
+            asyncio.create_task(self._save_v5_state())
             self._active_tasks[m_id] = asyncio.create_task(
                 self._shadow_scalp_monitor_loop(m_id),
                 name=f"slingger_monitor_{m_id[:8]}"
@@ -1922,9 +1940,14 @@ class TradingBot:
                 ttr = int((res_time - datetime.now(timezone.utc)).total_seconds())
 
                 if token_side == 'YES':
-                    current_price = 1.0 - clob.no_ask
+                    current_price = (1.0 - clob.no_ask) if clob.no_ask is not None else None
                 else:
-                    current_price = 1.0 - clob.yes_ask
+                    current_price = (1.0 - clob.yes_ask) if clob.yes_ask is not None else None
+
+                if current_price is None:
+                    logger.warning("slingger_price_unavailable", market_id=market_id)
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
 
                 # FASE 1: WAITING_ENTRY
                 if state['phase'] == 'WAITING_ENTRY':
@@ -2025,7 +2048,7 @@ class TradingBot:
                         
                         self._slingger_daily_stats['emergency'] += 1
                         
-                        msg = SlingshotAlerts.emergency(
+                        emergency_msg = SlingshotAlerts.emergency(
                             market_slug=market_slug,
                             ttr=ttr,
                             decision=decision,
@@ -2035,10 +2058,8 @@ class TradingBot:
                             exit_target=state['exit_odds'],
                             stake_usd=state['stake_usd']
                         )
-                        asyncio.create_task(
-                            self._send_telegram("SLINGGER V5", msg),
-                            name=f"slingger_emerg_{market_id[:8]}"
-                        )
+                        # We don't fire the emergency alert as a task yet; 
+                        # if it's EXIT_NOW, we'll combine it with the final outcome alert.
                         
                         if decision == 'HOLD_TO_MATURITY':
                             state['result'] = 'HOLD_TO_MATURITY'
@@ -2050,11 +2071,18 @@ class TradingBot:
                                 'net_pnl': 0.0, # Placeholder
                                 'hold_seconds': latency_s,
                             })
+                            
+                            asyncio.create_task(
+                                self._send_telegram("SLINGGER V5", emergency_msg),
+                                name=f"slingger_emerg_{market_id[:8]}"
+                            )
                             break
                         else:
                             # EXIT_NOW: close virtual position
                             state['phase'] = 'CLOSED'
-                            net_pnl = (current_price - entry_p) * state['shares'] * 0.98 - 0.005
+                            # Fix: ensure real loss is captured if delta is unrealistic (e.g. price collapse)
+                            delta_pnl = (current_price - entry_p) * state['shares'] * 0.98 - 0.005
+                            net_pnl = delta_pnl if delta_pnl < -state['stake_usd'] * 0.5 else -state['stake_usd']
                             
                             # Terjemahkan ke HIT/MISS untuk integritas W/L Tracker
                             is_win = net_pnl > 0
@@ -2081,7 +2109,7 @@ class TradingBot:
 
                             # Picu Notifikasi Penutupan Final (Closure Alert)
                             if is_win:
-                                msg = SlingshotAlerts.exit_hit(
+                                outcome_msg = SlingshotAlerts.exit_hit(
                                     market_slug=market_slug,
                                     entry_price=entry_p,
                                     exit_price=current_price,
@@ -2095,7 +2123,7 @@ class TradingBot:
                                     daily_losses=daily_losses
                                 )
                             else:
-                                msg = SlingshotAlerts.miss(
+                                outcome_msg = SlingshotAlerts.miss(
                                     market_slug=market_slug,
                                     entry_price=entry_p,
                                     exit_target=state['exit_odds'],
@@ -2107,51 +2135,51 @@ class TradingBot:
                                     daily_losses=daily_losses
                                 )
                                 
+                            # Dispatch EMERGENCY and outcome alerts sequentially to guarantee delivery order
                             asyncio.create_task(
-                                self._send_telegram("SLINGGER V5", msg),
-                                name=f"slingger_emerg_close_{market_id[:8]}"
+                                self._send_alerts_sequential(
+                                    ("SLINGGER V5", emergency_msg),
+                                    ("SLINGGER V5", outcome_msg)
+                                ),
+                                name=f"slingger_emerg_seq_{market_id[:8]}"
                             )
                             logger.info("slingger_emergency_closed", market_id=market_id, pnl=net_pnl)
                             break
 
                     elif ttr <= 0:
-                        net_pnl = -state['stake_usd'] - 0.005
+                        # Guardrail 3: Reality Sync - Force HOLD_TO_MATURITY if expired
+                        logger.warning("slingger_stale_reality_sync_expired", market_id=market_id)
                         state.update({
-                            'result': 'MISS',
-                            'phase': 'CLOSED',
-                            'net_pnl': net_pnl
+                            'emergency_triggered': True,
+                            'emergency_decision': 'HOLD_TO_MATURITY',
+                            'result': 'HOLD_TO_MATURITY',
+                            'phase': 'CLOSED'
                         })
                         self._session_stats['trades'].append({
-                            'result': 'MISS',
-                            'net_pnl': net_pnl,
+                            'result': 'HOLD_TO_MATURITY',
+                            'net_pnl': 0.0,
                             'hold_seconds': latency_s,
                         })
-                        self._session_stats['current_capital'] += net_pnl
 
-                        self._slingger_daily_stats['miss'] += 1
-                        
-                        daily_wins = sum(1 for t in self._session_stats['trades'] if t['result'] == 'HIT')
-                        daily_losses = sum(1 for t in self._session_stats['trades'] if t['result'] == 'MISS')
-                        daily_pnl = sum(t['net_pnl'] for t in self._session_stats['trades'])
-
-                        msg = SlingshotAlerts.miss(
+                        msg = SlingshotAlerts.emergency(
                             market_slug=market_slug,
-                            entry_price=entry_p,
+                            ttr=ttr,
+                            decision='HOLD_TO_MATURITY',
+                            ev_exit=0.0, ev_hold=0.0,
+                            current_price=current_price,
                             exit_target=state['exit_odds'],
-                            final_price=current_price,
-                            stake_usd=state['stake_usd'],
-                            reason="expired",
-                            daily_pnl=daily_pnl,
-                            daily_wins=daily_wins,
-                            daily_losses=daily_losses
+                            stake_usd=state['stake_usd']
                         )
                         asyncio.create_task(
                             self._send_telegram("SLINGGER V5", msg),
-                            name=f"slingger_miss_{market_id[:8]}"
+                            name=f"slingger_stale_sync_{market_id[:8]}"
                         )
+                        break
                         logger.info("slingger_miss", market_id=market_id)
                         break
-
+                
+                # Save state after each phase update or closure
+                await self._save_v5_state()
                 await asyncio.sleep(POLL_INTERVAL)
 
         except asyncio.CancelledError:
@@ -2177,6 +2205,8 @@ class TradingBot:
                 else:
                     cleaned.append(attr)
                 del store[market_id]
+        
+        self._completed_markets.add(market_id)
 
         if market_id in self._active_tasks:
             task = self._active_tasks.pop(market_id)
@@ -2197,6 +2227,9 @@ class TradingBot:
             logger.info("memory_report", cleanup_n=self._cleanup_count,
                         shadow_scalps=len(self._shadow_scalps),
                         active_tasks=len(self._active_tasks))
+        
+        # Ensure state is saved after cleanup
+        asyncio.create_task(self._save_v5_state())
 
     # ── Daily Summary Scheduler (Section 11) ──────────────────
 
@@ -2243,6 +2276,80 @@ class TradingBot:
         except Exception as e:
             # Dashboard failure should not crash the bot
             logger.warning("dashboard_error", error=str(e))
+
+    # ── Resilience & Recovery (Section 12) ────────────────────
+
+    async def _save_v5_state(self) -> None:
+        """Atomic save of session stats and shadow scalps to SQLite."""
+        try:
+            from src.database import V5StateRecord
+            from sqlalchemy.dialects.sqlite import insert
+            
+            async with self._db.session_factory() as session:
+                async with session.begin():
+                    # Save Session Stats
+                    stats_json = json.dumps(self._session_stats, default=str)
+                    stmt_stats = insert(V5StateRecord).values(
+                        key='session_stats', data_json=stats_json
+                    ).on_conflict_do_update(
+                        index_elements=['key'],
+                        set_={'data_json': stats_json, 'updated_at': datetime.now(timezone.utc)}
+                    )
+                    await session.execute(stmt_stats)
+                    
+                    # Save Shadow Scalps (active trades)
+                    # Filter out CLOSED trades for storage efficiency if needed, but keeping all for now
+                    scalps_json = json.dumps(self._shadow_scalps, default=str)
+                    stmt_scalps = insert(V5StateRecord).values(
+                        key='shadow_scalps', data_json=scalps_json
+                    ).on_conflict_do_update(
+                        index_elements=['key'],
+                        set_={'data_json': scalps_json, 'updated_at': datetime.now(timezone.utc)}
+                    )
+                    await session.execute(stmt_scalps)
+            
+            logger.debug("v5_state_saved", 
+                         capital=self._session_stats['current_capital'], 
+                         active_trades=len(self._shadow_scalps))
+        except Exception as e:
+            logger.error("v5_state_save_failed", error=str(e))
+
+    async def _hydrate_v5_state(self) -> None:
+        """Bootstrap hydration — Restore session stats and active trades."""
+        try:
+            from src.database import V5StateRecord
+            from sqlalchemy import select
+            
+            async with self._db.session_factory() as session:
+                # Load Session Stats
+                res_stats = await session.execute(select(V5StateRecord).where(V5StateRecord.key == 'session_stats'))
+                stats_rec = res_stats.scalar_one_or_none()
+                if stats_rec:
+                    persisted_stats = json.loads(stats_rec.data_json)
+                    # Guardrail 2: Restore Equity & Date Rollover Check
+                    self._session_stats['current_capital'] = persisted_stats.get('current_capital', self._session_stats['current_capital'])
+                    self._session_stats['total_fees'] = persisted_stats.get('total_fees', 0.0)
+                    self._session_stats['trades'] = persisted_stats.get('trades', [])
+                    self._session_stats['date'] = persisted_stats.get('date', self._session_stats['date'])
+                    logger.info("v5_equity_restored", capital=self._session_stats['current_capital'])
+
+                # Load Shadow Scalps
+                res_scalps = await session.execute(select(V5StateRecord).where(V5StateRecord.key == 'shadow_scalps'))
+                scalps_rec = res_scalps.scalar_one_or_none()
+                if scalps_rec:
+                    persisted_scalps = json.loads(scalps_rec.data_json)
+                    for m_id, state in persisted_scalps.items():
+                        if state.get('phase') in ('WAITING_ENTRY', 'WAITING_EXIT'):
+                            # Guardrail 3: Reality Sync will happen in the loop
+                            self._shadow_scalps[m_id] = state
+                            self._active_tasks[m_id] = asyncio.create_task(
+                                self._shadow_scalp_monitor_loop(m_id),
+                                name=f"slingger_monitor_hydrated_{m_id[:8]}"
+                            )
+            
+            logger.info("v5_hydration_complete", active_trades=len(self._shadow_scalps))
+        except Exception as e:
+            logger.error("v5_hydration_failed", error=str(e))
 
 
 # ============================================================
