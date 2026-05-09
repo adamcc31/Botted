@@ -1836,9 +1836,17 @@ class TradingBot:
         if winner:
             res = res_yes if winner == 'YES' else res_no
             
-            # Calculate position size using Kelly
+            # Kalkulasi dana tertahan (locked margin) di shadow positions
+            locked_capital = sum(
+                s['stake_usd'] for s in self._shadow_scalps.values() 
+                if s['phase'] in ('WAITING_ENTRY', 'WAITING_EXIT')
+            )
+            # Dapatkan sisa saldo aktif (dibatasi nol agar tidak minus)
+            available_capital = max(0.0, self._session_stats['current_capital'] - locked_capital)
+
+            # Calculate position size using Kelly based on available capital
             sizing = compute_position_size(
-                capital=self._session_stats['current_capital'],
+                capital=available_capital,
                 swing_prob=res['swing_probability'],
                 entry_odds=res['entry_odds'],
                 exit_odds=res['exit_odds']
@@ -2045,16 +2053,65 @@ class TradingBot:
                             break
                         else:
                             # EXIT_NOW: close virtual position
-                            state['result'] = 'EMERGENCY_EXIT'
                             state['phase'] = 'CLOSED'
-                            
                             net_pnl = (current_price - entry_p) * state['shares'] * 0.98 - 0.005
+                            
+                            # Terjemahkan ke HIT/MISS untuk integritas W/L Tracker
+                            is_win = net_pnl > 0
+                            final_result = 'HIT' if is_win else 'MISS'
+                            state['result'] = final_result
+                            
                             self._session_stats['trades'].append({
-                                'result': 'EMERGENCY_EXIT',
+                                'result': final_result,
                                 'net_pnl': net_pnl,
                                 'hold_seconds': latency_s,
                             })
                             self._session_stats['current_capital'] += net_pnl
+                            
+                            # Update W/L Rekor Slingger
+                            if is_win:
+                                self._slingger_daily_stats['hit'] += 1
+                                self._slingger_daily_stats['pnls'].append(net_pnl)
+                            else:
+                                self._slingger_daily_stats['miss'] += 1
+                            
+                            daily_wins = sum(1 for t in self._session_stats['trades'] if t['result'] == 'HIT')
+                            daily_losses = sum(1 for t in self._session_stats['trades'] if t['result'] == 'MISS')
+                            daily_pnl = sum(t['net_pnl'] for t in self._session_stats['trades'])
+
+                            # Picu Notifikasi Penutupan Final (Closure Alert)
+                            if is_win:
+                                msg = SlingshotAlerts.exit_hit(
+                                    market_slug=market_slug,
+                                    entry_price=entry_p,
+                                    exit_price=current_price,
+                                    exit_target=state['exit_odds'],
+                                    latency_s=latency_s,
+                                    ttr_at_exit=ttr,
+                                    shares=state['shares'],
+                                    stake_usd=state['stake_usd'],
+                                    daily_pnl=daily_pnl,
+                                    daily_wins=daily_wins,
+                                    daily_losses=daily_losses
+                                )
+                            else:
+                                msg = SlingshotAlerts.miss(
+                                    market_slug=market_slug,
+                                    entry_price=entry_p,
+                                    exit_target=state['exit_odds'],
+                                    final_price=current_price,
+                                    stake_usd=state['stake_usd'],
+                                    reason="EMERGENCY_EXIT_LOSS",
+                                    daily_pnl=daily_pnl,
+                                    daily_wins=daily_wins,
+                                    daily_losses=daily_losses
+                                )
+                                
+                            asyncio.create_task(
+                                self._send_telegram("SLINGGER V5", msg),
+                                name=f"slingger_emerg_close_{market_id[:8]}"
+                            )
+                            logger.info("slingger_emergency_closed", market_id=market_id, pnl=net_pnl)
                             break
 
                     elif ttr <= 0:
