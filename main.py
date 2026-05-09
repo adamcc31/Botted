@@ -553,7 +553,6 @@ class TradingBot:
         except Exception:
             binance_health = {}
         try:
-            clob_state = self._clob.clob_state
             clob_health = clob_state.model_dump() if clob_state else None
         except Exception:
             clob_health = None
@@ -1784,6 +1783,11 @@ class TradingBot:
         """
         if not self._slingger.is_loaded or not clob_state:
             return
+            
+        # Safety Guard: Ensure all required price fields are populated before feature computation
+        if any(v is None for v in [clob_state.yes_ask, clob_state.yes_bid, clob_state.no_ask, clob_state.no_bid]):
+            logger.debug("slingger_v5_incomplete_clob_skip", market_id=market.market_id)
+            return
 
         m_id = market.market_id
         if m_id in self._active_tasks or m_id in self._shadow_scalps or m_id in self._completed_markets:
@@ -1807,9 +1811,14 @@ class TradingBot:
         
         if hist_yes:
             # Simple bid price velocity
+            hist_ask = self._clob._best_ask(hist_yes)
             curr_bid = clob_state.yes_bid
-            hist_bid = (1.0 - self._clob._best_ask(hist_yes)) # Implied bid
-            price_velocity_30s = (curr_bid - hist_bid) / lookback
+            
+            if hist_ask is not None and curr_bid is not None:
+                hist_bid = 1.0 - hist_ask
+                price_velocity_30s = (curr_bid - hist_bid) / lookback
+            else:
+                price_velocity_30s = 0.0
         else:
             price_velocity_30s = 0.0
 
