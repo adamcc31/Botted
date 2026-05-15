@@ -201,8 +201,8 @@ class FeatureEngine:
             yes_token = active_market.clob_token_ids.get("YES", "")
             no_token = active_market.clob_token_ids.get("NO", "")
             
-            hist_yes_book = clob_feed.get_historical_book(yes_token, lookback_s) if yes_token else None
-            hist_no_book = clob_feed.get_historical_book(no_token, lookback_s) if no_token else None
+            hist_yes_book = clob_feed.get_historical_book_snapshot(yes_token, lookback_s) if yes_token else None
+            hist_no_book = clob_feed.get_historical_book_snapshot(no_token, lookback_s) if no_token else None
             
             if hist_yes_book and hist_no_book:
                 hist_yes_ask = clob_feed._best_ask(hist_yes_book)
