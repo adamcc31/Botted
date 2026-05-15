@@ -407,7 +407,7 @@ class CLOBFeed:
             return True
         return (time.time() - self._last_fetch_time) > self._stale_timeout
 
-    def get_historical_book(self, token_id: str, seconds_ago: float) -> Optional[dict]:
+    def get_historical_book_snapshot(self, token_id: str, seconds_ago: float) -> Optional[dict]:
         """
         Retrieve orderbook snapshot from approximately N seconds ago.
         Returns the snapshot book or None if history is insufficient.
@@ -419,13 +419,26 @@ class CLOBFeed:
         target_time = datetime.now(timezone.utc).timestamp() - seconds_ago
         
         # Search from newest to oldest for the first snapshot older than target_time
-        # Since it's a deque and WebSocket updates are frequent, we just look back
         for item in reversed(history):
             if item["timestamp"].timestamp() <= target_time:
                 return item["book"]
         
         # If all items are newer than target_time, return the oldest available
         return history[0]["book"]
+
+    def get_historical_books_range(self, token_id: str, seconds_ago: float) -> list[dict]:
+        """
+        Retrieve all orderbook snapshots captured within the last N seconds.
+        Returns a list of book dictionaries.
+        """
+        history = self._clob_history.get(token_id)
+        if not history:
+            return []
+
+        target_time = datetime.now(timezone.utc).timestamp() - seconds_ago
+        
+        # Return all books with timestamp >= target_time
+        return [item["book"] for item in history if item["timestamp"].timestamp() >= target_time]
 
     def cleanup_market(self, market_id: str) -> None:
         """

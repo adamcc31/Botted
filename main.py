@@ -1831,16 +1831,17 @@ class TradingBot:
         yes_token = market.clob_token_ids.get("YES", "")
         no_token = market.clob_token_ids.get("NO", "")
         
-        hist_yes = self._clob.get_historical_book(yes_token, lookback) if yes_token else None
+        hist_yes_snap = self._clob.get_historical_book_snapshot(yes_token, lookback) if yes_token else None
+        hist_yes_range = self._clob.get_historical_books_range(yes_token, lookback) if yes_token else []
         
         # [VOLATILITY FIX] Internal Polymarket Volatility (replacing Alpha V1 RV mismatch)
         import statistics
-        if hist_yes and len(hist_yes) >= 5:
+        if len(hist_yes_range) >= 5:
             # Replikasi algoritma training: std dari perubahan implied bid
             # implied bid = 1.0 - ask
             bids = []
-            for h in hist_yes:
-                h_ask = self._clob._best_ask(h) # h is the book dict returned by get_historical_book
+            for h in hist_yes_range:
+                h_ask = self._clob._best_ask(h) 
                 if h_ask is not None:
                     bids.append(1.0 - h_ask)
             
@@ -1853,9 +1854,9 @@ class TradingBot:
         else:
             poly_vol = 0.0
 
-        if hist_yes:
+        if hist_yes_snap:
             # Simple bid price velocity
-            hist_ask = self._clob._best_ask(hist_yes)
+            hist_ask = self._clob._best_ask(hist_yes_snap)
             curr_bid = clob_state.yes_bid
             
             if hist_ask is not None and curr_bid is not None:
