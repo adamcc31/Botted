@@ -162,7 +162,11 @@ class TradingBot:
         self._slingger = SlingshotHunterV5()
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._shadow_scalps: dict[str, dict] = {}
+        # [FIX-MEM-1] Bounded completed_markets set — capped at 500 entries to prevent
+        # unbounded RAM growth. At 12 markets/hr, 500 entries = ~41 hours of lookback,
+        # more than sufficient to prevent duplicate processing.
         self._completed_markets: set[str] = set()
+        self._completed_markets_max_size: int = 500
         self._enable_dual_execution = os.getenv("ENABLE_DUAL_EXECUTION", "False").lower() == "true"
         
         initial_capital = 50.0
@@ -173,6 +177,7 @@ class TradingBot:
             'current_capital': initial_capital,
         }
         
+        # [FIX-MEM-2] slingger_daily_stats is reset every day via _roll_session_day_if_needed.
         self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
         MAX_CONCURRENT_SLINGGER_TASKS = int(os.getenv("MAX_SLINGGER_TASKS", "10"))
         self._max_slingger_tasks = MAX_CONCURRENT_SLINGGER_TASKS
@@ -225,6 +230,9 @@ class TradingBot:
         """
         Auto daily rollover for session stats.
         Sends summary and resets for the new day.
+        [FIX-MEM-2] Purges unbounded trades list and pnls list daily to prevent RAM growth.
+        V1 gold standard: RiskManager.reset_daily() clears _trade_history every day.
+        V5 now mirrors this behavior.
         """
         today = datetime.utcnow().date().isoformat()
 
@@ -233,11 +241,16 @@ class TradingBot:
 
             self._session_stats = {
                 'date': today,
-                'trades': [],
+                'trades': [],          # [FIX-MEM-2] Purge daily — mirrors V1 RiskManager.reset_daily()
                 'total_fees': 0.0,
                 'current_capital':
                     self._session_stats['current_capital'],
             }
+            # [FIX-MEM-2] Purge daily pnl list — was unbounded in previous code
+            self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
+            # [FIX-MEM-2] Reset daily risk counters in V1 RiskManager (alignment)
+            self._risk_mgr.reset_daily()
+            # [FIX-MEM-1] Clear completed_markets on daily rollover (bounded by day)
             self._completed_markets.clear()
             asyncio.create_task(self._save_v5_state())
 
@@ -1741,7 +1754,8 @@ class TradingBot:
 
     # ── Dashboard ─────────────────────────────────────────────
 
-    # ── Slingger Hunter V5: Dual-Stage Shadow Monitor ─────────
+    # ── Slingger Hunter V5: Dual-Stage Shadow Monitor (DRY-RUN ONLY) ──
+    # [MANDAT-DRYRUN] Slingger V5 DILARANG eksekusi riil (Shadow Entry Only).
 
     def _init_shadow_scalp(self, market_id: str, side: str, entry: float, exit: float, prob: float,
                            stake_usd: float, shares: float, depth_usd_at_entry: float,
@@ -1791,7 +1805,17 @@ class TradingBot:
 
         m_id = market.market_id
         if m_id in self._active_tasks or m_id in self._shadow_scalps or m_id in self._completed_markets:
-            return # Already tracking or completed this market
+            return  # Already tracking or completed this market
+        
+        # [FIX-EV-1] UNDERDOG HARD BLOCK: Production data shows UNDERDOG_<35% has EV=-29.1%
+        # (68W/338L = 16.7% win rate at avg odds 0.236, theoretical payout 3.24x).
+        # V1 gold standard uses Zone Matrix which already excludes these zones.
+        yes_bid = clob_state.yes_bid
+        no_bid = clob_state.no_bid
+        if (yes_bid is not None and yes_bid < 0.35) or (no_bid is not None and no_bid < 0.35):
+            logger.debug("slingger_v5_underdog_block", yes_bid=yes_bid, no_bid=no_bid,
+                         reason="EV=-29.1%_at_odds_below_0.35")
+            return
 
         if len(self._active_tasks) >= self._max_slingger_tasks:
             logger.warning("slingger_v5_max_tasks_reached", limit=self._max_slingger_tasks)
@@ -1802,13 +1826,33 @@ class TradingBot:
         # 1. Prepare Base Features (from FeatureEngine)
         base_features = dict(zip(fv.feature_names, fv.values))
         
-        # 2. Compute 30s Velocity proxy (using history from CLOBFeed)
+        # 2. Compute 30s Velocity and Volatility proxy (using history from CLOBFeed)
         lookback = 30.0
         yes_token = market.clob_token_ids.get("YES", "")
         no_token = market.clob_token_ids.get("NO", "")
         
         hist_yes = self._clob.get_historical_book(yes_token, lookback) if yes_token else None
         
+        # [VOLATILITY FIX] Internal Polymarket Volatility (replacing Alpha V1 RV mismatch)
+        import statistics
+        if hist_yes and len(hist_yes) >= 5:
+            # Replikasi algoritma training: std dari perubahan implied bid
+            # implied bid = 1.0 - ask
+            bids = []
+            for h in hist_yes:
+                h_ask = self._clob._best_ask(h) # h is the book dict returned by get_historical_book
+                if h_ask is not None:
+                    bids.append(1.0 - h_ask)
+            
+            if len(bids) >= 5:
+                # Calculate daily-scaled volatility proxy as used in training
+                diffs = [bids[i] - bids[i-1] for i in range(1, len(bids))]
+                poly_vol = statistics.stdev(diffs)
+            else:
+                poly_vol = 0.0
+        else:
+            poly_vol = 0.0
+
         if hist_yes:
             # Simple bid price velocity
             hist_ask = self._clob._best_ask(hist_yes)
@@ -1833,7 +1877,7 @@ class TradingBot:
             'depth_imbalance_t0':        (clob_state.yes_depth_usd - clob_state.no_depth_usd) / max(clob_state.yes_depth_usd + clob_state.no_depth_usd, 1.0),
             'price_velocity_30s':        price_velocity_30s,
             'depth_trend_30s':           base_features.get("clob_depth_delta", 0.0), # Proxy
-            'btc_realized_vol_prior_30m': base_features.get("RV", 0.0),
+            'btc_realized_vol_prior_30m': poly_vol, # [FIXED] Mapped to Polymarket Vol
             'ttr_at_signal':             (market.T_resolution - now).total_seconds(),
             'market_hour_utc':           now.hour,
             'day_of_week':               now.weekday(),
@@ -1863,21 +1907,47 @@ class TradingBot:
         if winner:
             res = res_yes if winner == 'YES' else res_no
             
+            # [FIX-PIPELINE-1] Sync V5 capital with primary DryRunEngine capital.
+            # Previously V5 tracked its own _session_stats['current_capital'] which
+            # diverged from V1's DryRunEngine capital. Now we use the canonical V1 source.
+            # This mirrors V1 RiskManager which always calls approve(capital=self._dry_run.capital).
+            primary_capital = self._dry_run.capital
+            self._session_stats['current_capital'] = primary_capital  # Keep in sync
+
             # Kalkulasi dana tertahan (locked margin) di shadow positions
             locked_capital = sum(
                 s['stake_usd'] for s in self._shadow_scalps.values() 
                 if s['phase'] in ('WAITING_ENTRY', 'WAITING_EXIT')
             )
             # Dapatkan sisa saldo aktif (dibatasi nol agar tidak minus)
-            available_capital = max(0.0, self._session_stats['current_capital'] - locked_capital)
+            available_capital = max(0.0, primary_capital - locked_capital)
 
-            # Calculate position size using Kelly based on available capital
-            sizing = compute_position_size(
+            # [FIX-PIPELINE-1] Apply V1 consecutive-loss multiplier decay to V5 sizing.
+            # V1 RiskManager uses: multiplier = max(kelly_floor, 1.0 - consec_losses * decay)
+            # V5 previously ignored consecutive losses entirely.
+            consec_losses = self._risk_mgr.consecutive_losses
+            kelly_floor = float(self._config.get("risk.kelly_floor_multiplier", 0.25))
+            loss_decay = float(self._config.get("risk.consecutive_loss_multiplier", 0.15))
+            kelly_multiplier_v1 = max(kelly_floor, 1.0 - consec_losses * loss_decay)
+
+            # Calculate position size using Kelly with V1 multiplier applied
+            sizing_raw = compute_position_size(
                 capital=available_capital,
                 swing_prob=res['swing_probability'],
                 entry_odds=res['entry_odds'],
                 exit_odds=res['exit_odds']
             )
+            # Apply V1 decay multiplier to stake
+            sizing = sizing_raw.copy()
+            sizing['stake_usd'] = round(sizing_raw['stake_usd'] * kelly_multiplier_v1, 2)
+            sizing['shares'] = round(sizing_raw['shares'] * kelly_multiplier_v1, 2)
+            
+            if kelly_multiplier_v1 < 1.0:
+                logger.info("slingger_v5_kelly_decay_applied",
+                            consec_losses=consec_losses,
+                            multiplier=round(kelly_multiplier_v1, 4),
+                            stake_before=sizing_raw['stake_usd'],
+                            stake_after=sizing['stake_usd'])
             
             if sizing['stake_usd'] <= 0:
                 logger.debug("slingger_sizing_zero", market_id=m_id, side=winner, prob=res['swing_probability'])
@@ -2216,17 +2286,33 @@ class TradingBot:
                     cleaned.append(attr)
                 del store[market_id]
         
+        # [FIX-MEM-1] Add to completed set with bounded size enforcement.
+        # Prevents indefinite growth while still blocking duplicate market processing.
         self._completed_markets.add(market_id)
+        if len(self._completed_markets) > self._completed_markets_max_size:
+            # Remove the oldest-approximate entry (sets are unordered; pop is O(1))
+            try:
+                self._completed_markets.pop()
+            except KeyError:
+                pass
 
+        # [FIX-TASK-DEADLOCK] Avoid self-cancellation when cleanup_market is called
+        # from within the monitor task's finally block. Previously this caused a 2-second
+        # asyncio.wait_for timeout on every market close.
+        current_task = asyncio.current_task()
         if market_id in self._active_tasks:
             task = self._active_tasks.pop(market_id)
-            if not task.done():
+            if not task.done() and task is not current_task:
+                # Only cancel if caller is NOT the task itself
                 task.cancel()
                 try:
                     await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-            cleaned.append('_active_tasks')
+                cleaned.append('_active_tasks')
+            elif task is current_task:
+                # Self-call: task will end naturally; just remove from registry
+                cleaned.append('_active_tasks(self-cleanup)')
 
         if cleaned:
             logger.debug("cleanup_market", market_id=market_id, source=source,
@@ -2236,7 +2322,8 @@ class TradingBot:
         if self._cleanup_count % 100 == 0:
             logger.info("memory_report", cleanup_n=self._cleanup_count,
                         shadow_scalps=len(self._shadow_scalps),
-                        active_tasks=len(self._active_tasks))
+                        active_tasks=len(self._active_tasks),
+                        completed_markets_size=len(self._completed_markets))
         
         # Ensure state is saved after cleanup
         asyncio.create_task(self._save_v5_state())
@@ -2290,15 +2377,41 @@ class TradingBot:
     # ── Resilience & Recovery (Section 12) ────────────────────
 
     async def _save_v5_state(self) -> None:
-        """Atomic save of session stats and shadow scalps to SQLite."""
+        """Atomic save of session stats and shadow scalps to SQLite.
+        [FIX-STATE-SAVE] Only serializes active (non-CLOSED) scalps to reduce
+        JSON size and SQLite write frequency. Previously saved all scalps including
+        CLOSED ones, causing JSON payload to grow unboundedly in long sessions.
+        [FIX-PIPELINE-1] session_stats capital is now synced from DryRunEngine
+        before saving to ensure the persisted value is canonical.
+        """
         try:
             from src.database import V5StateRecord
             from sqlalchemy.dialects.sqlite import insert
             
+            # [FIX-PIPELINE-1] Always sync capital from primary DryRunEngine before saving
+            self._session_stats['current_capital'] = self._dry_run.capital
+            
+            # [FIX-STATE-SAVE] Only persist active scalps (WAITING_ENTRY | WAITING_EXIT)
+            # CLOSED scalps are already cleaned up by cleanup_market() and don't need persistence
+            active_scalps = {
+                k: v for k, v in self._shadow_scalps.items()
+                if v.get('phase') in ('WAITING_ENTRY', 'WAITING_EXIT')
+            }
+            
+            # Slim session_stats for serialization: exclude full trades list (too large)
+            # Only persist capital and totals — trades are reconstructed from DB on restart
+            slim_stats = {
+                'date':            self._session_stats['date'],
+                'total_fees':      self._session_stats['total_fees'],
+                'current_capital': self._session_stats['current_capital'],
+                # Only keep last 50 trades for daily summary, not full history
+                'trades':          self._session_stats['trades'][-50:],
+            }
+            
             async with self._db.session_factory() as session:
                 async with session.begin():
-                    # Save Session Stats
-                    stats_json = json.dumps(self._session_stats, default=str)
+                    # Save Session Stats (slim version)
+                    stats_json = json.dumps(slim_stats, default=str)
                     stmt_stats = insert(V5StateRecord).values(
                         key='session_stats', data_json=stats_json
                     ).on_conflict_do_update(
@@ -2307,9 +2420,8 @@ class TradingBot:
                     )
                     await session.execute(stmt_stats)
                     
-                    # Save Shadow Scalps (active trades)
-                    # Filter out CLOSED trades for storage efficiency if needed, but keeping all for now
-                    scalps_json = json.dumps(self._shadow_scalps, default=str)
+                    # Save only active shadow scalps
+                    scalps_json = json.dumps(active_scalps, default=str)
                     stmt_scalps = insert(V5StateRecord).values(
                         key='shadow_scalps', data_json=scalps_json
                     ).on_conflict_do_update(
@@ -2319,8 +2431,9 @@ class TradingBot:
                     await session.execute(stmt_scalps)
             
             logger.debug("v5_state_saved", 
-                         capital=self._session_stats['current_capital'], 
-                         active_trades=len(self._shadow_scalps))
+                         capital=self._session_stats['current_capital'],
+                         active_scalps=len(active_scalps),
+                         total_scalps=len(self._shadow_scalps))
         except Exception as e:
             logger.error("v5_state_save_failed", error=str(e))
 

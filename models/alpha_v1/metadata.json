@@ -1,0 +1,71 @@
+{
+  "version": "alpha_v1_golden_v2",
+  "saved_at": "2026-04-30T11:56:07Z",
+  "feature_names": [
+    "entry_odds",
+    "depth_ratio",
+    "contest_urgency",
+    "tfm_value",
+    "obi_vol_interaction"
+  ],
+  "n_features": 5,
+  "n_train": 859,
+  "n_calib": 391,
+  "best_iteration": 235,
+  "metrics": {
+    "calib_auc": 0.7362,
+    "calib_brier": 0.1927,
+    "calib_ece": 0.0
+  },
+  "cv": {
+    "mean_auc": 0.724,
+    "std_auc": 0.0318,
+    "mean_brier": 0.2134,
+    "oof_auc": 0.7145,
+    "n_estimators_optimal": 253
+  },
+  "quality_gates": {
+    "all_pass": true,
+    "checks": {
+      "auc_cv_min": {
+        "value": 0.724,
+        "threshold": 0.6,
+        "pass": true
+      },
+      "auc_cv_std": {
+        "value": 0.0318,
+        "threshold": 0.08,
+        "pass": true
+      },
+      "ece_calib": {
+        "value": 0.0,
+        "threshold": 0.05,
+        "pass": true
+      },
+      "brier": {
+        "value": 0.1927,
+        "threshold": 0.26,
+        "pass": true
+      },
+      "ece_test": {
+        "value": 0.16247515791938422,
+        "threshold": 0.2,
+        "pass": true
+      }
+    }
+  },
+  "calib_curve": {
+    "fraction_of_positives": [
+      0.2711864406779661,
+      0.475,
+      0.7638888888888888,
+      0.8372093023255814
+    ],
+    "mean_predicted": [
+      0.2711864411830902,
+      0.4750000074505806,
+      0.7638889137241576,
+      0.8372092940086542
+    ]
+  }
+}

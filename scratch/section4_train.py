@@ -442,6 +442,9 @@ else:
 
 # Save OOF predictions for simulation
 full_df['oof_prob'] = oof_probs
-full_df.to_csv('scratch/slingger_v5_oof.csv', index=False)
-print(f"\nOOF predictions saved to scratch/slingger_v5_oof.csv")
+# [CLEANUP] Remove phantom columns and non-feature residue
+drop_cols = ['btc_vs_strike_pct', 'obi_value', 'rv_value']
+save_df = full_df.drop(columns=[c for c in drop_cols if c in full_df.columns])
+save_df.to_csv('scratch/slingger_v5_oof.csv', index=False)
+print(f"\nOOF predictions saved to scratch/slingger_v5_oof.csv (Cleaned)")
 print(f"Gate result: {gate_result}")
