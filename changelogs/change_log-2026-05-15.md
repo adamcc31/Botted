@@ -9,6 +9,7 @@ This session focused on the critical forensic audit, data restoration, and archi
 - **Problem:** Mismatch between training volatility (Polymarket internal) and live inference (Binance BTC RV).
 - **Solution:** Re-implemented `btc_realized_vol_prior_30m` in `main.py` using internal Polymarket order book standard deviation.
 - **Result:** Feature importance rank jumped to #3 in the model, significantly improving prediction accuracy.
+- **HOTFIX (v5.0.2):** Resolved `AttributeError` caused by treating a single book dictionary as a list during historical iteration. Added `get_historical_books_range` to correctly handle multi-point volatility calculations.
 
 #### 2. Full Data Restoration & Merging
 - **Extraction:** Pulled 140k+ rows of missing log data (May 9-15) from Railway production volume.
