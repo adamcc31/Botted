@@ -25,7 +25,11 @@ This session focused on the critical forensic audit, data restoration, and archi
 - **Hard Ceiling:** Implemented a **$20.0 absolute max stake** per trade to prevent slippage on thin 5m markets.
 - **Threshold Lock:** Enforced a minimum **0.65 probability threshold** in `metadata.json`.
 
-#### 5. Production Safety (Dry-Run Mandate)
+#### 5. Stability & Memory Fixes (OOM & Capital Reset)
+- **OOM Prevention:** Implemented surgical cleanup of state dictionaries (`_shadow_scalps` and `_completed_markets`) to prevent unbounded memory growth in long sessions on Railway.
+- **Capital Sync:** Resolved the fatal divergence between V5 and V1 capital. V5 now dynamically pulls from `self._dry_run.capital` (canonical source) to ensure all dry-run statistics are unified and consistent.
+
+#### 6. Production Safety (Dry-Run Mandate)
 - **Isolation:** Explicitly tagged V5 logic with `[MANDAT-DRYRUN]` in `main.py`.
 - **Forward-Test:** V5 is now strictly locked in shadow-entry mode; no real capital will be deployed until the end-of-month validation.
 
