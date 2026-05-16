@@ -78,77 +78,93 @@ class SlingshotHunterV5:
                   signal             : str   'ENTER' | 'SKIP'
                   confidence_tier    : str   'HIGH' | 'MEDIUM' | 'LOW'
                   full_kelly         : float (Kelly criterion, negative = skip)
-
-        [FIX-THRESHOLD] ENTER threshold raised 0.55 → 0.65.
-        Rationale: With entry=0.49, exit=0.80, fee=0.02, Kelly formula gives:
-          gross_return = (0.80-0.49)/0.49 = 0.633
-          b_adj = 0.633 * 0.98 = 0.620
-          breakeven p = q / (b_adj + q) = (1-p) / (0.620 + (1-p))
-          => breakeven p ≈ 0.617
-        Previous threshold 0.55 was BELOW breakeven → guaranteed negative EV.
-        New threshold 0.65 gives Kelly=+0.08, margin above breakeven.
-
-        [FIX-EV-1] Inline Kelly check: returns SKIP if full_kelly < 0 even
-        if cal_prob >= threshold, as final safety gate. This is the V1 gold
-        standard: RiskManager rejects any bet where Kelly <= 0.
         """
         if not self._loaded:
             raise RuntimeError("Model not loaded. Call .load() first.")
 
-        X = np.array(
-            [[feature_dict.get(f, np.nan) for f in self.features]],
-            dtype=np.float32,
-        )
-        X = self.imputer.transform(X)
+        try:
+            X = np.array(
+                [[feature_dict.get(f, np.nan) for f in self.features]],
+                dtype=np.float32,
+            )
+            X = self.imputer.transform(X)
 
-        raw_prob = self.model.predict_proba(X)[0][1]
-        cal_prob = float(
-            self.calibrator.predict_proba(np.array([[raw_prob]]))[0][1]
-        )
-
-        # [FIX-THRESHOLD] Raised from 0.55 to 0.65 based on Kelly breakeven analysis.
-        # Threshold from metadata if available, else hardcoded 0.65.
-        enter_threshold = self.metadata.get("enter_threshold", 0.65)
-
-        # [FIX-EV-1] Inline Kelly validation as final gate
-        entry_odds = self.metadata["optimal_entry_odds"]
-        exit_odds = self.metadata["optimal_exit_odds"]
-        fee = self.metadata.get("polymarket_fee", 0.02)
-
-        gross_return = (exit_odds - entry_odds) / entry_odds if entry_odds > 0 else 0.0
-        b_adj = gross_return * (1 - fee)
-        q = 1 - cal_prob
-        if b_adj > 0:
-            full_kelly = (b_adj * cal_prob - q) / b_adj
-        else:
-            full_kelly = -1.0
-
-        # Signal: ENTER only if prob meets threshold AND Kelly is positive
-        kelly_positive = full_kelly > 0.0
-        above_threshold = cal_prob >= enter_threshold
-        signal = "ENTER" if (above_threshold and kelly_positive) else "SKIP"
-
-        if cal_prob >= 0.65 and kelly_positive:
-            tier = "HIGH"
-        elif cal_prob >= 0.55:
-            tier = "MEDIUM"
-        else:
-            tier = "LOW"
-
-        if signal == "SKIP" and above_threshold and not kelly_positive:
-            logger.debug(
-                "[SlingshotHunterV5] SKIP_NEGATIVE_KELLY",
-                cal_prob=round(cal_prob, 4),
-                full_kelly=round(full_kelly, 4),
+            raw_prob = self.model.predict_proba(X)[0][1]
+            cal_prob = float(
+                self.calibrator.predict_proba(np.array([[raw_prob]]))[0][1]
             )
 
+            # [FIX-THRESHOLD] Raised from 0.55 to 0.65 based on Kelly breakeven analysis.
+            enter_threshold = self.metadata.get("enter_threshold", 0.65)
+
+            # [FIX-EV-1] Inline Kelly validation as final gate
+            entry_odds = self.metadata["optimal_entry_odds"]
+            exit_odds = self.metadata["optimal_exit_odds"]
+            fee = self.metadata.get("polymarket_fee", 0.02)
+
+            gross_return = (exit_odds - entry_odds) / entry_odds if entry_odds > 0 else 0.0
+            b_adj = gross_return * (1 - fee)
+            q = 1 - cal_prob
+            if b_adj > 0:
+                full_kelly = (b_adj * cal_prob - q) / b_adj
+            else:
+                full_kelly = -1.0
+
+            # Signal: ENTER only if prob meets threshold AND Kelly is positive
+            kelly_positive = full_kelly > 0.0
+            above_threshold = cal_prob >= enter_threshold
+            signal = "ENTER" if (above_threshold and kelly_positive) else "SKIP"
+
+            if cal_prob >= 0.65 and kelly_positive:
+                tier = "HIGH"
+            elif cal_prob >= 0.55:
+                tier = "MEDIUM"
+            else:
+                tier = "LOW"
+
+            return {
+                "swing_probability": cal_prob,
+                "entry_odds": entry_odds,
+                "exit_odds": exit_odds,
+                "signal": signal,
+                "confidence_tier": tier,
+                "full_kelly": round(full_kelly, 4),
+            }
+        except Exception as e:
+            # [TASK-1] BONGKAR ERROR YANG TERTELAN
+            logger.error("[SlingshotHunterV5] PREDICT_EXCEPTION: %s", str(e), exc_info=True)
+            return {
+                "swing_probability": 0.0,
+                "entry_odds": 0.5,
+                "exit_odds": 0.8,
+                "signal": "SKIP",
+                "confidence_tier": "ERROR",
+                "full_kelly": -1.0,
+            }
+
+    def evaluate_signal(self, raw_features: dict, entry_odds: float) -> dict:
+        """Shim for backward compatibility with V1 code."""
+        # Mapping simple fields if they exist in V1 raw features
+        v5_input = {
+            'yes_price_t0':              raw_features.get('entry_odds', entry_odds),
+            'no_price_t0':               raw_features.get('odds_no', 1.0 - entry_odds),
+            'clob_spread_t0':            raw_features.get('spread_pct', 0.005),
+            'yes_depth_t0':              raw_features.get('depth_ratio', 1.0),
+            'no_depth_t0':               1.0,
+            'depth_imbalance_t0':        0.0,
+            'price_velocity_30s':        0.0,
+            'depth_trend_30s':           0.0,
+            'btc_realized_vol_prior_30m': raw_features.get('rv_value', 0.0),
+            'ttr_at_signal':             raw_features.get('ttr_seconds', 300.0),
+            'market_hour_utc':           12.0,
+            'day_of_week':               0.0
+        }
+        res = self.predict(v5_input)
         return {
-            "swing_probability": cal_prob,
-            "entry_odds": entry_odds,
-            "exit_odds": exit_odds,
-            "signal": signal,
-            "confidence_tier": tier,
-            "full_kelly": round(full_kelly, 4),
+            "decision": "PASS" if res['signal'] == "ENTER" else "REJECT",
+            "p_win": res['swing_probability'],
+            "ev": res['full_kelly'],
+            "reason": "V5_SHIM_REJECT" if res['signal'] == "SKIP" else "V5_SHIM_PASS"
         }
 
     @property
@@ -158,4 +174,4 @@ class SlingshotHunterV5:
 
 # ── Backward compatibility aliases ─────────────────────────────
 ShadowPredatorV4 = SlingshotHunterV5
-DualXGBoostGate = SlingshotHunterV5
+DualXGBoostGate = XGBoostGate

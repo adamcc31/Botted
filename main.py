@@ -1868,7 +1868,6 @@ class TradingBot:
             price_velocity_30s = 0.0
 
         # 3. Predict for YES side swing
-        # Model expects: yes_price_t0, no_price_t0, etc.
         yes_feat = {
             'yes_price_t0':              clob_state.yes_bid,
             'no_price_t0':               clob_state.no_bid,
@@ -1877,14 +1876,18 @@ class TradingBot:
             'no_depth_t0':               clob_state.no_depth_usd,
             'depth_imbalance_t0':        (clob_state.yes_depth_usd - clob_state.no_depth_usd) / max(clob_state.yes_depth_usd + clob_state.no_depth_usd, 1.0),
             'price_velocity_30s':        price_velocity_30s,
-            'depth_trend_30s':           base_features.get("clob_depth_delta", 0.0), # Proxy
-            'btc_realized_vol_prior_30m': poly_vol, # [FIXED] Mapped to Polymarket Vol
+            'depth_trend_30s':           base_features.get("clob_depth_delta", 0.0),
+            'btc_realized_vol_prior_30m': poly_vol,
             'ttr_at_signal':             (market.T_resolution - now).total_seconds(),
             'market_hour_utc':           now.hour,
             'day_of_week':               now.weekday(),
         }
         
+        logger.debug("slingger_v5_features_assembly", market_id=market.market_id, features=yes_feat)
         res_yes = self._slingger.predict(yes_feat)
+        
+        if res_yes['signal'] == 'ENTER':
+            logger.info("slingger_v5_yes_signal", market_id=market.market_id, prob=res_yes['swing_probability'], kelly=res_yes['full_kelly'])
         
         # 4. Predict for NO side swing (Swap prices/depths as seen by NO side)
         no_feat = yes_feat.copy()
@@ -1895,6 +1898,8 @@ class TradingBot:
         no_feat['depth_imbalance_t0'] = -yes_feat['depth_imbalance_t0']
         
         res_no = self._slingger.predict(no_feat)
+        if res_no['signal'] == 'ENTER':
+            logger.info("slingger_v5_no_signal", market_id=market.market_id, prob=res_no['swing_probability'], kelly=res_no['full_kelly'])
 
         # 5. Decide
         winner = None
