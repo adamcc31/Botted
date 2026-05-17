@@ -73,7 +73,11 @@ class PaperTradingEngine:
         self.slippage_log_path = os.path.join(self.output_dir, "slippage_log.csv")
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # O(1) Buffers for high-performance I/O
+        # [FIX-MEM-PAPERTRADE] Bounded buffer — prevents unbounded RAM growth.
+        # At 12 markets/hr (5m markets), 200 entries = ~16 hours of buffer.
+        # Paper trades are already written to disk via _append_to_csv;
+        # this buffer is only needed for in-memory inspection, not persistence.
+        self.MAX_TRADE_BUFFER: int = 200
         self._trade_buffer: List[PaperTradeRecord] = []
         self._summary_cache: Dict[str, dict] = {}
         self._load_summary_cache()
@@ -289,26 +293,39 @@ class PaperTradingEngine:
                 writer.writeheader()
             writer.writerow(data)
             
-        # Also keep in buffer for Task 1
+        # [FIX-MEM-PAPERTRADE] Bounded buffer — trim if over MAX_TRADE_BUFFER
         self._trade_buffer.append(record)
+        if len(self._trade_buffer) > self.MAX_TRADE_BUFFER:
+            # Trim oldest entries (keep newest MAX_TRADE_BUFFER records)
+            self._trade_buffer = self._trade_buffer[-self.MAX_TRADE_BUFFER:]
 
     def _update_csv(self, file_path: str, record: PaperTradeRecord):
         """
-        Update the resolution fields in the CSV. 
+        Update the resolution fields in the CSV.
         Still uses Pandas for existing file updates as CSV is not row-addressable,
-        but we eliminate pd.concat and futurewarnings.
+        but we eliminate pd.concat and FutureWarnings.
+
+        [FIX-PANDAS-DTYPE] FutureWarning was triggered by df.at[idx, field.name] = val
+        when setting string values (e.g. timestamps) into columns inferred as numeric.
+        Fix: use str() cast for Optional[str] fields to prevent dtype mismatch.
         """
         if not os.path.exists(file_path):
             return
         
         # Optimization: only read if needed
-        df = pd.read_csv(file_path)
+        df = pd.read_csv(file_path, dtype=str)  # Read all as str to prevent dtype conflicts
         if record.trade_id in df['trade_id'].values:
             idx = df[df['trade_id'] == record.trade_id].index[0]
             for field in fields(record):
                 val = getattr(record, field.name)
-                # Avoid setting NaNs or incompatible types if possible
-                df.at[idx, field.name] = val
+                # Explicit string conversion for Optional fields to prevent FutureWarning
+                # on dtype-incompatible assignment (e.g. datetime string -> numeric column)
+                if val is None:
+                    df.at[idx, field.name] = ''
+                elif isinstance(val, (int, float, bool)):
+                    df.at[idx, field.name] = val
+                else:
+                    df.at[idx, field.name] = str(val)
             df.to_csv(file_path, index=False)
 
     def _log_slippage(self, signal, fresh_clob, edge):

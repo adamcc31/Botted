@@ -189,11 +189,20 @@ class TradingBot:
             self._config.get("telegram.heartbeat_minutes", 15.0)
         )
         self._post_mortem_tracker = {}
+        # [FIX-MEM-3] _post_mortem_tracker bounded to prevent unbounded growth.
+        # Without this cap, markets evaluated but never traded (ABSTAIN) would accumulate
+        # indefinitely. At 12 markets/hr x 16hr = 192 entries accruing + counter growth.
+        self._MAX_POST_MORTEM_ENTRIES: int = 200
         self._active_bets: dict[str, object] = {}  # market_id → active SignalResult
         
         from collections import deque
         self._odds_history: dict[str, deque] = {}   # per market_id
         self._binance_price_history: deque = deque()  # global
+        
+        # [FIX-V5-VISIBILITY] V5 evaluation counter for monitoring
+        # Tracks total evaluations so Telegram heartbeat can confirm V5 is running
+        self._v5_eval_count: int = 0
+        self._v5_enter_count: int = 0
 
     def _get_value_n_seconds_ago(
         self,
@@ -365,6 +374,12 @@ class TradingBot:
                     "zone_id": getattr(latest_signal, "zone_id", "N/A")
                     if latest_signal
                     else "N/A",
+                    # [FIX-V5-VISIBILITY] V5 evaluation diagnostics in heartbeat
+                    # v5_evals > 0 confirms V5 is evaluating; v5_enters/v5_evals = entry rate
+                    "v5_evals_total": self._v5_eval_count,
+                    "v5_enters_total": self._v5_enter_count,
+                    "v5_enter_rate": f"{(self._v5_enter_count / max(self._v5_eval_count, 1) * 100):.1f}%",
+                    "v5_active_scalps": len(self._shadow_scalps),
                 }
                 await self._send_telegram(
                     "HEARTBEAT / MARKET WATCH",
@@ -1183,6 +1198,15 @@ class TradingBot:
         if signal.signal == "ABSTAIN":
             m_id = market.market_id
             if m_id not in self._post_mortem_tracker:
+                # [FIX-MEM-3] Enforce cap: evict oldest entry if at limit.
+                # Counter objects inside each entry grow with each ABSTAIN reason,
+                # so unbounded accumulation is a genuine memory leak at high eval rates.
+                if len(self._post_mortem_tracker) >= self._MAX_POST_MORTEM_ENTRIES:
+                    oldest_key = next(iter(self._post_mortem_tracker))
+                    del self._post_mortem_tracker[oldest_key]
+                    logger.debug("post_mortem_tracker_evicted", evicted_key=oldest_key[:16],
+                                 tracker_size=len(self._post_mortem_tracker))
+
                 self._post_mortem_tracker[m_id] = {
                     "evals": 0,
                     "reasons": Counter(),
@@ -1192,12 +1216,12 @@ class TradingBot:
                     self._schedule_post_mortem(market),
                     name=f"pm_{m_id[:8]}"
                 )
-            
+
             stats = self._post_mortem_tracker[m_id]
             stats["evals"] += 1
             if signal.abstain_reason:
                 stats["reasons"][signal.abstain_reason] += 1
-            
+
             current_max_edge = max(signal.edge_yes or 0.0, signal.edge_no or 0.0)
             if current_max_edge > stats["max_edge"]:
                 stats["max_edge"] = current_max_edge
@@ -1806,7 +1830,12 @@ class TradingBot:
         m_id = market.market_id
         if m_id in self._active_tasks or m_id in self._shadow_scalps or m_id in self._completed_markets:
             return  # Already tracking or completed this market
-        
+
+        # [FIX-V5-VISIBILITY] Increment evaluation counter for monitoring.
+        # Telegram heartbeat will show v5_evals and v5_enters every interval,
+        # confirming V5 IS running even during zero-trade periods.
+        self._v5_eval_count += 1
+
         # [FIX-EV-1] UNDERDOG HARD BLOCK: Production data shows UNDERDOG_<35% has EV=-29.1%
         # (68W/338L = 16.7% win rate at avg odds 0.236, theoretical payout 3.24x).
         # V1 gold standard uses Zone Matrix which already excludes these zones.
@@ -1962,7 +1991,10 @@ class TradingBot:
             logger.info("slingger_v5_pattern_detected", 
                         side=winner, prob=round(res['swing_probability'], 4),
                         tier=res['confidence_tier'], stake=sizing['stake_usd'])
-            
+
+            # [FIX-V5-VISIBILITY] Track successful entries for telemetry
+            self._v5_enter_count += 1
+
             # Additional Telemetry Data
             depth_at_entry = clob_state.yes_depth_usd if winner == 'YES' else clob_state.no_depth_usd
             btc_vs_strike_pct = ((oracle_price - market.strike_price) / market.strike_price) * 100

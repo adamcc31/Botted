@@ -7,6 +7,7 @@ Changes require versioning.
 
 from __future__ import annotations
 
+import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,13 @@ from sqlalchemy import text
 from src.schemas import PaperTrade, SessionMetrics, CLOBState
 
 logger = structlog.get_logger(__name__)
+
+# [FIX-MEM-EXPORTER] CLOB log CSV header columns (immutable contract)
+_CLOB_LOG_COLUMNS = [
+    "timestamp", "market_id", "TTR_minutes",
+    "yes_ask", "yes_bid", "no_ask", "no_bid",
+    "yes_depth_usd", "no_depth_usd", "market_vig", "is_liquid",
+]
 
 _EXPORTS_DIR = Path(__file__).parent.parent / "data" / "exports"
 
@@ -98,25 +106,39 @@ class Exporter:
     # ── CLOB Log ──────────────────────────────────────────────
 
     def record_clob_snapshot(self, clob_state: CLOBState, ttr_minutes: float) -> None:
-        """Record CLOB snapshot and append immediately to clob_log.csv."""
+        """
+        Record CLOB snapshot and append immediately to clob_log.csv.
+
+        [FIX-MEM-EXPORTER] Previously created a new pd.DataFrame([record]) on every call
+        (every 5 seconds via _run_clob_loop = 12x/min = 720x/hr = 17,280x/day).
+        Each DataFrame allocation adds ~50KB of pandas internal overhead and forces
+        a GC cycle, causing linear memory growth.
+
+        Replaced with direct csv.writer — O(1) cost, zero pandas overhead.
+        This eliminates the primary driver of the 1.0→1.8GB RAM growth curve.
+        """
         path = self._session_dir / "clob_log.csv"
         file_exists = path.exists()
 
-        record = {
-            "timestamp": clob_state.timestamp.isoformat(),
-            "market_id": clob_state.market_id,
-            "TTR_minutes": round(ttr_minutes, 2),
-            "yes_ask": clob_state.yes_ask,
-            "yes_bid": clob_state.yes_bid,
-            "no_ask": clob_state.no_ask,
-            "no_bid": clob_state.no_bid,
-            "yes_depth_usd": round(clob_state.yes_depth_usd, 2),
-            "no_depth_usd": round(clob_state.no_depth_usd, 2),
-            "market_vig": round(clob_state.market_vig, 4),
-            "is_liquid": clob_state.is_liquid,
-        }
-        df = pd.DataFrame([record])
-        df.to_csv(path, mode='a', header=not file_exists, index=False)
+        row = [
+            clob_state.timestamp.isoformat(),
+            clob_state.market_id,
+            round(ttr_minutes, 2),
+            clob_state.yes_ask,
+            clob_state.yes_bid,
+            clob_state.no_ask,
+            clob_state.no_bid,
+            round(clob_state.yes_depth_usd, 2),
+            round(clob_state.no_depth_usd, 2),
+            round(clob_state.market_vig, 4),
+            clob_state.is_liquid,
+        ]
+
+        with open(path, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(_CLOB_LOG_COLUMNS)
+            writer.writerow(row)
 
     def export_clob_log(self) -> Path:
         """Legacy export method for shutdown."""

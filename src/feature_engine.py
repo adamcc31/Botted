@@ -209,25 +209,30 @@ class FeatureEngine:
                 hist_yes_bid = clob_feed._best_bid(hist_yes_book)
                 hist_no_ask = clob_feed._best_ask(hist_no_book)
                 hist_no_bid = clob_feed._best_bid(hist_no_book)
-                
-                # Spread velocity (YES)
-                current_spread = clob_state.yes_ask - clob_state.yes_bid
-                hist_spread = hist_yes_ask - hist_yes_bid
-                features["clob_spread_vel"] = (current_spread - hist_spread) / lookback_s
-                
-                # Depth Delta (Ratio of Bid/Ask depth)
-                # curr_depth_ratio = current yes_depth / current no_depth
-                curr_depth_ratio = clob_state.yes_depth_usd / (clob_state.no_depth_usd + 0.1) # Min 0.1 USD to prevent extreme ratios
-                
-                hist_yes_depth = clob_feed._calc_depth_near_ask(hist_yes_book, hist_yes_ask, pct=0.03)
-                hist_no_depth = clob_feed._calc_depth_near_ask(hist_no_book, hist_no_ask, pct=0.03)
-                hist_depth_ratio = hist_yes_depth / (hist_no_depth + 0.1)
-                
-                # FEATURE SANITIZATION:
-                # 1. Spread Velocity (clamped to +/- 0.1 per second)
-                # 2. Depth Delta (clamped to +/- 50.0 ratio change)
-                features["clob_spread_vel"] = np.clip((current_spread - hist_spread) / lookback_s, -0.1, 0.1)
-                features["clob_depth_delta"] = np.clip(curr_depth_ratio - hist_depth_ratio, -50.0, 50.0)
+
+                # [FIX-NONETYPE] Guard: any None price means historical book is incomplete
+                # (e.g. empty asks/bids in a snapshot). Fall back to 0.0 defaults.
+                if any(v is None for v in [hist_yes_ask, hist_yes_bid, hist_no_ask, hist_no_bid]):
+                    features["clob_spread_vel"] = 0.0
+                    features["clob_depth_delta"] = 0.0
+                else:
+                    # Spread velocity (YES)
+                    current_spread = clob_state.yes_ask - clob_state.yes_bid
+                    hist_spread = hist_yes_ask - hist_yes_bid
+                    features["clob_spread_vel"] = (current_spread - hist_spread) / lookback_s
+
+                    # Depth Delta (Ratio of Bid/Ask depth)
+                    curr_depth_ratio = clob_state.yes_depth_usd / (clob_state.no_depth_usd + 0.1)
+
+                    hist_yes_depth = clob_feed._calc_depth_near_ask(hist_yes_book, hist_yes_ask, pct=0.03)
+                    hist_no_depth = clob_feed._calc_depth_near_ask(hist_no_book, hist_no_ask, pct=0.03)
+                    hist_depth_ratio = hist_yes_depth / (hist_no_depth + 0.1)
+
+                    # FEATURE SANITIZATION:
+                    # 1. Spread Velocity (clamped to +/- 0.1 per second)
+                    # 2. Depth Delta (clamped to +/- 50.0 ratio change)
+                    features["clob_spread_vel"] = np.clip((current_spread - hist_spread) / lookback_s, -0.1, 0.1)
+                    features["clob_depth_delta"] = np.clip(curr_depth_ratio - hist_depth_ratio, -50.0, 50.0)
             else:
                 features["clob_spread_vel"] = 0.0
                 features["clob_depth_delta"] = 0.0
