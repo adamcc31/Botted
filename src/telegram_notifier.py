@@ -100,8 +100,41 @@ class TelegramNotifier:
 
 
 class SlingshotAlerts:
-    """Centralized alert formatter for Slingger Hunter V5.
-    All Telegram f-strings live here — none in monitor loops."""
+    """Centralized alert formatter for the trading engine.
+
+    TELEMETRY SEPARATION CONTRACT
+    ─────────────────────────────────────────────────────────────────────────────
+    [SLINGGER V5] — V5-exclusive methods (shadow scalp lifecycle only):
+        entry()        Shadow scalp opened
+        exit_hit()     Swing target reached
+        emergency()    TTR < 60s decision gate
+        miss()         Position closed at loss
+        daily_summary() End-of-day V5 stats
+
+    [ALPHA V1] — Called exclusively from the Alpha V1 execution path
+    (_on_bar_close → _schedule_resolution → _send_telegram):
+        order_execution()     Trade entry notification
+        order_result()        Trade resolution (WIN/LOSS)
+        paper_trade_resolved() High-fidelity paper trade resolved
+        session_aborted()     Hard abort triggered
+        go_live_enabled()     Dry-run gate passed
+        session_report()      Periodic 2h summary
+        heartbeat()           15-min market watch pulse
+        system_health()       Startup health check
+        session_finished()    Session end summary
+        dry_run_limit()       Max duration exceeded
+
+    Any change to a prefix MUST update this docstring.
+    ─────────────────────────────────────────────────────────────────────────────
+    """
+
+    # Single source of truth for model identifiers.
+    MODEL_V1 = "ALPHA V1"
+    MODEL_V5 = "SLINGGER V5"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # V5-EXCLUSIVE: Shadow Scalp Lifecycle Notifications
+    # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def entry(market_slug: str,
@@ -403,46 +436,51 @@ class SlingshotAlerts:
             f"${current_capital:.2f}"
         )
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # ALPHA V1: Order & Session Lifecycle Notifications
+    # Called exclusively from: _on_bar_close → _schedule_resolution path
+    # ─────────────────────────────────────────────────────────────────────────
+
     @staticmethod
     def system_health(data: dict) -> str:
-        return "[SLINGGER V5] 🛠 SYSTEM HEALTH START\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[ALPHA V1] 🛠 SYSTEM HEALTH START\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def heartbeat(data: dict) -> str:
-        return "[SLINGGER V5] 💓 HEARTBEAT / MARKET WATCH\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[ALPHA V1] 💓 HEARTBEAT / MARKET WATCH\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def session_report(title: str, data: dict) -> str:
-        return f"[SLINGGER V5] 📊 {title}\n\n" + SlingshotAlerts._tg_kv(data)
+        return f"[ALPHA V1] 📊 {title}\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def order_execution(title: str, data: dict) -> str:
-        return f"[SLINGGER V5] 📦 {title}\n\n" + SlingshotAlerts._tg_kv(data)
+        return f"[ALPHA V1] 📦 {title}\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def order_result(data: dict) -> str:
-        return "[SLINGGER V5] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[ALPHA V1] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def paper_trade_resolved(data: dict) -> str:
-        return "[SLINGGER V5] 📊 Paper Trade Resolved\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[ALPHA V1] 📊 Paper Trade Resolved\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def session_aborted(reason: str, session_id: str) -> str:
         return (
-            f"[SLINGGER V5] 🛑 SESSION ABORTED\n\n"
+            f"[ALPHA V1] 🛑 SESSION ABORTED\n\n"
             f"Reason: {reason}\n"
             f"Session: {session_id}"
         )
 
     @staticmethod
     def go_live_enabled(data: dict) -> str:
-        return "[SLINGGER V5] 🚀 GO LIVE ENABLED\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[ALPHA V1] 🚀 GO LIVE ENABLED\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def dry_run_limit(max_hours: float, session_id: str) -> str:
         return (
-            f"[SLINGGER V5] ⏳ DRY RUN TIME LIMIT\n\n"
+            f"[ALPHA V1] ⏳ DRY RUN TIME LIMIT\n\n"
             f"Dry-run belum mencapai gate live dalam maksimal {max_hours} jam.\n"
             f"Session: {session_id}"
         )
@@ -450,11 +488,15 @@ class SlingshotAlerts:
     @staticmethod
     def session_finished(title: str, prefix: str, reason: str, stats_text: str) -> str:
         return (
-            f"[SLINGGER V5] 🏁 {title}\n\n"
+            f"[ALPHA V1] 🏁 {title}\n\n"
             f"{prefix}\n"
             f"Reason: {reason}\n\n"
             f"{stats_text}"
         )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Shared Utilities
+    # ─────────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _tg_kv(data: dict) -> str:
