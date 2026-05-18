@@ -556,7 +556,9 @@ class TradingBot:
 
         # Load models
         try:
-            self._xgboost_gate.load_model(Path("models/alpha_v1"))
+            # ALPHA V1 RETIRED: Model loading disabled to prevent CPU/memory consumption in production.
+            logger.info("alpha_v1_disabled_skipping_model_load")
+            # self._xgboost_gate.load_model(Path("models/alpha_v1"))
         except Exception as e:
             logger.warning(
                 "no_v1_model_loaded",
@@ -991,15 +993,11 @@ class TradingBot:
         except Exception as e:
             logger.error("slingger_v5_execution_error", error=str(e), traceback=traceback.format_exc())
 
-        # ── STEP 1: min_ttr_minutes Gate (V1/V4 Directional Only) ──
-        min_ttr = float(self._config.get("signal.min_ttr_minutes", 1.5))
-        if market.TTR_minutes < min_ttr:
-            logger.debug(
-                "v1_directional_skipped_late_ttr",
-                TTR_minutes=round(market.TTR_minutes, 2),
-                min_ttr=min_ttr,
-            )
-            return
+        # ── ALPHA V1 KILL SWITCH (NO-GO VERDICT) ──
+        # Alpha V1 is officially disabled to save CPU cycles and prevent negative EV bleeding.
+        # Slingger V5 remains 100% active and healthy.
+        logger.debug("alpha_v1_disabled_skipping_directional_flow")
+        return
 
         # ── ML Features Collection (MUST happen before XGBoost gate) ─
         ml_features = {}

@@ -39,10 +39,10 @@ CHOP_FILES = [
     "dataset_weekday_monday-0100-0230AM ET_chop_v1.csv",
 ]
 
-DRY_RUN_FILES = [
-    "dry_run_2026-04-28_132421.csv",
-    "dry_run_2026-04-28_155909.csv",
-]
+# Dynamically glob all dry_run_*.csv files in RAW_DIR, sorted for consistency
+dry_run_paths = sorted(RAW_DIR.glob("dry_run_*.csv"))
+DRY_RUN_FILES = [p.name for p in dry_run_paths]
+print(f"Detected {len(DRY_RUN_FILES)} dry run files dynamically.")
 
 OUTPUT_FILE = RAW_DIR / "alpha_v1_master.csv"
 
@@ -65,7 +65,7 @@ def run_retrofix(chop_files: list[str], skip: bool = False) -> None:
 
     for fname in chop_files:
         fpath = RAW_DIR / fname
-        print(f"\n  → Retrofix: {fname}")
+        print(f"\n  -> Retrofix: {fname}")
 
         cmd = [
             sys.executable, str(retrofix_script),
@@ -102,7 +102,7 @@ def run_recompute(chop_files: list[str], skip: bool = False) -> None:
 
     for fname in chop_files:
         fpath = RAW_DIR / fname
-        print(f"\n  → Recompute: {fname}")
+        print(f"\n  -> Recompute: {fname}")
 
         cmd = [
             sys.executable, str(recompute_script),
@@ -152,7 +152,7 @@ def load_and_align() -> pd.DataFrame:
                 df["ttr_minutes"], errors="coerce"
             ) * 60
             df = df.drop(columns=["ttr_minutes"])
-            print(f"    → Converted ttr_minutes → ttr_seconds")
+            print(f"    -> Converted ttr_minutes -> ttr_seconds")
 
         frames.append(df)
 
@@ -199,7 +199,7 @@ def sort_and_dedup(df: pd.DataFrame) -> pd.DataFrame:
     # Sort chronological
     df = df.sort_values("timestamp").reset_index(drop=True)
     print(f"  Sorted chronologically: {len(df)} rows")
-    print(f"  Time range: {df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(f"  Time range: {df['timestamp'].min()} -> {df['timestamp'].max()}")
 
     # Drop duplicates pada timestamp + market_id
     df = df.drop_duplicates(subset=["timestamp", "market_id"], keep="last")
@@ -282,11 +282,11 @@ def save_master(df: pd.DataFrame) -> None:
 
     df.to_csv(OUTPUT_FILE, index=False)
     size_mb = OUTPUT_FILE.stat().st_size / (1024 * 1024)
-    print(f"\n  ✅  Saved: {OUTPUT_FILE}")
+    print(f"\n  [OK] Saved: {OUTPUT_FILE}")
     print(f"  File size: {size_mb:.2f} MB")
     print(f"  Rows: {len(df)}")
     print(f"  Columns: {len(df.columns)}")
-    print(f"  Time span: {df['timestamp'].min()} → {df['timestamp'].max()}")
+    print(f"  Time span: {df['timestamp'].min()} -> {df['timestamp'].max()}")
     print(f"\n  Unique markets: {df['market_id'].nunique()}")
     print(f"  Unique slugs: {df['slug'].nunique()}")
 

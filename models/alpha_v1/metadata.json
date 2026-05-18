@@ -1,6 +1,6 @@
 {
-  "version": "alpha_v1_golden_v2",
-  "saved_at": "2026-04-30T11:56:07Z",
+  "version": "alpha_v1",
+  "saved_at": "2026-05-18T11:41:49Z",
   "feature_names": [
     "entry_odds",
     "depth_ratio",
@@ -9,46 +9,47 @@
     "obi_vol_interaction"
   ],
   "n_features": 5,
-  "n_train": 859,
-  "n_calib": 391,
-  "best_iteration": 235,
+  "n_train": 1562,
+  "n_calib": 459,
+  "best_iteration": 286,
   "metrics": {
-    "calib_auc": 0.7362,
-    "calib_brier": 0.1927,
-    "calib_ece": 0.0
+    "calib_auc": 0.6663,
+    "calib_brier": 0.2139,
+    "calib_ece": 0.0002,
+    "ece_before": 0.0361
   },
   "cv": {
-    "mean_auc": 0.724,
-    "std_auc": 0.0318,
-    "mean_brier": 0.2134,
-    "oof_auc": 0.7145,
-    "n_estimators_optimal": 253
+    "mean_auc": 0.7667,
+    "std_auc": 0.0642,
+    "mean_brier": 0.1968,
+    "oof_auc": 0.7687,
+    "n_estimators_optimal": 152
   },
   "quality_gates": {
     "all_pass": true,
     "checks": {
       "auc_cv_min": {
-        "value": 0.724,
+        "value": 0.7667,
         "threshold": 0.6,
         "pass": true
       },
       "auc_cv_std": {
-        "value": 0.0318,
+        "value": 0.0642,
         "threshold": 0.08,
         "pass": true
       },
       "ece_calib": {
-        "value": 0.0,
+        "value": 0.0002,
         "threshold": 0.05,
         "pass": true
       },
       "brier": {
-        "value": 0.1927,
+        "value": 0.2139,
         "threshold": 0.26,
         "pass": true
       },
       "ece_test": {
-        "value": 0.16247515791938422,
+        "value": 0.15884718907549186,
         "threshold": 0.2,
         "pass": true
       }
@@ -56,16 +57,20 @@
   },
   "calib_curve": {
     "fraction_of_positives": [
-      0.2711864406779661,
-      0.475,
-      0.7638888888888888,
-      0.8372093023255814
+      0.0,
+      0.3870967741935484,
+      0.4888888888888889,
+      0.6290322580645161,
+      0.7320574162679426,
+      0.8571428571428571
     ],
     "mean_predicted": [
-      0.2711864411830902,
-      0.4750000074505806,
-      0.7638889137241576,
-      0.8372092940086542
+      0.0010000000474974513,
+      0.3870967626571655,
+      0.4888888895511627,
+      0.6290322542190552,
+      0.7320574151271838,
+      0.8571428486279079
     ]
   }
 }

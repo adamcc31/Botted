@@ -28,6 +28,12 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
+    # Initialize any missing raw features with 0.0 to support legacy or pruned
+    # datasets (e.g., Alpha V1 master) that do not contain newer V5 features.
+    for col in RAW_FEATURES:
+        if col not in df.columns:
+            df[col] = 0.0
+
     # ------------------------------------------------------------------
     # 1. edge_vs_crowd  →  q_fair - entry_odds
     #

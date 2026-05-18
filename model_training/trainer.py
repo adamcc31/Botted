@@ -489,14 +489,33 @@ def save_model(train_result: dict,
         "quality_gates": gate_result,
         "calib_curve": train_result["calib_curve"],
     }
+    def make_json_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [make_json_serializable(v) for v in obj]
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64, np.floating)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64, np.integer)):
+            return int(obj)
+        elif hasattr(obj, '__dict__'):
+            return str(obj)
+        try:
+            json.dumps(obj)
+            return obj
+        except TypeError:
+            return str(obj)
+
     meta_path = output_dir / "metadata.json"
     with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
+        json.dump(make_json_serializable(metadata), f, indent=2)
 
     # CV detail
     cv_path = output_dir / "cv_results.json"
     with open(cv_path, "w") as f:
-        json.dump(cv_result, f, indent=2)
+        json.dump(make_json_serializable(cv_result), f, indent=2)
 
     logger.info("Metadata tersimpan: %s", meta_path)
     return model_path

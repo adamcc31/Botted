@@ -68,7 +68,7 @@ def _setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> N
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(
         logging.Formatter(
-            "%(asctime)s │ %(levelname)-8s │ %(name)s │ %(message)s",
+            "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
             datefmt="%H:%M:%S",
         )
     )
@@ -115,6 +115,7 @@ class TrainingPipeline:
         data_format: str = "csv",
         test_ratio: float = 0.15,
         model_version: Optional[str] = None,
+        calibration_method: str = "temperature",
     ) -> None:
         """
         Args:
@@ -123,12 +124,14 @@ class TrainingPipeline:
             data_format:   "csv" atau "sqlite".
             test_ratio:    Proporsi data untuk final test set.
             model_version: ID versi model. Auto-generate jika None.
+            calibration_method: "temperature" atau "isotonic".
         """
         self.data_path = Path(data_path)
         self.output_dir = Path(output_dir)
         self.data_format = data_format
         self.test_ratio = test_ratio
         self.model_version = model_version or time.strftime("%Y%m%d_%H%M%S")
+        self.calibration_method = calibration_method
 
         # State yang diisi selama pipeline
         self.df_raw: Optional[pd.DataFrame] = None
@@ -287,7 +290,10 @@ class TrainingPipeline:
         y_train = df_train_feat[TARGET_COL].values.astype(np.int32)
         groups = get_market_groups(df_train_feat)
 
-        self.cv_result = cross_validate(X_train, y_train, groups)
+        self.cv_result = cross_validate(
+            X_train, y_train, groups,
+            calibration_method=self.calibration_method
+        )
 
         logger.info(
             "CV Result: mean_AUC=%.4f ±%.4f | OOF_AUC=%.4f | Brier=%.4f",
@@ -302,19 +308,20 @@ class TrainingPipeline:
     # Step 6: Train & Calibrate
     # ------------------------------------------------------------------
 
-    def step_train_and_calibrate(self) -> dict:
-        """Final training XGBoost + Platt calibration."""
-        logger.info("=" * 60)
-        logger.info("STEP 6: FINAL TRAINING + PLATT CALIBRATION")
-        logger.info("=" * 60)
-
-        if self.df_train is None or self.df_calib is None:
-            raise RuntimeError("Panggil step_split_data() terlebih dahulu.")
-
+    def step_train_and_calibrate(self) -> None:
+        """
+        Step 4: Train and Calibrate on Full Dataset
+        ==========================================
+        Melatih model akhir menggunakan seluruh df_train, lalu
+        melakukan kalibrasi probability menggunakan df_calib.
+        """
+        logger.info("\n" + "="*40 + "\nSTEP 4: FULL TRAINING & CALIBRATION\n" + "="*40)
+        
         self.train_result = train_and_calibrate(
             self.df_train,
             self.df_calib,
             imputer_vals=self.imputer_vals,
+            calibration_method=self.calibration_method,
         )
 
         logger.info(
@@ -618,6 +625,13 @@ def parse_args() -> argparse.Namespace:
         help="ID versi model. Auto-generated jika tidak diisi.",
     )
     parser.add_argument(
+        "--calibration-method",
+        type=str,
+        choices=["temperature", "isotonic"],
+        default="temperature",
+        help="Metode kalibrasi: 'temperature' atau 'isotonic'. Default: temperature.",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -647,6 +661,7 @@ def main() -> None:
     logger.info("  format:     %s", args.format)
     logger.info("  test_ratio: %.2f", args.test_ratio)
     logger.info("  version:    %s", args.version or "(auto)")
+    logger.info("  calibration:%s", args.calibration_method)
 
     # Run pipeline
     pipeline = TrainingPipeline(
@@ -655,6 +670,7 @@ def main() -> None:
         data_format=args.format,
         test_ratio=args.test_ratio,
         model_version=args.version,
+        calibration_method=args.calibration_method,
     )
 
     result = pipeline.run_full_pipeline()
