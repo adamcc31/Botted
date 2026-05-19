@@ -412,7 +412,7 @@ class DryRunEngine:
             capital_end=round(self._capital, 2),
             dry_run_score=round(dry_run_score, 4),
             pass_fail=pass_fail,
-            model_version=model_version,
+            model_version=model_version or "V1_DISABLED",
             consecutive_losses=self._consecutive_losses,
         )
 

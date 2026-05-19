@@ -486,7 +486,9 @@ class TradingBot:
                 break
                 
             try:
-                xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+                xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
+                               getattr(self._xgboost_gate, 'model_version', None) or 
+                               "Slingger V5 (Lone Wolf)")
                 metrics = self._dry_run.compute_session_metrics(xgb_version)
                 summary = {
                     "trades_executed": metrics.trades_executed,
@@ -728,7 +730,9 @@ class TradingBot:
         await self._db.close()
 
         # Export session data
-        xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+        xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
+                       getattr(self._xgboost_gate, 'model_version', None) or 
+                       "Slingger V5 (Lone Wolf)")
         metrics = self._dry_run.compute_session_metrics(xgb_version)
         if self._exporter:
             self._exporter.export_session(
@@ -1423,7 +1427,9 @@ class TradingBot:
             asyncio.create_task(self.stop(), name="stop_after_abort")
 
         # Update metrics
-        xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+        xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
+                       getattr(self._xgboost_gate, 'model_version', None) or 
+                       "Slingger V5 (Lone Wolf)")
         self._latest_metrics = self._dry_run.compute_session_metrics(
             xgb_version
         )
@@ -1632,8 +1638,9 @@ class TradingBot:
         min_total_trades = int(
             self._config.get("dry_run.go_live_min_total_trades", 100)
         )
-        consec_pass = int(self._config.get("dry_run.go_live_consecutive_pass", 5))
-        xgb_version = getattr(self._xgboost_gate, 'version', getattr(self._xgboost_gate, 'model_version', 'unknown'))
+        xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
+                       getattr(self._xgboost_gate, 'model_version', None) or 
+                       "Slingger V5 (Lone Wolf)")
         metrics = self._dry_run.compute_session_metrics(xgb_version)
 
         if metrics.trades_executed >= min_total_trades and metrics.pass_fail == "PASS":
