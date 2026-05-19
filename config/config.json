@@ -9,7 +9,7 @@
   },
   "dual_feed": {
     "rtds_ws_url": "wss://ws-live-data.polymarket.com",
-    "spread_threshold_normal_pct": 0.03,
+    "spread_threshold_normal_pct": 0.05,
     "spread_threshold_elevated_pct": 0.08,
     "rolling_window_seconds": 60,
     "stale_threshold_seconds": 10,
