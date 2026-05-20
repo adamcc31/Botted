@@ -576,7 +576,8 @@ class TradingBot:
 
         # Bootstrap historical data
         bars_loaded = await self._binance.bootstrap_historical(limit=500)
-        logger.info("bootstrap_complete", bars=bars_loaded)
+        bars_1m_loaded = await self._binance.bootstrap_1m_historical(limit=100)
+        logger.info("bootstrap_complete", bars=bars_loaded, bars_1m=bars_1m_loaded)
 
         # System health report on first bot active (Railway start).
         # This should be lightweight and never crash the bot.
@@ -1785,7 +1786,6 @@ class TradingBot:
 
     # ── Slingger Hunter V5: Dual-Stage Shadow Monitor (DRY-RUN ONLY) ──
     # [MANDAT-DRYRUN] Slingger V5 DILARANG eksekusi riil (Shadow Entry Only).
-
     def _init_shadow_scalp(self, market_id: str, side: str, entry: float, exit: float, prob: float,
                            stake_usd: float, shares: float, depth_usd_at_entry: float,
                            btc_vs_strike_pct: float, ttr: int) -> None:
@@ -1818,6 +1818,53 @@ class TradingBot:
             'fee_paid':             None,
             'net_pnl':              None,
         }
+
+    def _verify_binance_buffer(self) -> bool:
+        """Check 30min OHLCV buffer exists"""
+        buffer = self._binance.ohlcv_1m_buffer
+        if len(buffer) < 30:
+            logger.error("insufficient_binance_data", bars=len(buffer))
+            return False
+        return True
+
+    def _compute_btc_realized_vol_live(self, binance_ohlcv_30m: pd.DataFrame) -> float:
+        """
+        Compute annualized realized volatility from 30min Binance OHLCV
+        Matches training pipeline exactly
+        """
+        import pandas as pd
+        import numpy as np
+        # Extract close prices
+        closes = binance_ohlcv_30m['close']
+        
+        # Compute log returns
+        log_returns = np.log(closes / closes.shift(1)).dropna()
+        
+        # Standard deviation
+        sigma = log_returns.std()
+        
+        # Annualize (assuming 5-minute bars in 30min window = 6 bars)
+        # Trading year = 365 days * 24 hours * 12 (5min bars/hour) = 105,120 bars
+        annualization_factor = np.sqrt(105120)
+        
+        volatility_annualized = sigma * annualization_factor
+        
+        # Sanity check: Should be 0.30-0.80 typically
+        if volatility_annualized < 0.1 or volatility_annualized > 2.0:
+            logger.warning("volatility_outside_expected_range", val=round(volatility_annualized, 4))
+        
+        return float(volatility_annualized)
+
+    def _audit_feature_ranges(self, btc_vol: float) -> float:
+        """Verify live features are within acceptable limits"""
+        try:
+            # 0.05 <= volatility <= 2.50
+            if not (0.05 <= btc_vol <= 2.50):
+                raise AssertionError(f"Volatility out of bounds: {btc_vol:.4f}")
+            return btc_vol
+        except AssertionError as e:
+            logger.warning("volatility_safety_audit_failed", error=str(e), fallback=0.45)
+            return 0.45
 
     async def _run_slingger_v5(self, market: ActiveMarket, clob_state: CLOBState, fv: FeatureVector, oracle_price: float) -> None:
         """
@@ -1866,27 +1913,20 @@ class TradingBot:
         no_token = market.clob_token_ids.get("NO", "")
         
         hist_yes_snap = self._clob.get_historical_book_snapshot(yes_token, lookback) if yes_token else None
-        hist_yes_range = self._clob.get_historical_books_range(yes_token, lookback) if yes_token else []
         
-        # [VOLATILITY FIX] Internal Polymarket Volatility (replacing Alpha V1 RV mismatch)
-        import statistics
-        if len(hist_yes_range) >= 5:
-            # Replikasi algoritma training: std dari perubahan implied bid
-            # implied bid = 1.0 - ask
-            bids = []
-            for h in hist_yes_range:
-                h_ask = self._clob._best_ask(h) 
-                if h_ask is not None:
-                    bids.append(1.0 - h_ask)
-            
-            if len(bids) >= 5:
-                # Calculate daily-scaled volatility proxy as used in training
-                diffs = [bids[i] - bids[i-1] for i in range(1, len(bids))]
-                poly_vol = statistics.stdev(diffs)
-            else:
-                poly_vol = 0.0
+        # [VOLATILITY FIX] Compute annualized volatility from 30min Binance OHLCV
+        import pandas as pd
+        if self._verify_binance_buffer():
+            ohlcv_1m = self._binance.ohlcv_1m_buffer
+            recent_1m = ohlcv_1m[-30:]
+            df_1m = pd.DataFrame(recent_1m)
+            df_5m = df_1m.iloc[::5].copy()
+            raw_btc_vol = self._compute_btc_realized_vol_live(df_5m)
+            btc_vol = self._audit_feature_ranges(raw_btc_vol)
         else:
-            poly_vol = 0.0
+            btc_vol = 0.45  # fallback to historical average if buffer not ready
+            
+        logger.info("btc_realized_vol_live", value=round(btc_vol, 4))
 
         if hist_yes_snap:
             # Simple bid price velocity
@@ -1911,7 +1951,7 @@ class TradingBot:
             'depth_imbalance_t0':        (clob_state.yes_depth_usd - clob_state.no_depth_usd) / max(clob_state.yes_depth_usd + clob_state.no_depth_usd, 1.0),
             'price_velocity_30s':        price_velocity_30s,
             'depth_trend_30s':           base_features.get("clob_depth_delta", 0.0),
-            'btc_realized_vol_prior_30m': poly_vol,
+            'btc_realized_vol_prior_30m': btc_vol,
             'ttr_at_signal':             (market.T_resolution - now).total_seconds(),
             'market_hour_utc':           now.hour,
             'day_of_week':               now.weekday(),

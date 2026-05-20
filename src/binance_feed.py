@@ -190,6 +190,31 @@ class BinanceFeed:
             logger.error("binance_bootstrap_failed", error=str(e))
             return 0
 
+    async def bootstrap_1m_historical(self, limit: int = 100) -> int:
+        """
+        Bootstrap 1m OHLCV buffer with historical data from REST API.
+        Returns number of bars loaded.
+        """
+        params = {"symbol": "BTCUSDT", "interval": "1m", "limit": limit}
+        try:
+            resp = await self._rest_get("/api/v3/klines", params=params)
+            klines = resp.json()
+
+            for k in klines:
+                bar = self._parse_rest_kline(k)
+                if bar and self._validate_bar(bar):
+                    self._ohlcv_1m_buffer.append(bar)
+
+            logger.info(
+                "binance_1m_bootstrap_complete",
+                bars_loaded=len(self._ohlcv_1m_buffer),
+            )
+            return len(self._ohlcv_1m_buffer)
+
+        except Exception as e:
+            logger.error("binance_1m_bootstrap_failed", error=str(e))
+            return 0
+
     async def fetch_rest_klines(
         self, limit: int = 500, start_time: Optional[int] = None
     ) -> List[Dict[str, Any]]:
