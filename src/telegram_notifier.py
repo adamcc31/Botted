@@ -447,11 +447,11 @@ class SlingshotAlerts:
 
     @staticmethod
     def heartbeat(data: dict) -> str:
-        return "[ALPHA V1] 💓 HEARTBEAT / MARKET WATCH\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[SLINGGER V5] 💓 HEARTBEAT / MARKET WATCH\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def session_report(title: str, data: dict) -> str:
-        return f"[ALPHA V1] 📊 {title}\n\n" + SlingshotAlerts._tg_kv(data)
+        return f"[SLINGGER V5] 📊 {title}\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def order_execution(title: str, data: dict) -> str:

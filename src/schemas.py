@@ -388,7 +388,7 @@ class SessionMetrics(BaseModel):
     capital_end: float = 0.0
     dry_run_score: float = 0.0
     pass_fail: Optional[Literal["PASS", "FAIL"]] = None
-    model_version: Optional[str] = ""
+    model_version: Optional[str] = None
     ws_drop_rate_pct: float = 0.0
     clob_stale_events: int = 0
     consecutive_losses: int = 0
