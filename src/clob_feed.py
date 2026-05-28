@@ -69,6 +69,9 @@ class CLOBFeed:
         self._history_maxlen = 100
         self._clob_history: Dict[str, Deque[dict]] = {}
 
+        # [FIX-07] Market-ID → token-ID mapping for proper cleanup
+        self._market_token_map: Dict[str, set] = {}
+
     # ── Public Properties ─────────────────────────────────────
 
     @property
@@ -193,6 +196,9 @@ class CLOBFeed:
         if not yes_token or not no_token:
             logger.warning("clob_missing_token_ids", market_id=market.market_id)
             return None
+
+        # [FIX-07] Record market → token mapping for cleanup
+        self._market_token_map[market.market_id] = {yes_token, no_token}
 
         new_tokens = {yes_token, no_token}
         if self._active_tokens != new_tokens:
@@ -443,19 +449,15 @@ class CLOBFeed:
     def cleanup_market(self, market_id: str) -> None:
         """
         Explicitly free all cached data for a resolved/expired market.
-
-        Called by main.py when a market is resolved, expired, or stopped.
-        Prevents progressive memory leak from unbounded _clob_history growth.
+        [FIX-07] Now properly cleans _cached_books, _last_fetch_time_per_token,
+        and _clob_history using the market → token mapping.
         """
-        # Clean history deque
-        try:
-            del self._clob_history[market_id]
-            logger.info("clob_history_cleaned", market_id=market_id[:16])
-        except KeyError:
-            pass
+        # [FIX-07] Get associated token_ids and clean all per-token caches
+        tokens = self._market_token_map.pop(market_id, set())
+        for token_id in tokens:
+            self._cached_books.pop(token_id, None)
+            self._last_fetch_time_per_token.pop(token_id, None)  # [FIX-10]
+            self._clob_history.pop(token_id, None)
 
-        # Clean cached books for any token_ids associated with this market
-        # (token_ids are not keyed by market_id in _cached_books, but
-        #  rotating subscriptions in fetch_clob_snapshot already handles that)
-
-        logger.debug("clob_market_cleanup_complete", market_id=market_id[:16])
+        logger.debug("clob_market_cleanup_complete", market_id=market_id[:16],
+                      tokens_cleaned=len(tokens))

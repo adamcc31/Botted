@@ -68,7 +68,7 @@ class SlingshotHunterV5:
         )
         return self
 
-    def predict(self, feature_dict: dict) -> dict:
+    def predict(self, feature_dict: dict, live_entry_odds: float = 0.50) -> dict:
         """
         Input:  dict of feature_name -> value (matches self.features list)
         Output: dict with keys:
@@ -97,9 +97,10 @@ class SlingshotHunterV5:
             # [FIX-THRESHOLD] Raised from 0.55 to 0.65 based on Kelly breakeven analysis.
             enter_threshold = self.metadata.get("enter_threshold", 0.65)
 
-            # [FIX-EV-1] Inline Kelly validation as final gate
-            entry_odds = self.metadata["optimal_entry_odds"]
-            exit_odds = self.metadata["optimal_exit_odds"]
+            # [FIX-11] entry_odds from live CLOB bid, NOT stale metadata.
+            # exit_odds hardcoded to 0.80 (Polymarket scalp target).
+            entry_odds = live_entry_odds
+            exit_odds = 0.80
             fee = self.metadata.get("polymarket_fee", 0.02)
 
             gross_return = (exit_odds - entry_odds) / entry_odds if entry_odds > 0 else 0.0
@@ -159,7 +160,7 @@ class SlingshotHunterV5:
             'market_hour_utc':           12.0,
             'day_of_week':               0.0
         }
-        res = self.predict(v5_input)
+        res = self.predict(v5_input, live_entry_odds=entry_odds)
         return {
             "decision": "PASS" if res['signal'] == "ENTER" else "REJECT",
             "p_win": res['swing_probability'],
@@ -171,7 +172,3 @@ class SlingshotHunterV5:
     def is_loaded(self) -> bool:
         return self._loaded
 
-
-# ── Backward compatibility aliases ─────────────────────────────
-ShadowPredatorV4 = SlingshotHunterV5
-DualXGBoostGate = XGBoostGate

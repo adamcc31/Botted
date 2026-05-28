@@ -1,3 +1,6 @@
+# [ISOLATED - ALPHA V1 ARTIFACT]
+# Scheduled for deletion in Sprint 6.
+# No new code should call this module.
 """
 dry_run.py — Paper trading engine with PASS/FAIL evaluation.
 

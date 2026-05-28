@@ -72,13 +72,14 @@ from src.binance_feed import BinanceFeed
 from src.clob_feed import CLOBFeed
 from src.config_manager import ConfigManager
 
-from src.dry_run import DryRunEngine
+# TODO(Sprint 6): Remove DryRunEngine dependency — V5 has native database
+from src.dry_run import DryRunEngine  # [ISOLATED - ALPHA V1 ARTIFACT]
 from src.dual_feed import DualFeed
 from src.execution import ExecutionClient
 from src.exporter import Exporter
 from src.feature_engine import FeatureEngine
 from src.market_discovery import MarketDiscovery
-from model_training.inference import XGBoostGate
+# [FIX-03] Alpha V1 XGBoostGate removed — Slingger V5 is sole trading engine
 from model_training.dual_inference import SlingshotHunterV5
 from src.telegram_notifier import SlingshotAlerts
 from src.fair_probability import FairProbabilityEngine
@@ -87,6 +88,7 @@ from src.signal_generator import SignalGenerator
 from src.spread_filter import SpreadFilter
 from src.telegram_notifier import TelegramNotifier
 from src.database import DatabaseManager
+from src.v5_database import V5DatabaseManager
 from src.vatic_feed import VaticFeed
 from src.utils import compute_position_size, fmt_money
 from sqlalchemy import text
@@ -109,19 +111,9 @@ class TradingBot:
 
     def __init__(self, mode: str = "dry-run", confirm_live: bool = False) -> None:
         self._requested_mode = mode
-        # ── DRY-RUN HARD LOCK UNTUK ALPHA V1 ENDURANCE RUN (Hingga 4 Mei 2026) ──
-        # Kunci absolut: Bot TIDAK DIIZINKAN untuk melakukan trading live
-        # dan hanya menulis status transaksi ke SQLite / trades.csv (Mock Trade).
-        lock_expiry = datetime(2026, 5, 4, tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) < lock_expiry:
-            if mode == "live":
-                logger.warning("DRY_RUN_HARD_LOCK_ACTIVE: Mengubah mode 'live' menjadi 'dry-run' secara paksa hingga 4 Mei 2026.")
-            self._mode = "dry-run"
-            self._requested_mode = "dry-run"
-            self._confirm_live = False
-        else:
-            self._mode = "dry-run" if mode == "live" else mode
-            self._confirm_live = confirm_live
+        # [FIX-04] Clean mode assignment — V1 hard lock removed
+        self._mode = mode
+        self._confirm_live = confirm_live
 
         self._running = False
         self._live_enabled = False
@@ -139,9 +131,10 @@ class TradingBot:
         self._vatic_feed = VaticFeed(on_strike_price=self._discovery.inject_vatic_strike)
         self._clob = CLOBFeed(self._config)
         self._feature_engine = FeatureEngine(self._config)
-        self._xgboost_gate = XGBoostGate()
+        # [FIX-03] XGBoostGate removed — Alpha V1 retired
         self._signal_gen = SignalGenerator(self._config)
         self._db = DatabaseManager()
+        self._v5_db = V5DatabaseManager()  # [FIX-14] V5 native database
         self._risk_mgr = RiskManager(self._config, self._db)
         self._execution = ExecutionClient(self._config)
         self._fair_prob_engine = FairProbabilityEngine(self._config)
@@ -195,9 +188,11 @@ class TradingBot:
         self._MAX_POST_MORTEM_ENTRIES: int = 200
         self._active_bets: dict[str, object] = {}  # market_id → active SignalResult
         
+        import uuid as _uuid_mod  # [FIX-15] for trade_id generation
+        self._uuid_mod = _uuid_mod
         from collections import deque
         self._odds_history: dict[str, deque] = {}   # per market_id
-        self._binance_price_history: deque = deque()  # global
+        self._binance_price_history: deque = deque(maxlen=4500)  # [FIX-08] hard cap: 90s × 50 ticks/s
         
         # [FIX-V5-VISIBILITY] V5 evaluation counter for monitoring
         # Tracks total evaluations so Telegram heartbeat can confirm V5 is running
@@ -486,38 +481,48 @@ class TradingBot:
                 break
                 
             try:
-                xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
-                               getattr(self._xgboost_gate, 'model_version', None) or 
-                               "Slingger V5 (Lone Wolf)")
-                metrics = self._dry_run.compute_session_metrics(xgb_version)
+                # [FIX-17] Trigger C: Query V5 session state as Single Source of Truth
+                v5_session = await self._v5_db.get_session_state()
+
+                if v5_session:
+                    trades_exec = v5_session["trades_executed"]
+                    wins = v5_session["trades_win"]
+                    total_pnl = v5_session["total_pnl_usd"]
+                    capital = v5_session["capital_current"]
+                    wr = f"{wins / max(trades_exec, 1) * 100:.1f}%"
+                else:
+                    trades_exec = 0
+                    wins = 0
+                    total_pnl = 0.0
+                    capital = 50.0
+                    wr = "N/A"
+
                 summary = {
-                    "trades_executed": metrics.trades_executed,
-                    "win_rate (trades)": f"{metrics.win_rate*100:.1f}%" if metrics.win_rate is not None else "N/A",
-                    "pnl_usd": f"${metrics.total_pnl_usd:.2f}" if metrics.total_pnl_usd is not None else "N/A",
-                    "capital": f"${metrics.capital_end:.2f}" if metrics.capital_end is not None else "N/A",
-                    "duration_hours": f"{metrics.duration_hours:.1f}" if metrics.duration_hours else "N/A",
+                    "trades_executed": trades_exec,
+                    "win_rate (trades)": wr,
+                    "pnl_usd": f"${total_pnl:.2f}",
+                    "capital": f"${capital:.2f}",
                 }
-                
+
                 # Append signal aggregation
                 sig_summary = await self._get_signal_summary()
-                
+
                 # V5 Heartbeat Health
                 v5_health = {
                     "v5_active_scalps": len(self._shadow_scalps),
-                    "v5_capital": f"${self._session_stats['current_capital']:.2f}",
-                    "v5_persistence": "ACTIVE (SQLite)"
+                    "v5_capital": f"${capital:.2f}",
+                    "v5_persistence": "ACTIVE (V5 SQLite)"
                 }
 
                 # Combine reports
                 combined = {**sig_summary, **{"---": "---"}, **v5_health, **{"---": "---"}, **summary}
-                sum_text = self._tg_kv(combined)
-                
+
                 msg_text = SlingshotAlerts.session_report(f"Session Report ({report_hours:.0f}h)", combined)
                 await self._send_telegram(
                     f"Session Report ({report_hours:.0f}h)", msg_text
                 )
                 logger.info("telegram_periodic_report_sent_text_only")
-                    
+
             except Exception as e:
                 logger.error("periodic_report_loop_error", error=str(e), exc_info=True)
 
@@ -550,23 +555,21 @@ class TradingBot:
         self._running = True
 
         await self._db.init_db()
-        
+
+        # [FIX-14] Initialize V5 native database
+        await self._v5_db.init_db()
+        # TODO(Sprint 6): Generate session_id independently from DryRunEngine
+        await self._v5_db.init_session(
+            session_id=self._dry_run.session_id,
+            capital_start=50.0,
+        )
+
         # Guardrail 2: Hydrate V5 State (Capital & Trades)
         await self._hydrate_v5_state()
 
         logger.info("market_filter_active", slug_prefix=SLUG_PREFIX, is_ultrashort=IS_ULTRASHORT)
 
-        # Load models
-        try:
-            # ALPHA V1 RETIRED: Model loading disabled to prevent CPU/memory consumption in production.
-            logger.info("alpha_v1_disabled_skipping_model_load")
-            # self._xgboost_gate.load_model(Path("models/alpha_v1"))
-        except Exception as e:
-            logger.warning(
-                "no_v1_model_loaded",
-                info=f"V1 model not available: {e}.",
-            )
-            
+        # [FIX-03] Alpha V1 model loading removed — only V5 Slingger active
 
         # Load Slingger Hunter V5
         try:
@@ -731,10 +734,8 @@ class TradingBot:
         await self._db.close()
 
         # Export session data
-        xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
-                       getattr(self._xgboost_gate, 'model_version', None) or 
-                       "Slingger V5 (Lone Wolf)")
-        metrics = self._dry_run.compute_session_metrics(xgb_version)
+        # TODO(Sprint 6): Replace DryRunEngine metrics with V5 native DB in stop()
+        metrics = self._dry_run.compute_session_metrics("Slingger V5")
         if self._exporter:
             self._exporter.export_session(
                 trades=self._dry_run._resolved_trades,
@@ -1004,436 +1005,8 @@ class TradingBot:
         logger.debug("alpha_v1_disabled_skipping_directional_flow")
         return
 
-        # ── ML Features Collection (MUST happen before XGBoost gate) ─
-        ml_features = {}
-        if fv:
-            ml_features = dict(zip(fv.feature_names, fv.values))
-            
-        m_id = market.market_id
-        odds_hist = self._odds_history.get(m_id)
-        odds_60s_ago = self._get_value_n_seconds_ago(odds_hist, 60, tolerance_seconds=30)
-        ml_features["odds_yes_60s_ago"] = odds_60s_ago
-        if odds_60s_ago is not None and clob_state:
-            ml_features["odds_delta_60s"] = clob_state.yes_ask - odds_60s_ago
-        else:
-            ml_features["odds_delta_60s"] = None
-
-        btc_60s_ago = self._get_value_n_seconds_ago(self._binance_price_history, 60, tolerance_seconds=30)
-        current_btc = self._binance.latest_price
-        if btc_60s_ago is not None and btc_60s_ago > 0 and current_btc is not None:
-            ml_features["btc_return_1m"] = (current_btc - btc_60s_ago) / btc_60s_ago
-        else:
-            ml_features["btc_return_1m"] = None
-
-        # ── Build RAW_FEATURES dict for XGBoost gate ──────────────
-        # Map FeatureEngine 24-feature names → training CSV column names
-        # that inference.py / build_features() expects.
-        obi_val = ml_features.get("OBI")
-        tfm_val = ml_features.get("TFM_normalized")
-        vol_pct = ml_features.get("vol_percentile")
-        
-        xgb_raw_features = {
-            # Microstructure (from FeatureEngine)
-            "obi_value":           obi_val,
-            "tfm_value":           tfm_val,
-            "depth_ratio":         ml_features.get("depth_ratio"),
-            "obi_tfm_product":     (obi_val or 0) * (tfm_val or 0),
-            "obi_tfm_alignment":   1.0 if (obi_val or 0) * (tfm_val or 0) > 0 else 0.0,
-            # Volatility
-            "rv_value":            ml_features.get("RV"),
-            "vol_percentile":      vol_pct,
-            # Strike-relative
-            "strike_distance_pct": ml_features.get("strike_distance_pct"),
-            "contest_urgency":     ml_features.get("contest_urgency"),
-            "ttr_seconds":         (market.T_resolution - datetime.now(timezone.utc)).total_seconds(),
-            # CLOB / Market odds
-            "odds_yes":            clob_state.yes_ask if clob_state else None,
-            "odds_no":             clob_state.no_ask if clob_state else None,
-            "entry_odds":          clob_state.yes_ask if clob_state else None,
-            "odds_yes_60s_ago":    odds_60s_ago,
-            "odds_delta_60s":      ml_features.get("odds_delta_60s"),
-            # Price / Spread
-            "spread_pct":          getattr(spread_result, "spread_pct", None),
-            "btc_return_1m":       ml_features.get("btc_return_1m"),
-            # Velocity (Task 1)
-            "clob_spread_vel":     ml_features.get("clob_spread_vel"),
-            "clob_depth_delta":    ml_features.get("clob_depth_delta"),
-            # Signal engine
-            "confidence_score":    q_fair,
-            "signal_direction":    "BUY_UP" if q_fair > clob_state.yes_ask else "BUY_DOWN",
-            # Timestamp for hour_wib / is_weekend features
-            "timestamp":           datetime.now(timezone.utc).isoformat(),
-        }
-
-        # ── Probability Source Selection (XGBoost Alpha V1) ────
-        p_model = q_fair
-        # Even if shadow mode is on, we always run V1 unless V5 has taken control
-        if not self._enable_dual_execution or not self._slingger.is_loaded:
-            if fv and self._xgboost_gate.is_loaded:
-                gate_res = self._xgboost_gate.evaluate_signal(
-                    raw_features=xgb_raw_features,
-                    entry_odds=clob_state.yes_ask if clob_state else 0.5,
-                )
-                
-                if gate_res["decision"] == "PASS":
-                    p_model = gate_res["p_win"]
-                    logger.info(
-                        "ml_model_signal_passed",
-                        p_win=round(p_model, 4),
-                        ev=round(gate_res["ev"], 4),
-                    )
-                else:
-                    logger.debug("ml_model_signal_rejected", reason=gate_res["reason"])
-        
-        logger.info(
-            "probability_source_applied",
-            q_fair=round(q_fair, 4),
-            p_model=round(p_model, 4),
-            uncertainty_u=round(uncertainty_u, 4),
-        )
-
-        # Determine confidence bucket based on ML probability
-        # Determine quantitative confidence bucket for ML features
-        confidence_bucket = None
-        if p_model is not None:
-            if p_model < 0.30: confidence_bucket = '0-30'
-            elif p_model < 0.50: confidence_bucket = '30-50'
-            elif p_model < 0.70: confidence_bucket = '50-70'
-            else: confidence_bucket = '70-100'
-        ml_features["confidence_bucket"] = confidence_bucket
-
-        # ── Signal Generation ─────────────────────────────────
-        signal = self._signal_gen.evaluate(
-            p_model, uncertainty_u, clob_state, market, fv
-        )
-        
-        signal.entry_odds_source = entry_odds_source
-
-        # ── Enrich signal with dual-feed tracking fields ──────
-        binance_price_now = self._binance.latest_price
-        signal.binance_price_at_signal = binance_price_now
-        signal.chainlink_price_at_signal = oracle_price
-        signal.spread_pct_at_signal = spread_result.spread_pct
-        signal.oracle_vs_binance_at_entry = round(
-            abs(oracle_price - (binance_price_now or oracle_price)), 2
-        )
-        signal.spread_filter_passed = spread_result.passed
-        signal.spread_filter_reason = spread_result.reason
-        signal.strike_price_source = "GAMMA"  # strike always from Gamma API
-        signal.odds_source = "CLOB"  # odds always from CLOB order book
-        signal.oracle_source = oracle_source
-
-        # Guard: tunggu verifikasi strike selesai (max 15 detik)
-        if not self._discovery.is_strike_verified:
-            for _ in range(15):
-                await asyncio.sleep(1.0)
-                if self._discovery.is_strike_verified:
-                    break
-            if not self._discovery.is_strike_verified:
-                logger.warning("strike_unverified_skipping_record",
-                               market_id=market.market_id,
-                               source=getattr(market, "strike_price_source", None))
-                return  # skip record daripada tulis data corrupt
-
-        if entry_odds_source == "DEFAULT_FALLBACK":
-            blocked = SignalResult(
-                signal="ABSTAIN",
-                abstain_reason="CONTAMINATED_FALLBACK_ODDS",
-                clob_yes_ask=signal.clob_yes_ask,
-                clob_no_ask=signal.clob_no_ask,
-                P_model=signal.P_model,
-                TTR_minutes=signal.TTR_minutes,
-                strike_price=signal.strike_price,
-                current_price=signal.current_price,
-                strike_distance=signal.strike_distance,
-                market_id=signal.market_id,
-                timestamp=signal.timestamp,
-                entry_odds_source=entry_odds_source,
-            )
-            blocked.binance_price_at_signal = self._binance.latest_price
-            self._latest_signal = blocked
-            await self._dry_run.record_signal(blocked, slug=market.slug, ml_features=ml_features)
-            logger.info("signal_skipped_contaminated_fallback", market_id=market.market_id)
-            return
-
-        self._latest_signal = signal
-        await self._dry_run.record_signal(signal, slug=market.slug, ml_features=ml_features)
-
-
-        # ── ONE-BET-PER-MARKET RULE ───────────────────────────
-        # Only one active position/pending signal per market_id.
-        m_id = market.market_id
-        if signal.signal != "ABSTAIN" and m_id in self._active_bets:
-            existing = self._active_bets[m_id]
-            # Keep the signal with higher P_model confidence
-            existing_conf = existing.P_model if hasattr(existing, 'P_model') else 0.0
-            new_conf = signal.P_model
-            if new_conf <= existing_conf:
-                logger.info(
-                    "one_bet_rule_blocked",
-                    market_id=m_id,
-                    blocked_signal=signal.signal,
-                    blocked_p_model=round(new_conf, 4),
-                    active_signal=existing.signal if hasattr(existing, 'signal') else 'UNKNOWN',
-                    active_p_model=round(existing_conf, 4),
-                    reason="one_bet_per_market",
-                )
-                # Record blocked signal to SQLite for analysis
-                blocked = signal.model_copy(update={
-                    "signal": "ABSTAIN",
-                    "abstain_reason": "BLOCKED_ONE_BET",
-                    "entry_odds_source": entry_odds_source,
-                })
-                await self._dry_run.record_signal(blocked, slug=market.slug, ml_features=ml_features)
-                return
-            else:
-                # New signal is stronger — replace active bet
-                logger.info(
-                    "one_bet_rule_replaced",
-                    market_id=m_id,
-                    new_signal=signal.signal,
-                    new_p_model=round(new_conf, 4),
-                    replaced_signal=existing.signal if hasattr(existing, 'signal') else 'UNKNOWN',
-                    replaced_p_model=round(existing_conf, 4),
-                )
-
-        # ── Post-Mortem Aggregator ────────────────────────────
-        if signal.signal == "ABSTAIN":
-            m_id = market.market_id
-            if m_id not in self._post_mortem_tracker:
-                # [FIX-MEM-3] Enforce cap: evict oldest entry if at limit.
-                # Counter objects inside each entry grow with each ABSTAIN reason,
-                # so unbounded accumulation is a genuine memory leak at high eval rates.
-                if len(self._post_mortem_tracker) >= self._MAX_POST_MORTEM_ENTRIES:
-                    oldest_key = next(iter(self._post_mortem_tracker))
-                    del self._post_mortem_tracker[oldest_key]
-                    logger.debug("post_mortem_tracker_evicted", evicted_key=oldest_key[:16],
-                                 tracker_size=len(self._post_mortem_tracker))
-
-                self._post_mortem_tracker[m_id] = {
-                    "evals": 0,
-                    "reasons": Counter(),
-                    "max_edge": 0.0
-                }
-                asyncio.create_task(
-                    self._schedule_post_mortem(market),
-                    name=f"pm_{m_id[:8]}"
-                )
-
-            stats = self._post_mortem_tracker[m_id]
-            stats["evals"] += 1
-            if signal.abstain_reason:
-                stats["reasons"][signal.abstain_reason] += 1
-
-            current_max_edge = max(signal.edge_yes or 0.0, signal.edge_no or 0.0)
-            if current_max_edge > stats["max_edge"]:
-                stats["max_edge"] = current_max_edge
-            return
-
-        # ── STEP 2: Live Edge Verification (Execution Gates) ──────────
-        fresh_clob = await self._clob.fetch_clob_snapshot(market)
-        if not fresh_clob:
-            logger.warning("live_verification_failed_clob_unavailable")
-            return
-
-        real_best_ask = fresh_clob.yes_ask if signal.signal == "BUY_UP" else fresh_clob.no_ask
-        synthetic_edge = signal.edge_yes if signal.signal == "BUY_UP" else signal.edge_no
-        p_outcome = signal.P_model if signal.signal == "BUY_UP" else (1.0 - signal.P_model)
-        # Guard clause for edge calculation
-        if signal.uncertainty_u is None or real_best_ask is None:
-            logger.warning("edge_verification_missing_input", market_id=market.market_id)
-            return
-
-        live_edge = p_outcome - signal.uncertainty_u - real_best_ask
-        
-        if synthetic_edge is None or live_edge is None:
-            logger.warning("edge_verification_null", market_id=market.market_id)
-            return
-            
-        edge_deviation = abs(synthetic_edge - live_edge)
-
-        max_buy_price = float(self._config.get("risk.max_buy_price", 0.75))
-        edge_tolerance = float(self._config.get("risk.live_edge_tolerance", 0.05))
-        margin_of_safety = float(self._config.get("signal.margin_of_safety", 0.02))
-
-        # Gate 1: Hard Cap
-        if real_best_ask > max_buy_price:
-            logger.info("trade_aborted", reason="PRICE_EXCEEDS_MAX_CAP", price=real_best_ask, cap=max_buy_price)
-            return
-
-        # Gate 2: Tolerance
-        if edge_deviation > edge_tolerance:
-            logger.info("trade_aborted", reason="EDGE_DEVIATION_TOO_HIGH", synthetic=round(synthetic_edge, 4), live=round(live_edge, 4), dev=round(edge_deviation, 4))
-            return
-
-        # Gate 3: Live Edge Positive
-        if live_edge <= margin_of_safety:
-            logger.info("trade_aborted", reason="LIVE_EDGE_NEGATIVE", live_edge=round(live_edge, 4), threshold=margin_of_safety)
-            return
-
-        # Update signal with live verification data for risk and logging
-        signal.live_yes_ask = fresh_clob.yes_ask
-        signal.live_no_ask = fresh_clob.no_ask
-        signal.synthetic_edge = synthetic_edge
-        signal.live_edge = live_edge
-        
-        # Override CLOB prices in signal to ensure Kelly uses real_best_ask
-        if signal.signal == "BUY_UP":
-            signal.clob_yes_ask = real_best_ask
-        else:
-            signal.clob_no_ask = real_best_ask
-
-        # ── Risk Management ───────────────────────────────────
-        result = await self._risk_mgr.approve(signal, self._dry_run.capital)
-
-        from src.schemas import ApprovedBet, RejectedBet
-
-        if isinstance(result, RejectedBet):
-            logger.info("trade_rejected", reason=result.reason)
-            return
-
-        approved = result
-        assert isinstance(approved, ApprovedBet)
-
-        # ── Execute Trade (Dry Run / Paper Trading) ───────────────────────────
-        if self._mode == "dry-run":
-            # High-fidelity Paper Trading Execution
-            from src.zone_matrix import classify_zone
-            # V4 logic requires absolute USD distance and correct side entry odds
-            zone_res = classify_zone(
-                signal.TTR_minutes, 
-                abs(signal.current_price - signal.strike_price), 
-                signal.entry_odds
-            )
-            
-            paper_record = await self._paper_engine.execute_paper_trade(
-                signal=signal,
-                zone_result=zone_res,
-                bet_size=approved.bet_size,
-                market=market
-            )
-            
-            # Note: we still use DryRunEngine to maintain existing SQLite/CSV logs for legacy dashboards
-            trade = self._dry_run.simulate_trade(signal, approved, market)
-            self._discovery.mark_trade_executed()
-            self._active_bets[market.market_id] = signal  # Register active bet
-
-            # Telegram: trade opened (paper order).
-            asyncio.create_task(
-                self._send_telegram(
-                    "ORDER EXECUTION (PAPER-V4)",
-                    SlingshotAlerts.order_execution(
-                        "ORDER EXECUTION (PAPER-V4)",
-                        {
-                            "session_id": self._dry_run.session_id,
-                            "trade_id": paper_record.trade_id if paper_record else trade.trade_id,
-                            "market_id": trade.market_id,
-                            "signal": trade.signal_type,
-                            "entry_price": paper_record.simulated_fill_price if paper_record else trade.entry_price,
-                            "bet_size": trade.bet_size,
-                            "strike_price": trade.strike_price,
-                            "btc_now": self._binance.latest_price,
-                            "ttr_minutes": trade.TTR_at_entry,
-                            "status": "EXECUTED" if paper_record else "SLIPPED"
-                        }
-                    )
-                ),
-                name=f"tg_open_{trade.trade_id[:8]}",
-            )
-
-            # Schedule resolution
-            asyncio.create_task(
-                self._schedule_resolution(trade, market, paper_record),
-                name=f"resolve_{trade.trade_id[:8]}",
-            )
-        else:
-            # Live mode execution
-            fill_result = await self._execution.place_order(approved, market)
-            logger.info(
-                "live_order_result",
-                status=fill_result.status if hasattr(fill_result, "status") else "rejected",
-            )
-
-            # If nothing filled, release risk-manager position slot.
-            status = getattr(fill_result, "status", "").upper()
-            filled_size = getattr(fill_result, "filled_size", None)
-            effective_bet_size = None
-            if status in ("FILLED", "PARTIALLY_FILLED"):
-                if filled_size is not None and float(filled_size) > 0:
-                    effective_bet_size = float(filled_size)
-                else:
-                    # Fallback: treat as fully using the risk-approved size.
-                    effective_bet_size = float(approved.bet_size)
-            fill_price = getattr(fill_result, "fill_price", None)
-            if fill_price is None:
-                fill_price = (
-                    signal.clob_yes_ask
-                    if signal.signal == "BUY_UP"
-                    else signal.clob_no_ask
-                )
-
-            if effective_bet_size is None:
-                await self._risk_mgr.on_trade_resolved(0.0)
-            else:
-                trade = self._dry_run.simulate_trade(
-                    signal,
-                    approved,
-                    market,
-                    entry_price_override=float(fill_price),
-                    bet_size_override=float(effective_bet_size),
-                )
-                self._discovery.mark_trade_executed()
-
-                # Telegram: trade opened (shadow paper record for live).
-                asyncio.create_task(
-                    self._send_telegram(
-                        "ORDER EXECUTION (SHADOW LIVE)",
-                        SlingshotAlerts.order_execution(
-                            "ORDER EXECUTION (SHADOW LIVE)",
-                            {
-                                "session_id": self._dry_run.session_id,
-                                "trade_id": trade.trade_id,
-                                "market_id": trade.market_id,
-                                "signal": trade.signal_type,
-                                "entry_price": trade.entry_price,
-                                "bet_size": trade.bet_size,
-                                "strike_price": trade.strike_price,
-                                "btc_now": self._binance.latest_price,
-                                "ttr_minutes": trade.TTR_at_entry,
-                                "fill_status": status,
-                                "fill_price": fill_price,
-                                "filled_size": filled_size,
-                            }
-                        )
-                    ),
-                    name=f"tg_open_live_{trade.trade_id[:8]}",
-                )
-                asyncio.create_task(
-                    self._schedule_resolution(trade, market),
-                    name=f"resolve_live_{trade.trade_id[:8]}",
-                )
-
-        # Check abort conditions
-        abort = self._dry_run.check_abort_conditions(mode=self._mode)
-        if abort:
-            logger.critical("session_abort", reason=abort)
-            self._stop_reason = abort
-            asyncio.create_task(
-                self._send_telegram(
-                    "SESSION ABORTED",
-                    SlingshotAlerts.session_aborted(abort, self._dry_run.session_id)
-                ),
-                name="tg_abort",
-            )
-            asyncio.create_task(self.stop(), name="stop_after_abort")
-
-        # Update metrics
-        xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
-                       getattr(self._xgboost_gate, 'model_version', None) or 
-                       "Slingger V5 (Lone Wolf)")
-        self._latest_metrics = self._dry_run.compute_session_metrics(
-            xgb_version
-        )
+        # [FIX-02] Alpha V1 pipeline removed (430 lines of dead code).
+        # Only Slingger V5 pipeline above this point is active.
 
     def _on_binance_price_update(self, price: float) -> None:
         """Handler for real-time Binance price ticks."""
@@ -1639,10 +1212,10 @@ class TradingBot:
         min_total_trades = int(
             self._config.get("dry_run.go_live_min_total_trades", 100)
         )
-        xgb_version = (getattr(self._xgboost_gate, 'version', None) or 
-                       getattr(self._xgboost_gate, 'model_version', None) or 
-                       "Slingger V5 (Lone Wolf)")
-        metrics = self._dry_run.compute_session_metrics(xgb_version)
+        consec_pass = int(
+            self._config.get("dry_run.go_live_consecutive_pass", 5)
+        )
+        metrics = self._dry_run.compute_session_metrics("Slingger V5")  # [FIX-18]
 
         if metrics.trades_executed >= min_total_trades and metrics.pass_fail == "PASS":
             self._go_live_pass_streak += 1
@@ -1756,7 +1329,7 @@ class TradingBot:
                         now = datetime.now(timezone.utc)
                         m_id = market.market_id
                         if m_id not in self._odds_history:
-                            self._odds_history[m_id] = __import__("collections").deque()
+                            self._odds_history[m_id] = __import__("collections").deque(maxlen=4500)  # [FIX-09]
                         self._odds_history[m_id].append((now, state.yes_ask))
                         
                         cutoff = now - timedelta(seconds=90)
@@ -1790,7 +1363,9 @@ class TradingBot:
                            stake_usd: float, shares: float, depth_usd_at_entry: float,
                            btc_vs_strike_pct: float, ttr: int) -> None:
         import time as _time
+        trade_id = self._uuid_mod.uuid4().hex[:16]  # [FIX-15] unique trade_id
         self._shadow_scalps[market_id] = {
+            'trade_id':            trade_id,
             'token_side':          side,
             'entry_odds':          entry,
             'exit_odds':           exit,
@@ -1895,7 +1470,7 @@ class TradingBot:
         no_bid = clob_state.no_bid
         if (yes_bid is not None and yes_bid < 0.35) or (no_bid is not None and no_bid < 0.35):
             logger.debug("slingger_v5_underdog_block", yes_bid=yes_bid, no_bid=no_bid,
-                         reason="EV=-29.1%_at_odds_below_0.35")
+                         reason="EV_negative_at_odds_below_0.35")
             return
 
         if len(self._active_tasks) >= self._max_slingger_tasks:
@@ -1958,7 +1533,7 @@ class TradingBot:
         }
         
         logger.debug("slingger_v5_features_assembly", market_id=market.market_id, features=yes_feat)
-        res_yes = self._slingger.predict(yes_feat)
+        res_yes = self._slingger.predict(yes_feat, live_entry_odds=clob_state.yes_bid)  # [FIX-11]
         
         if res_yes['signal'] == 'ENTER':
             logger.info("slingger_v5_yes_signal", market_id=market.market_id, prob=res_yes['swing_probability'], kelly=res_yes['full_kelly'])
@@ -1971,7 +1546,7 @@ class TradingBot:
         no_feat['no_depth_t0']  = clob_state.yes_depth_usd
         no_feat['depth_imbalance_t0'] = -yes_feat['depth_imbalance_t0']
         
-        res_no = self._slingger.predict(no_feat)
+        res_no = self._slingger.predict(no_feat, live_entry_odds=clob_state.no_bid)  # [FIX-11]
         if res_no['signal'] == 'ENTER':
             logger.info("slingger_v5_no_signal", market_id=market.market_id, prob=res_no['swing_probability'], kelly=res_no['full_kelly'])
 
@@ -1987,11 +1562,9 @@ class TradingBot:
         if winner:
             res = res_yes if winner == 'YES' else res_no
             
-            # [FIX-PIPELINE-1] Sync V5 capital with primary DryRunEngine capital.
-            # Previously V5 tracked its own _session_stats['current_capital'] which
-            # diverged from V1's DryRunEngine capital. Now we use the canonical V1 source.
-            # This mirrors V1 RiskManager which always calls approve(capital=self._dry_run.capital).
-            primary_capital = self._dry_run.capital
+            # [FIX-15] Capital from V5 native database — no DryRunEngine dependency
+            v5_sess = await self._v5_db.get_session_state()
+            primary_capital = v5_sess['capital_current'] if v5_sess else 50.0
             self._session_stats['current_capital'] = primary_capital  # Keep in sync
 
             # Kalkulasi dana tertahan (locked margin) di shadow positions
@@ -2053,6 +1626,20 @@ class TradingBot:
                 btc_vs_strike_pct=btc_vs_strike_pct,
                 ttr=ttr
             )
+
+            # [FIX-15] Record trade in V5 native database
+            scalp = self._shadow_scalps[m_id]
+            await self._v5_db.record_new_trade(
+                trade_id=scalp['trade_id'],
+                market_id=m_id,
+                token_side=winner,
+                entry_odds=res['entry_odds'],
+                target_odds=res['exit_odds'],
+                entry_spread=clob_state.yes_ask - clob_state.yes_bid if clob_state.yes_ask and clob_state.yes_bid else 0.0,
+                stake_usd=sizing['stake_usd'],
+                shares=sizing['shares'],
+            )
+
             asyncio.create_task(self._save_v5_state())
             self._active_tasks[m_id] = asyncio.create_task(
                 self._shadow_scalp_monitor_loop(m_id),
@@ -2114,6 +1701,13 @@ class TradingBot:
 
                 # FASE 1: WAITING_ENTRY
                 if state['phase'] == 'WAITING_ENTRY':
+                    # [FIX-12] Sanity guard: reject fills at absurdly low prices
+                    if current_price < 0.35:
+                        logger.warning(
+                            f"HARD BLOCK: fill price {current_price:.3f} < 0.35 minimum, aborting fill. trade_id={state['trade_id']}"
+                        )
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
                     if current_price <= state['entry_odds']:
                         state['entry_filled'] = True
                         state['entry_fill_price'] = current_price
@@ -2170,6 +1764,14 @@ class TradingBot:
                         })
                         self._session_stats['current_capital'] += net_pnl
                         self._session_stats['total_fees'] += fee_paid
+
+                        # [FIX-16] Persist to V5 native database
+                        await self._v5_db.close_trade(
+                            trade_id=state.get('trade_id', market_id),
+                            status='WIN',
+                            exit_odds=current_price,
+                            pnl_usd=net_pnl,
+                        )
 
                         self._slingger_daily_stats['hit'] += 1
                         self._slingger_daily_stats['pnls'].append(net_pnl)
@@ -2235,6 +1837,16 @@ class TradingBot:
                                 'hold_seconds': latency_s,
                             })
                             
+                            # PnL from HOLD_TO_MATURITY requires on-chain
+                            # resolution data — set 0.0 until Sprint 6 resolver.
+                            await self._v5_db.close_trade(
+                                trade_id=state['trade_id'],
+                                status='HOLD_TO_MATURITY',
+                                exit_odds=current_price,
+                                pnl_usd=0.0,
+                                exit_ts=int(_time.time() * 1000)
+                            )
+                            
                             asyncio.create_task(
                                 self._send_telegram("SLINGGER V5", emergency_msg),
                                 name=f"slingger_emerg_{market_id[:8]}"
@@ -2258,6 +1870,14 @@ class TradingBot:
                                 'hold_seconds': latency_s,
                             })
                             self._session_stats['current_capital'] += net_pnl
+
+                            # [FIX-16] Persist EMERGENCY_EXIT to V5 native database
+                            await self._v5_db.close_trade(
+                                trade_id=state.get('trade_id', market_id),
+                                status='EMERGENCY_EXIT',
+                                exit_odds=current_price,
+                                pnl_usd=net_pnl,
+                            )
                             
                             # Update W/L Rekor Slingger
                             if is_win:
@@ -2324,6 +1944,16 @@ class TradingBot:
                             'hold_seconds': latency_s,
                         })
 
+                        # PnL from HOLD_TO_MATURITY requires on-chain
+                        # resolution data — set 0.0 until Sprint 6 resolver.
+                        await self._v5_db.close_trade(
+                            trade_id=state['trade_id'],
+                            status='HOLD_TO_MATURITY',
+                            exit_odds=current_price,
+                            pnl_usd=0.0,
+                            exit_ts=int(_time.time() * 1000)
+                        )
+
                         msg = SlingshotAlerts.emergency(
                             market_slug=market_slug,
                             ttr=ttr,
@@ -2337,8 +1967,6 @@ class TradingBot:
                             self._send_telegram("SLINGGER V5", msg),
                             name=f"slingger_stale_sync_{market_id[:8]}"
                         )
-                        break
-                        logger.info("slingger_miss", market_id=market_id)
                         break
                 
                 # Save state after each phase update or closure
@@ -2471,8 +2099,8 @@ class TradingBot:
             from src.database import V5StateRecord
             from sqlalchemy.dialects.sqlite import insert
             
-            # [FIX-PIPELINE-1] Always sync capital from primary DryRunEngine before saving
-            self._session_stats['current_capital'] = self._dry_run.capital
+            # [FIX-15] V5 DB is canonical source — no DryRunEngine sync needed
+            # Capital is managed exclusively through V5DatabaseManager.close_trade()
             
             # [FIX-STATE-SAVE] Only persist active scalps (WAITING_ENTRY | WAITING_EXIT)
             # CLOSED scalps are already cleaned up by cleanup_market() and don't need persistence
