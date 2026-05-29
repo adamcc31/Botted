@@ -122,6 +122,7 @@ class TradingBot:
         self._stopping = False
         self._run_started_at = datetime.now(timezone.utc)
         self._stop_reason: str = "UNKNOWN"
+        self._last_mem_snapshot = None  # [HOTFIX] tracemalloc delta baseline
 
         # Initialize components
         self._config = ConfigManager.get_instance()
@@ -2048,33 +2049,66 @@ class TradingBot:
     # ── Memory Audit Loop (tracemalloc) ────────────────────────
 
     async def _memory_audit_loop(self) -> None:
-        """[HOTFIX] Periodic tracemalloc snapshot for memory leak investigation.
-        Runs every 10 minutes, prints top-10 memory consumers with [MEM_AUDIT] prefix.
+        """[HOTFIX] Periodic tracemalloc DELTA snapshot for memory leak investigation.
+        Runs every 10 minutes, compares to previous snapshot to show what GREW.
         """
         INTERVAL = 600  # 10 minutes
+        SKIP_FILES = ('json/decoder.py', 'binance_feed.py')
         while self._running:
             await asyncio.sleep(INTERVAL)
             if not self._running:
                 break
             try:
-                snapshot = tracemalloc.take_snapshot()
+                current = tracemalloc.take_snapshot()
                 # Filter out importlib and tracemalloc internals
-                snapshot = snapshot.filter_traces([
+                current = current.filter_traces([
                     tracemalloc.Filter(False, '<frozen importlib._bootstrap>'),
                     tracemalloc.Filter(False, '<frozen importlib._bootstrap_external>'),
                     tracemalloc.Filter(False, tracemalloc.__file__),
                 ])
-                stats = snapshot.statistics('lineno')
+
                 ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                print(f"[MEM_AUDIT] ========== SNAPSHOT {ts} ==========")
-                print(f"[MEM_AUDIT] Rank | File:Line                    | Size (KB) | Count")
-                print(f"[MEM_AUDIT] -----|------------------------------|-----------|------")
-                for rank, stat in enumerate(stats[:10], 1):
-                    frame = stat.traceback[0]
-                    fname = f"{frame.filename}:{frame.lineno}"
-                    size_kb = stat.size / 1024
-                    print(f"[MEM_AUDIT] {rank:>4} | {fname:<28} | {size_kb:>9.1f} | {stat.count:>5}")
-                print(f"[MEM_AUDIT] ========== END SNAPSHOT ==========")
+
+                if self._last_mem_snapshot is not None:
+                    # Delta: what grew since last snapshot
+                    top_stats = current.compare_to(self._last_mem_snapshot, 'lineno')
+                    growing = [s for s in top_stats if s.size_diff > 0][:5]
+
+                    print(f"[MEM_AUDIT] ===== DELTA {ts} =====")
+                    print(f"[MEM_AUDIT] Rank | File:Line                    | +Size (KB) | +Count")
+                    print(f"[MEM_AUDIT] -----|------------------------------|------------|-------")
+                    for rank, stat in enumerate(growing, 1):
+                        frame = stat.traceback[0]
+                        fname = f"{frame.filename}:{frame.lineno}"
+                        size_diff_kb = stat.size_diff / 1024
+                        print(f"[MEM_AUDIT] {rank:>4} | {fname:<28} | {size_diff_kb:>+10.1f} | {stat.count_diff:>+6}")
+
+                    # Traceback for top non-json/non-binance_feed delta item
+                    for stat in top_stats:
+                        if stat.size_diff <= 0:
+                            continue
+                        frame = stat.traceback[0]
+                        if any(skip in frame.filename for skip in SKIP_FILES):
+                            continue
+                        # Found the top interesting delta — print traceback
+                        print(f"[MEM_AUDIT] TRACEBACK TOP DELTA:")
+                        for tb_frame in stat.traceback[:5]:
+                            print(f"[MEM_AUDIT]   File \"{tb_frame.filename}\", line {tb_frame.lineno}")
+                        break
+
+                    print(f"[MEM_AUDIT] ===== END DELTA =====")
+                else:
+                    # First run — baseline only, no delta available
+                    stats = current.statistics('lineno')
+                    print(f"[MEM_AUDIT] ===== BASELINE {ts} (next cycle will show delta) =====")
+                    for rank, stat in enumerate(stats[:5], 1):
+                        frame = stat.traceback[0]
+                        fname = f"{frame.filename}:{frame.lineno}"
+                        size_kb = stat.size / 1024
+                        print(f"[MEM_AUDIT] {rank:>4} | {fname:<28} | {size_kb:>9.1f} KB | {stat.count:>5}")
+                    print(f"[MEM_AUDIT] ===== END BASELINE =====")
+
+                self._last_mem_snapshot = current
                 sys.stdout.flush()
             except Exception as e:
                 print(f"[MEM_AUDIT] ERROR taking snapshot: {e}")
