@@ -18,6 +18,7 @@ import os
 import signal
 import sys
 import traceback
+import tracemalloc
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -660,6 +661,11 @@ class TradingBot:
         # Slingger daily summary scheduler
         asyncio.create_task(
             self._daily_summary_loop(), name="slingger_daily_summary"
+        )
+
+        # [HOTFIX] Memory audit loop — tracemalloc snapshot every 10 min
+        asyncio.create_task(
+            self._memory_audit_loop(), name="memory_audit_loop"
         )
 
         # Dry-run must finish within max duration (default 48h).
@@ -2039,6 +2045,41 @@ class TradingBot:
         # Ensure state is saved after cleanup
         asyncio.create_task(self._save_v5_state())
 
+    # ── Memory Audit Loop (tracemalloc) ────────────────────────
+
+    async def _memory_audit_loop(self) -> None:
+        """[HOTFIX] Periodic tracemalloc snapshot for memory leak investigation.
+        Runs every 10 minutes, prints top-10 memory consumers with [MEM_AUDIT] prefix.
+        """
+        INTERVAL = 600  # 10 minutes
+        while self._running:
+            await asyncio.sleep(INTERVAL)
+            if not self._running:
+                break
+            try:
+                snapshot = tracemalloc.take_snapshot()
+                # Filter out importlib and tracemalloc internals
+                snapshot = snapshot.filter_traces([
+                    tracemalloc.Filter(False, '<frozen importlib._bootstrap>'),
+                    tracemalloc.Filter(False, '<frozen importlib._bootstrap_external>'),
+                    tracemalloc.Filter(False, tracemalloc.__file__),
+                ])
+                stats = snapshot.statistics('lineno')
+                ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                print(f"[MEM_AUDIT] ========== SNAPSHOT {ts} ==========")
+                print(f"[MEM_AUDIT] Rank | File:Line                    | Size (KB) | Count")
+                print(f"[MEM_AUDIT] -----|------------------------------|-----------|------")
+                for rank, stat in enumerate(stats[:10], 1):
+                    frame = stat.traceback[0]
+                    fname = f"{frame.filename}:{frame.lineno}"
+                    size_kb = stat.size / 1024
+                    print(f"[MEM_AUDIT] {rank:>4} | {fname:<28} | {size_kb:>9.1f} | {stat.count:>5}")
+                print(f"[MEM_AUDIT] ========== END SNAPSHOT ==========")
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"[MEM_AUDIT] ERROR taking snapshot: {e}")
+                sys.stdout.flush()
+
     # ── Daily Summary Scheduler (Section 11) ──────────────────
 
     async def _daily_summary_loop(self) -> None:
@@ -2275,6 +2316,8 @@ def main(
     signal.signal(signal.SIGTERM, handle_shutdown)
 
     # Run
+    # [HOTFIX] Start tracemalloc before event loop for memory leak investigation
+    tracemalloc.start()
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:

@@ -166,7 +166,7 @@ class CLOBFeed:
                                             "book": event
                                         })
                                         
-                                        logger.info("clob_book_updated", source="websocket", token_id=token_id[:16])
+                                        logger.debug("clob_book_updated", source="websocket", token_id=token_id[:16])
                         except json.JSONDecodeError:
                             continue
                         except Exception as e:
