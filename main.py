@@ -2053,7 +2053,6 @@ class TradingBot:
         Runs every 10 minutes, compares to previous snapshot to show what GREW.
         """
         INTERVAL = 600  # 10 minutes
-        SKIP_FILES = ('json/decoder.py', 'binance_feed.py')
         while self._running:
             await asyncio.sleep(INTERVAL)
             if not self._running:
@@ -2070,36 +2069,27 @@ class TradingBot:
                 ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
                 if self._last_mem_snapshot is not None:
-                    # Delta: what grew since last snapshot
-                    top_stats = current.compare_to(self._last_mem_snapshot, 'lineno')
-                    growing = [s for s in top_stats if s.size_diff > 0][:5]
+                    # Delta: what grew since last snapshot (traceback mode
+                    # splits same file by call chain, e.g. decoder.py via
+                    # binance_feed vs decoder.py via clob_feed)
+                    top_stats = current.compare_to(self._last_mem_snapshot, 'traceback')
+                    growing = [s for s in top_stats if s.size_diff > 0][:10]
 
                     print(f"[MEM_AUDIT] ===== DELTA {ts} =====")
-                    print(f"[MEM_AUDIT] Rank | File:Line                    | +Size (KB) | +Count")
-                    print(f"[MEM_AUDIT] -----|------------------------------|------------|-------")
                     for rank, stat in enumerate(growing, 1):
+                        size_diff_kb = stat.size_diff / 1024
                         frame = stat.traceback[0]
                         fname = f"{frame.filename}:{frame.lineno}"
-                        size_diff_kb = stat.size_diff / 1024
-                        print(f"[MEM_AUDIT] {rank:>4} | {fname:<28} | {size_diff_kb:>+10.1f} | {stat.count_diff:>+6}")
-
-                    # Traceback for top non-json/non-binance_feed delta item
-                    for stat in top_stats:
-                        if stat.size_diff <= 0:
-                            continue
-                        frame = stat.traceback[0]
-                        if any(skip in frame.filename for skip in SKIP_FILES):
-                            continue
-                        # Found the top interesting delta — print traceback
-                        print(f"[MEM_AUDIT] TRACEBACK TOP DELTA:")
-                        for tb_frame in stat.traceback[:5]:
-                            print(f"[MEM_AUDIT]   File \"{tb_frame.filename}\", line {tb_frame.lineno}")
-                        break
+                        print(f"[MEM_AUDIT] DELTA #{rank}: +{size_diff_kb:.1f} KB | +{stat.count_diff} objects | {fname}")
+                        # Inline traceback for entries growing > 50 KB
+                        if size_diff_kb > 50.0:
+                            for i, tb_frame in enumerate(stat.traceback[:3], 1):
+                                print(f"[MEM_AUDIT]   Frame {i}: File \"{tb_frame.filename}\", line {tb_frame.lineno}")
 
                     print(f"[MEM_AUDIT] ===== END DELTA =====")
                 else:
                     # First run — baseline only, no delta available
-                    stats = current.statistics('lineno')
+                    stats = current.statistics('traceback')
                     print(f"[MEM_AUDIT] ===== BASELINE {ts} (next cycle will show delta) =====")
                     for rank, stat in enumerate(stats[:5], 1):
                         frame = stat.traceback[0]
@@ -2113,6 +2103,7 @@ class TradingBot:
             except Exception as e:
                 print(f"[MEM_AUDIT] ERROR taking snapshot: {e}")
                 sys.stdout.flush()
+
 
     # ── Daily Summary Scheduler (Section 11) ──────────────────
 
