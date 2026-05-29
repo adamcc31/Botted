@@ -2342,7 +2342,7 @@ def main(
 
     # Run
     # [HOTFIX] Start tracemalloc before event loop for memory leak investigation
-    tracemalloc.start()
+    tracemalloc.start(10)
     try:
         asyncio.run(bot.start())
     except KeyboardInterrupt:

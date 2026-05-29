@@ -203,6 +203,13 @@ class CLOBFeed:
         new_tokens = {yes_token, no_token}
         if self._active_tokens != new_tokens:
             logger.info("clob_rotating_market_subscription", old=list(self._active_tokens), new=list(new_tokens))
+            
+            # [HOTFIX] Cleanup orphaned tokens before rotation
+            old_tokens = set(self._active_tokens) - set(new_tokens)
+            for token in old_tokens:
+                self._clob_history.pop(token, None)
+                self._last_fetch_time_per_token.pop(token, None)
+                
             self._active_tokens = new_tokens
             self._cached_books.clear()
             if self._ws_connection:
