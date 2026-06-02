@@ -101,3 +101,26 @@ Migration complete.
 Database: `/app/data/trading.db` (SQLite on Railway volume)
 
 ### Status: DEPLOYED — Tidak memerlukan restart. Bot mengisi kolom V5 mulai sinyal berikutnya.
+
+---
+
+### SPRINT 6 — HISTORICAL LABEL RESOLVER IMPLEMENTATION
+
+#### 1. Polymarket Label Resolver Script
+- **File baru:** [resolve_historical_labels.py](file:///z:/01%20ADAM/00%20DOKUMENTASI%20PROJECT/polymarket/MADE%20IN%20ABYSS%20V2/scripts/resolve_historical_labels.py)
+- **Fungsi:** Menyelesaikan 197.466 data signal di database SQLite (`actual_outcome = 'PENDING'`, `'BUY_UP'`, atau `'BUY_DOWN'`) menjadi `'WIN'`, `'LOSE'`, atau `'INVALID'` secara otomatis dengan menarik data pergerakan harga dari API Polymarket.
+- **Strategi Optimasi:**
+  - **Gamma API Mapping:** Melakukan mapping batched `condition_ids` (20 per request) untuk mendapatkan YES Token ID (decimal string) dan `endDate`.
+  - **Deduplikasi Per Market:** Pengelompokan signal berdasarkan `market_id` sehingga penarikan harga CLOB API hanya berjalan sekali per market (8.097 kali untuk 192.492 signal).
+  - **Time-Bounded CLOB Query:** Mengatasi problem data pruning `interval = max` pada resolved markets dengan membatasi request ke `startTs` (earliest signal) dan `endTs` (endDate + 300 detik) dengan `fidelity = 1`.
+  - **True Concurrency:** Berjalan asinkron menggunakan `aiohttp` dengan semafor (concurrency = 15) untuk menjaga kestabilan rate limit.
+
+#### 2. Hasil Resolusi Sinyal (SQLite Railway Volume)
+- **Total Sinyal Terproses:** 197.492 sinyal.
+- **Waktu Eksekusi:** ~1.6 menit.
+- **Hasil Outcome:**
+  - **WIN:** 149.276 sinyal (75.6%)
+  - **LOSE:** 47.765 sinyal (24.2%)
+  - **INVALID:** 451 sinyal (0.2%)
+  - **PENDING:** 8 sinyal (0.0%)
+
