@@ -1619,6 +1619,22 @@ class TradingBot:
                             stake_before=sizing_raw['stake_usd'],
                             stake_after=sizing['stake_usd'])
             
+            # 1. Pastikan modal cukup untuk minimum trade
+            if available_capital < 1.00:
+                logger.warning("Capital depleted (< $1.00). Skipping trade.")
+                return
+
+            stake_usd = sizing['stake_usd']
+            # 2. Terapkan Floor dan Rounding
+            stake_usd = max(1.00, stake_usd)
+            stake_usd = round(stake_usd, 2)
+
+            # 3. Pastikan stake tidak melebihi sisa modal setelah pembulatan
+            stake_usd = min(stake_usd, available_capital)
+            
+            sizing['stake_usd'] = stake_usd
+            sizing['shares'] = round(stake_usd / res['entry_odds'], 2) if res['entry_odds'] > 0 else 0.0
+
             if sizing['stake_usd'] <= 0:
                 logger.debug("slingger_sizing_zero", market_id=m_id, side=winner, prob=res['swing_probability'])
                 return
@@ -1950,6 +1966,11 @@ class TradingBot:
                             pnl_usd=net_pnl,
                         )
 
+                        if not state.get('is_hydrated', False):
+                            await self._risk_mgr.on_trade_resolved(net_pnl)
+                        else:
+                            logger.debug("Ghost trade resolved. Bypassing RiskManager memory.")
+
                         self._slingger_daily_stats['hit'] += 1
                         self._slingger_daily_stats['pnls'].append(net_pnl)
                         
@@ -2023,6 +2044,11 @@ class TradingBot:
                                 pnl_usd=0.0,
                                 exit_ts=int(_time.time() * 1000)
                             )
+
+                            if not state.get('is_hydrated', False):
+                                await self._risk_mgr.on_trade_resolved(0.0)
+                            else:
+                                logger.debug("Ghost trade resolved. Bypassing RiskManager memory.")
                             
                             asyncio.create_task(
                                 self._send_telegram("SLINGGER V5", emergency_msg),
@@ -2055,6 +2081,11 @@ class TradingBot:
                                 exit_odds=current_price,
                                 pnl_usd=net_pnl,
                             )
+
+                            if not state.get('is_hydrated', False):
+                                await self._risk_mgr.on_trade_resolved(net_pnl)
+                            else:
+                                logger.debug("Ghost trade resolved. Bypassing RiskManager memory.")
                             
                             # Update W/L Rekor Slingger
                             if is_win:
@@ -2130,6 +2161,11 @@ class TradingBot:
                             pnl_usd=0.0,
                             exit_ts=int(_time.time() * 1000)
                         )
+
+                        if not state.get('is_hydrated', False):
+                            await self._risk_mgr.on_trade_resolved(0.0)
+                        else:
+                            logger.debug("Ghost trade resolved. Bypassing RiskManager memory.")
 
                         msg = SlingshotAlerts.emergency(
                             market_slug=market_slug,
@@ -2411,6 +2447,7 @@ class TradingBot:
                     for m_id, state in persisted_scalps.items():
                         if state.get('phase') in ('WAITING_ENTRY', 'WAITING_EXIT'):
                             # Guardrail 3: Reality Sync will happen in the loop
+                            state['is_hydrated'] = True
                             self._shadow_scalps[m_id] = state
                             self._active_tasks[m_id] = asyncio.create_task(
                                 self._shadow_scalp_monitor_loop(m_id),
