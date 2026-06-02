@@ -443,7 +443,7 @@ class SlingshotAlerts:
 
     @staticmethod
     def system_health(data: dict) -> str:
-        return "[ALPHA V1] 🛠 SYSTEM HEALTH START\n\n" + SlingshotAlerts._tg_kv(data)
+        return "[SYSTEM] 🛠 SYSTEM HEALTH START\n\n" + SlingshotAlerts._tg_kv(data)
 
     @staticmethod
     def heartbeat(data: dict) -> str:
@@ -480,7 +480,7 @@ class SlingshotAlerts:
     @staticmethod
     def dry_run_limit(max_hours: float, session_id: str) -> str:
         return (
-            f"[ALPHA V1] ⏳ DRY RUN TIME LIMIT\n\n"
+            f"[SYSTEM] ⏳ DRY RUN TIME LIMIT\n\n"
             f"Dry-run belum mencapai gate live dalam maksimal {max_hours} jam.\n"
             f"Session: {session_id}"
         )
@@ -488,7 +488,7 @@ class SlingshotAlerts:
     @staticmethod
     def session_finished(title: str, prefix: str, reason: str, stats_text: str) -> str:
         return (
-            f"[ALPHA V1] 🏁 {title}\n\n"
+            f"[SYSTEM] 🏁 {title}\n\n"
             f"{prefix}\n"
             f"Reason: {reason}\n\n"
             f"{stats_text}"

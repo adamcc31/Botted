@@ -530,7 +530,7 @@ class TradingBot:
 
     async def _dry_run_time_guard(self) -> None:
         """Stop after max duration unless live gate has already enabled live."""
-        max_hours = float(self._config.get("dry_run.max_duration_hours", 48))
+        max_hours = float(self._config.get("dry_run.max_duration_hours", 720))
         await asyncio.sleep(max_hours * 3600)
 
         if not self._running:
@@ -908,8 +908,13 @@ class TradingBot:
                 oracle_price=oracle_price,
                 chainlink_stale=self._dual_feed.is_chainlink_stale,
             )
+            # Build V5 features from CLOBState for DB recording
+            v5_feats_skip = self._build_v5_features_from_clob(market, clob_state)
             self._latest_signal = skip_signal
-            await self._dry_run.record_signal(skip_signal, slug=market.slug)
+            await self._dry_run.record_signal(skip_signal, slug=market.slug, v5_features=v5_feats_skip)
+            # Shadow prediction: only if oracle available (not ORACLE_UNAVAILABLE)
+            if self._mode == "dry-run" and oracle_source != "UNAVAILABLE" and clob_state:
+                await self._run_shadow_prediction(market, clob_state, oracle_price, spread_result, v5_feats_skip)
             return
 
         if spread_result.recommendation == "WAIT":
@@ -941,8 +946,13 @@ class TradingBot:
                 spread_pct=round(spread_result.spread_pct, 4),
                 reason=spread_result.reason,
             )
+            # Build V5 features from CLOBState for DB recording
+            v5_feats_wait = self._build_v5_features_from_clob(market, clob_state)
             self._latest_signal = wait_signal
-            await self._dry_run.record_signal(wait_signal, slug=market.slug)
+            await self._dry_run.record_signal(wait_signal, slug=market.slug, v5_features=v5_feats_wait)
+            # Shadow prediction: oracle is available in WAIT case
+            if self._mode == "dry-run" and clob_state:
+                await self._run_shadow_prediction(market, clob_state, oracle_price, spread_result, v5_feats_wait)
             return
 
         # ── Feature Computation ───────────────────────────────
@@ -1653,6 +1663,166 @@ class TradingBot:
                 name=f"slingger_monitor_{m_id[:8]}"
             )
 
+
+    def _build_v5_features_from_clob(self, market: "ActiveMarket", clob_state: "CLOBState") -> dict:
+        """
+        Build the 9-column V5 feature dict from CLOBState and Binance buffer.
+
+        This mirrors the feature assembly in _run_slingger_v5 (lines 1527-1540)
+        so that features are recorded in the DB for ALL signal types, including
+        spread-blocked SKIP/WAIT abstains.
+        """
+        now = datetime.now(timezone.utc)
+        yes_token = market.clob_token_ids.get("YES", "")
+        lookback = 30.0
+
+        # Price velocity (30s)
+        hist_yes_snap = self._clob.get_historical_book_snapshot(yes_token, lookback) if yes_token else None
+        if hist_yes_snap:
+            hist_ask = self._clob._best_ask(hist_yes_snap)
+            curr_bid = clob_state.yes_bid
+            if hist_ask is not None and curr_bid is not None:
+                hist_bid = 1.0 - hist_ask
+                price_velocity_30s = (curr_bid - hist_bid) / lookback
+            else:
+                price_velocity_30s = 0.0
+        else:
+            price_velocity_30s = 0.0
+
+        # BTC realized vol (30min, from 1m OHLCV buffer)
+        if self._verify_binance_buffer():
+            import pandas as pd
+            ohlcv_1m = self._binance.ohlcv_1m_buffer
+            recent_1m = ohlcv_1m[-30:]
+            df_1m = pd.DataFrame(recent_1m)
+            df_5m = df_1m.iloc[::5].copy()
+            raw_vol = self._compute_btc_realized_vol_live(df_5m)
+            btc_vol = self._audit_feature_ranges(raw_vol)
+        else:
+            btc_vol = 0.45  # historical average fallback
+
+        # Depth imbalance
+        yes_d = clob_state.yes_depth_usd or 0.0
+        no_d = clob_state.no_depth_usd or 0.0
+        total_d = yes_d + no_d
+        depth_imbalance = (yes_d - no_d) / max(total_d, 1.0)
+
+        return {
+            "yes_price_t0": clob_state.yes_bid,
+            "no_price_t0": clob_state.no_bid,
+            "clob_spread_t0": (clob_state.yes_ask or 0.0) - (clob_state.yes_bid or 0.0),
+            "yes_depth_t0": yes_d,
+            "no_depth_t0": no_d,
+            "depth_imbalance_t0": depth_imbalance,
+            "price_velocity_30s": price_velocity_30s,
+            "depth_trend_30s": 0.0,   # requires FeatureEngine; set 0 for blocked signals
+            "btc_realized_vol_prior_30m": btc_vol,
+        }
+
+    async def _run_shadow_prediction(
+        self,
+        market: "ActiveMarket",
+        clob_state: "CLOBState",
+        oracle_price: float,
+        spread_result: "SpreadFilterResult",
+        v5_feats: dict,
+    ) -> None:
+        """
+        Run V5 model inference on a spread-blocked signal and log to shadow CSV.
+
+        Called ONLY in dry-run mode, after SKIP or WAIT spread filter decisions.
+        Does NOT affect trading execution in any way.
+
+        Shadow CSV path: data/exports/{session_id}/dry_run_shadow_{session_id}.csv
+        """
+        if not self._slingger.is_loaded:
+            return
+
+        try:
+            now = datetime.now(timezone.utc)
+            ttr_seconds = max(0.0, (market.T_resolution - now).total_seconds())
+
+            # YES side prediction
+            yes_feat = {
+                "yes_price_t0": clob_state.yes_bid,
+                "no_price_t0": clob_state.no_bid,
+                "clob_spread_t0": (clob_state.yes_ask or 0.0) - (clob_state.yes_bid or 0.0),
+                "yes_depth_t0": clob_state.yes_depth_usd,
+                "no_depth_t0": clob_state.no_depth_usd,
+                "depth_imbalance_t0": v5_feats.get("depth_imbalance_t0", 0.0),
+                "price_velocity_30s": v5_feats.get("price_velocity_30s", 0.0),
+                "depth_trend_30s": v5_feats.get("depth_trend_30s", 0.0),
+                "btc_realized_vol_prior_30m": v5_feats.get("btc_realized_vol_prior_30m", 0.45),
+                "ttr_at_signal": ttr_seconds,
+                "market_hour_utc": now.hour,
+                "day_of_week": now.weekday(),
+            }
+            res_yes = self._slingger.predict(yes_feat, live_entry_odds=clob_state.yes_bid)
+
+            # NO side prediction (swap YES/NO perspectives)
+            no_feat = yes_feat.copy()
+            no_feat["yes_price_t0"] = clob_state.no_bid
+            no_feat["no_price_t0"] = clob_state.yes_bid
+            no_feat["yes_depth_t0"] = clob_state.no_depth_usd
+            no_feat["no_depth_t0"] = clob_state.yes_depth_usd
+            no_feat["depth_imbalance_t0"] = -yes_feat["depth_imbalance_t0"]
+            res_no = self._slingger.predict(no_feat, live_entry_odds=clob_state.no_bid)
+
+            # Extract spread blocked reason label
+            reason = spread_result.reason or ""
+            if "ELEVATED" in reason:
+                blocked_reason = "ELEVATED"
+            elif "TOO_WIDE" in reason:
+                blocked_reason = "TOO_WIDE"
+            elif "UNAVAILABLE" in reason or "STALE" in reason:
+                blocked_reason = "ORACLE_UNAVAILABLE"
+            else:
+                blocked_reason = "SKIP"
+
+            shadow_record = {
+                "timestamp": now.isoformat(),
+                "market_id": market.market_id,
+                "slug": getattr(market, "slug", ""),
+                "ttr_seconds": round(ttr_seconds, 1),
+                "spread_pct": round(spread_result.spread_pct, 6),
+                "spread_blocked_reason": blocked_reason,
+                "yes_price_t0": v5_feats.get("yes_price_t0", ""),
+                "no_price_t0": v5_feats.get("no_price_t0", ""),
+                "clob_spread_t0": round(v5_feats.get("clob_spread_t0", 0.0), 6),
+                "yes_depth_t0": round(v5_feats.get("yes_depth_t0", 0.0), 2),
+                "no_depth_t0": round(v5_feats.get("no_depth_t0", 0.0), 2),
+                "depth_imbalance_t0": round(v5_feats.get("depth_imbalance_t0", 0.0), 6),
+                "price_velocity_30s": round(v5_feats.get("price_velocity_30s", 0.0), 8),
+                "depth_trend_30s": round(v5_feats.get("depth_trend_30s", 0.0), 6),
+                "btc_realized_vol_prior_30m": round(v5_feats.get("btc_realized_vol_prior_30m", 0.0), 6),
+                "ttr_at_signal": round(ttr_seconds, 1),
+                "market_hour_utc": now.hour,
+                "day_of_week": now.weekday(),
+                "shadow_signal_yes": res_yes["signal"],
+                "shadow_prob_yes": round(res_yes["swing_probability"], 6),
+                "shadow_kelly_yes": round(res_yes["full_kelly"], 6),
+                "shadow_tier_yes": res_yes["confidence_tier"],
+                "shadow_signal_no": res_no["signal"],
+                "shadow_prob_no": round(res_no["swing_probability"], 6),
+                "shadow_kelly_no": round(res_no["full_kelly"], 6),
+                "shadow_tier_no": res_no["confidence_tier"],
+                "actual_outcome": "PENDING",
+            }
+
+            self._exporter.record_shadow(shadow_record)
+
+            logger.debug(
+                "shadow_prediction_recorded",
+                market_id=market.market_id,
+                blocked_reason=blocked_reason,
+                yes_signal=res_yes["signal"],
+                yes_prob=round(res_yes["swing_probability"], 4),
+                no_signal=res_no["signal"],
+                no_prob=round(res_no["swing_probability"], 4),
+            )
+
+        except Exception as e:
+            logger.warning("shadow_prediction_error", error=str(e))
 
     async def _shadow_scalp_monitor_loop(self, market_id: str) -> None:
         """

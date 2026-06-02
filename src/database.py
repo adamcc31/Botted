@@ -172,6 +172,18 @@ class SignalRecord(Base):
     settlement_price_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     oracle_source: Mapped[Optional[str]] = mapped_column(String, nullable=True) # LIVE | CACHED | UNAVAILABLE
 
+    # ── V5 Inference Features (12 actuals from metadata.json) ──
+    # These replace the V1 ml_features and directly map to SlingshotHunterV5 inputs.
+    yes_price_t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    no_price_t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    clob_spread_t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    yes_depth_t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    no_depth_t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    depth_imbalance_t0: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_velocity_30s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    depth_trend_30s: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    btc_realized_vol_prior_30m: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
     model_version: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     mode: Mapped[str] = mapped_column(String, nullable=False)  # DRY | LIVE
 

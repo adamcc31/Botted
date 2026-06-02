@@ -182,7 +182,7 @@ class Exporter:
         try:
             async with db_manager.engine.connect() as conn:
                 result = await conn.execute(text("""
-                    SELECT 
+                    SELECT
                         timestamp_utc as timestamp,
                         market_id,
                         slug,
@@ -198,24 +198,27 @@ class Exporter:
                         spread_filter_passed,
                         spread_filter_reason,
                         entry_odds,
-                        1.0 as theoretical_exit_odds,
-                        theoretical_pnl,
-                        signal_correct,
                         actual_outcome,
                         obi_value,
                         tfm_norm as tfm_value,
                         rv_value,
-                        vol_percentile,
                         depth_ratio,
                         strike_distance_pct,
                         contest_urgency,
-                        odds_yes_60s_ago,
-                        odds_delta_60s,
                         btc_return_1m,
                         confidence_bucket,
                         entry_odds_source,
-                        oracle_source
-                    FROM signals 
+                        oracle_source,
+                        yes_price_t0,
+                        no_price_t0,
+                        clob_spread_t0,
+                        yes_depth_t0,
+                        no_depth_t0,
+                        depth_imbalance_t0,
+                        price_velocity_30s,
+                        depth_trend_30s,
+                        btc_realized_vol_prior_30m
+                    FROM signals
                     WHERE session_id = :session_id
                     ORDER BY timestamp_utc ASC
                 """), {"session_id": self._session_id})
@@ -232,6 +235,52 @@ class Exporter:
             logger.error("export_signals_failed", error=str(e))
             
         return path
+
+    # ── Shadow Prediction Log ─────────────────────────────────
+
+    def record_shadow(
+        self,
+        record: dict,
+    ) -> None:
+        """
+        Append a shadow prediction row to dry_run_shadow_{session_id}.csv.
+
+        Called only in dry-run mode when spread filter blocks an entry (SKIP/WAIT)
+        but we still want to know what the model would have said.
+
+        Schema:
+            timestamp, market_id, slug, ttr_seconds, spread_pct,
+            spread_blocked_reason,
+            yes_price_t0, no_price_t0, clob_spread_t0,
+            yes_depth_t0, no_depth_t0, depth_imbalance_t0,
+            price_velocity_30s, depth_trend_30s, btc_realized_vol_prior_30m,
+            ttr_at_signal, market_hour_utc, day_of_week,
+            shadow_signal_yes, shadow_prob_yes, shadow_kelly_yes, shadow_tier_yes,
+            shadow_signal_no, shadow_prob_no, shadow_kelly_no, shadow_tier_no,
+            actual_outcome
+        """
+        path = self._session_dir / f"dry_run_shadow_{self._session_id}.csv"
+        file_exists = path.exists()
+
+        _SHADOW_COLUMNS = [
+            "timestamp", "market_id", "slug", "ttr_seconds", "spread_pct",
+            "spread_blocked_reason",
+            "yes_price_t0", "no_price_t0", "clob_spread_t0",
+            "yes_depth_t0", "no_depth_t0", "depth_imbalance_t0",
+            "price_velocity_30s", "depth_trend_30s", "btc_realized_vol_prior_30m",
+            "ttr_at_signal", "market_hour_utc", "day_of_week",
+            "shadow_signal_yes", "shadow_prob_yes", "shadow_kelly_yes", "shadow_tier_yes",
+            "shadow_signal_no", "shadow_prob_no", "shadow_kelly_no", "shadow_tier_no",
+            "actual_outcome",
+        ]
+
+        row = [record.get(col, "") for col in _SHADOW_COLUMNS]
+
+        with open(path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(_SHADOW_COLUMNS)
+            writer.writerow(row)
 
     # ── Full Session Export ───────────────────────────────────
 

@@ -63,7 +63,7 @@
     "abort_consecutive_fail": 3,
     "abort_win_rate_threshold": 0.48,
     "abort_consecutive_losses": 6,
-    "max_duration_hours": 48,
+    "max_duration_hours": 720,
     "abstain_summary_every_signals": 25
   },
   "model": {

@@ -94,9 +94,11 @@ class DryRunEngine:
 
     # ── Trade Simulation ──────────────────────────────────────
 
-    async def record_signal(self, signal: SignalResult, slug: str = "", ml_features: dict = None) -> None:
+    async def record_signal(self, signal: SignalResult, slug: str = "", ml_features: dict = None, v5_features: dict = None) -> None:
         if ml_features is None:
             ml_features = {}
+        if v5_features is None:
+            v5_features = {}
         """Record every signal evaluation (including ABSTAIN)."""
         self._signals_evaluated += 1
         if signal.signal == "ABSTAIN":
@@ -140,19 +142,25 @@ class DryRunEngine:
                     abstain_reason, p_model, clob_yes_ask, clob_no_ask,
                     ttr_minutes, slug, strike_price, binance_price, chainlink_price,
                     spread_pct, spread_filter_passed, spread_filter_reason,
-                    entry_odds, theoretical_pnl, signal_correct, actual_outcome, mode,
-                    obi_value, tfm_norm, rv_value, vol_percentile, depth_ratio,
-                    strike_distance_pct, contest_urgency, odds_yes_60s_ago,
-                    odds_delta_60s, btc_return_1m, confidence_bucket, entry_odds_source, oracle_source
+                    entry_odds, signal_correct, actual_outcome, mode,
+                    obi_value, tfm_norm, rv_value, depth_ratio,
+                    strike_distance_pct, contest_urgency, btc_return_1m,
+                    confidence_bucket, entry_odds_source, oracle_source,
+                    yes_price_t0, no_price_t0, clob_spread_t0,
+                    yes_depth_t0, no_depth_t0, depth_imbalance_t0,
+                    price_velocity_30s, depth_trend_30s, btc_realized_vol_prior_30m
                 ) VALUES (
                     :signal_id, :session_id, :market_id, :timestamp_utc, :signal_type,
                     :abstain_reason, :p_model, :clob_yes_ask, :clob_no_ask,
                     :ttr_minutes, :slug, :strike_price, :binance_price, :chainlink_price,
                     :spread_pct, :spread_filter_passed, :spread_filter_reason,
-                    :entry_odds, :theoretical_pnl, 'PENDING', 'PENDING', 'DRY',
-                    :obi_value, :tfm_norm, :rv_value, :vol_percentile, :depth_ratio,
-                    :strike_distance_pct, :contest_urgency, :odds_yes_60s_ago,
-                    :odds_delta_60s, :btc_return_1m, :confidence_bucket, :entry_odds_source, :oracle_source
+                    :entry_odds, 'PENDING', 'PENDING', 'DRY',
+                    :obi_value, :tfm_norm, :rv_value, :depth_ratio,
+                    :strike_distance_pct, :contest_urgency, :btc_return_1m,
+                    :confidence_bucket, :entry_odds_source, :oracle_source,
+                    :yes_price_t0, :no_price_t0, :clob_spread_t0,
+                    :yes_depth_t0, :no_depth_t0, :depth_imbalance_t0,
+                    :price_velocity_30s, :depth_trend_30s, :btc_realized_vol_prior_30m
                 )
             """), {
                 "signal_id": str(uuid.uuid4()),
@@ -173,21 +181,29 @@ class DryRunEngine:
                 "spread_filter_passed": getattr(signal, "spread_filter_passed", None),
                 "spread_filter_reason": getattr(signal, "spread_filter_reason", None),
                 "entry_odds": entry_odds,
-                "theoretical_pnl": 0.0, # Will be calculated during resolve
+                # V1 features (retained for compatibility, from legacy FeatureEngine)
                 "obi_value": ml_features.get("OBI"),
                 "tfm_norm": ml_features.get("TFM_normalized"),
                 "rv_value": ml_features.get("RV"),
-                "vol_percentile": ml_features.get("vol_percentile"),
                 "depth_ratio": ml_features.get("depth_ratio"),
                 "strike_distance_pct": ml_features.get("strike_distance_pct"),
                 "contest_urgency": ml_features.get("contest_urgency"),
-                "odds_yes_60s_ago": ml_features.get("odds_yes_60s_ago"),
-                "odds_delta_60s": ml_features.get("odds_delta_60s"),
                 "btc_return_1m": ml_features.get("btc_return_1m"),
                 "confidence_bucket": ml_features.get("confidence_bucket"),
                 "entry_odds_source": getattr(signal, "entry_odds_source", None),
                 "oracle_source": getattr(signal, "oracle_source", None),
+                # V5 actual inference features
+                "yes_price_t0": v5_features.get("yes_price_t0"),
+                "no_price_t0": v5_features.get("no_price_t0"),
+                "clob_spread_t0": v5_features.get("clob_spread_t0"),
+                "yes_depth_t0": v5_features.get("yes_depth_t0"),
+                "no_depth_t0": v5_features.get("no_depth_t0"),
+                "depth_imbalance_t0": v5_features.get("depth_imbalance_t0"),
+                "price_velocity_30s": v5_features.get("price_velocity_30s"),
+                "depth_trend_30s": v5_features.get("depth_trend_30s"),
+                "btc_realized_vol_prior_30m": v5_features.get("btc_realized_vol_prior_30m"),
             })
+
 
     def simulate_trade(
         self,
