@@ -66,6 +66,14 @@ class FeatureEngine:
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
+        self._cached_vol_pct = None
+        self._cached_vol_pct_key = None
+        self._cached_price_vs_ema20 = None
+        self._cached_price_vs_ema20_key = None
+        self._cached_rv = None
+        self._cached_rv_key = None
+        self._cached_vam = None
+        self._cached_vam_key = None
 
     def compute(
         self,
@@ -334,6 +342,12 @@ class FeatureEngine:
         realized_vol = std(close_returns, window=12)
         VAM = close_returns / (realized_vol + ε)
         """
+        if not ohlcv:
+            return 0.0
+        last_close_time = ohlcv[-1].get("close_time")
+        if self._cached_vam_key == last_close_time and self._cached_vam is not None:
+            return self._cached_vam
+
         if len(ohlcv) < 13:
             return 0.0
 
@@ -357,13 +371,23 @@ class FeatureEngine:
             return 0.0
 
         std_returns = float(np.std(returns))
-        return current_return / (std_returns + EPSILON)
+        val = current_return / (std_returns + EPSILON)
+
+        self._cached_vam = val
+        self._cached_vam_key = last_close_time
+        return val
 
     def _compute_rv(self, ohlcv: list) -> float:
         """
         Realized Volatility (annualized).
         RV = std(close_returns, window=12) × √(252 × 96)
         """
+        if not ohlcv:
+            return 0.0
+        last_close_time = ohlcv[-1].get("close_time")
+        if self._cached_rv_key == last_close_time and self._cached_rv is not None:
+            return self._cached_rv
+
         if len(ohlcv) < 13:
             return 0.0
 
@@ -382,7 +406,11 @@ class FeatureEngine:
 
         std_returns = float(np.std(returns))
         annualizer = math.sqrt(252 * 96)  # 96 bars per day, 252 trading days
-        return std_returns * annualizer
+        val = std_returns * annualizer
+
+        self._cached_rv = val
+        self._cached_rv_key = last_close_time
+        return val
 
     def _compute_vol_percentile(self, ohlcv: list) -> float:
         """
@@ -390,31 +418,43 @@ class FeatureEngine:
         vol_percentile = rolling_rank(RV[t], window=500) / 500
         Anti-lookahead: rank from [t-500, t-1].
         """
+        if not ohlcv:
+            return 0.5
+        last_close_time = ohlcv[-1].get("close_time")
+        if self._cached_vol_pct_key == last_close_time and self._cached_vol_pct is not None:
+            return self._cached_vol_pct
+
         window = min(len(ohlcv) - 1, 500)
         if window < 20:
             return 0.5  # Default neutral
 
-        # Compute RV for each bar in window using [bar-12, bar-1]
-        closes = [bar["close"] for bar in ohlcv]
-        rvs = []
-
-        for i in range(max(13, len(closes) - window), len(closes)):
-            prior = closes[max(0, i - 12):i]
-            if len(prior) < 2:
-                continue
-            rets = [
-                math.log(prior[j] / (prior[j - 1] + EPSILON))
-                for j in range(1, len(prior))
-            ]
-            if rets:
-                rvs.append(float(np.std(rets)))
-
-        if not rvs:
+        # Vectorized implementation for speed
+        closes = np.array([bar["close"] for bar in ohlcv], dtype=np.float32)
+        log_returns = np.log(closes[1:] / (closes[:-1] + EPSILON))
+        n_returns = len(log_returns)
+        if n_returns < 11:
+            self._cached_vol_pct = 0.5
+            self._cached_vol_pct_key = last_close_time
             return 0.5
 
-        current_rv = rvs[-1] if rvs else 0.0
-        rank = sum(1 for rv in rvs[:-1] if rv <= current_rv)
-        return rank / (len(rvs) - 1 + EPSILON)
+        # std(ddof=0) is computed from pandas std(ddof=1) multiplied by sqrt(10/11)
+        pd_std = pd.Series(log_returns).rolling(window=11).std()
+        rvs = (pd_std * math.sqrt(10.0 / 11.0)).dropna().values
+
+        if len(rvs) < 2:
+            self._cached_vol_pct = 0.5
+            self._cached_vol_pct_key = last_close_time
+            return 0.5
+
+        rvs_sliced = rvs[:-1]  # Exclude last close to match the range() logic of loop
+        rvs_subset = rvs_sliced[-window:]
+        current_rv = rvs_subset[-1]
+        rank = np.sum(rvs_subset[:-1] <= current_rv)
+        val = float(rank / (len(rvs_subset) - 1 + EPSILON))
+
+        self._cached_vol_pct = val
+        self._cached_vol_pct_key = last_close_time
+        return val
 
     def _compute_price_vs_ema20(self, ohlcv: list) -> float:
         """
@@ -422,6 +462,12 @@ class FeatureEngine:
         (close[t] - EMA(close, 20)) / (close[t] + ε)
         Anti-lookahead: EMA from [t-20, t-1].
         """
+        if not ohlcv:
+            return 0.0
+        last_close_time = ohlcv[-1].get("close_time")
+        if self._cached_price_vs_ema20_key == last_close_time and self._cached_price_vs_ema20 is not None:
+            return self._cached_price_vs_ema20
+
         if len(ohlcv) < 21:
             return 0.0
 
@@ -434,7 +480,11 @@ class FeatureEngine:
         if pd.isna(ema_value):
             return 0.0
 
-        return (current_close - ema_value) / (current_close + EPSILON)
+        val = (current_close - ema_value) / (current_close + EPSILON)
+
+        self._cached_price_vs_ema20 = val
+        self._cached_price_vs_ema20_key = last_close_time
+        return val
 
     # ── Batch Feature Computation (for training) ──────────────
 

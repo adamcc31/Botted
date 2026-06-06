@@ -130,9 +130,9 @@ class SignalV2Tests(unittest.TestCase):
             slug=market_id,
             question="q",
             strike_price=100.0,
-            T_open=now - timedelta(hours=1),
-            T_resolution=now + timedelta(minutes=7),
-            TTR_minutes=7.0,
+            T_open=now - timedelta(minutes=6),
+            T_resolution=now + timedelta(minutes=4),
+            TTR_minutes=4.0,
             clob_token_ids={"YES": "y", "NO": "n"},
             settlement_exchange="BINANCE",
             settlement_instrument="BTCUSDT",
@@ -140,7 +140,8 @@ class SignalV2Tests(unittest.TestCase):
             settlement_price_type="close",
             resolution_source="Binance",
         )
-        fv = make_feature_vector(now, market_id, current_price=100.0, ttr_minutes=7.0)
+        # Pass current_price=145.0 so that distance = abs(145.0 - 100.0) = 45.0, matching V4-A2 bounds (30 to 60)
+        fv = make_feature_vector(now, market_id, current_price=145.0, ttr_minutes=4.0)
 
         res = sg.evaluate(P_model=0.70, uncertainty_u=0.02, clob_state=clob, active_market=active, feature_vector=fv)
         self.assertEqual(res.signal, "BUY_UP")

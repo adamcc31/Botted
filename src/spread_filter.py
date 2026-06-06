@@ -56,7 +56,7 @@ class SpreadFilter:
             self._config.get("dual_feed.spread_threshold_normal_pct", 0.03)
         )
         elevated_threshold = float(
-            self._config.get("dual_feed.spread_threshold_elevated_pct", 0.08)
+            self._config.get("dual_feed.spread_threshold_elevated_pct", 0.12)
         )
 
         # ── Feed Availability Check ───────────────────────────
@@ -146,7 +146,7 @@ class SpreadFilter:
     def check_from_snapshot(
         snapshot: Optional[DualFeedSnapshot],
         normal_threshold: float = 0.03,
-        elevated_threshold: float = 0.08,
+        elevated_threshold: float = 0.12,
     ) -> SpreadFilterResult:
         """
         Static convenience method for testing with pre-built snapshots.

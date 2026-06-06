@@ -58,6 +58,7 @@ class FairProbabilityTests(unittest.TestCase):
 
         m1 = ActiveMarket(
             market_id="m",
+            slug="slug",
             question="q",
             strike_price=95.0,
             T_open=now - timedelta(hours=1),
@@ -87,6 +88,7 @@ class FairProbabilityTests(unittest.TestCase):
         )
         common = dict(
             market_id="m",
+            slug="slug",
             question="q",
             strike_price=100.0,
             T_open=now - timedelta(hours=1),

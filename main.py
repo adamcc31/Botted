@@ -1458,6 +1458,24 @@ class TradingBot:
             logger.warning("volatility_safety_audit_failed", error=str(e), fallback=0.45)
             return 0.45
 
+    def _get_btc_regime(self) -> str:
+        """
+        Klasifikasikan regime BTC berdasarkan pergerakan 30 menit terakhir.
+        Returns: 'BULLISH', 'BEARISH', atau 'NEUTRAL'
+        """
+        buffer = self._binance.ohlcv_1m_buffer
+        if len(buffer) < 30:
+            return "NEUTRAL"
+
+        prices = [bar['close'] for bar in buffer[-30:]]
+        momentum = (prices[-1] - prices[0]) / prices[0] * 100
+
+        if momentum > 0.3:
+            return "BULLISH"
+        elif momentum < -0.3:
+            return "BEARISH"
+        return "NEUTRAL"
+
     async def _run_slingger_v5(self, market: ActiveMarket, clob_state: CLOBState, fv: FeatureVector, oracle_price: float) -> None:
         """
         Inference engine for Slingger Hunter V5.
@@ -1569,15 +1587,55 @@ class TradingBot:
 
         # 5. Decide
         winner = None
+        rejected_side = None
+        rejected_prob = 0.0
         if res_yes['signal'] == 'ENTER' and res_no['signal'] == 'ENTER':
-            winner = 'YES' if res_yes['swing_probability'] >= res_no['swing_probability'] else 'NO'
+            if res_yes['swing_probability'] >= res_no['swing_probability']:
+                winner = 'YES'
+                rejected_side = 'NO'
+                rejected_prob = res_no['swing_probability']
+            else:
+                winner = 'NO'
+                rejected_side = 'YES'
+                rejected_prob = res_yes['swing_probability']
         elif res_yes['signal'] == 'ENTER':
             winner = 'YES'
+            rejected_side = 'NO'
+            rejected_prob = res_no['swing_probability']
         elif res_no['signal'] == 'ENTER':
             winner = 'NO'
+            rejected_side = 'YES'
+            rejected_prob = res_yes['swing_probability']
 
         if winner:
             res = res_yes if winner == 'YES' else res_no
+            logger.info(
+                "single_side_entry",
+                side=winner,
+                prob=res['swing_probability'],
+                ev=res['full_kelly'],
+                rejected_side=rejected_side,
+                rejected_prob=rejected_prob,
+            )
+
+            # Apply regime filter
+            regime = self._get_btc_regime()
+            if winner == "YES" and regime == "BEARISH":
+                logger.info(
+                    "entry_blocked_regime_mismatch",
+                    side="YES",
+                    regime="BEARISH",
+                    market_id=m_id,
+                )
+                return
+            if winner == "NO" and regime == "BULLISH":
+                logger.info(
+                    "entry_blocked_regime_mismatch",
+                    side="NO",
+                    regime="BULLISH",
+                    market_id=m_id,
+                )
+                return
             
             # [FIX-15] Capital from V5 native database — no DryRunEngine dependency
             v5_sess = await self._v5_db.get_session_state()
@@ -1783,6 +1841,20 @@ class TradingBot:
             no_feat["no_depth_t0"] = clob_state.yes_depth_usd
             no_feat["depth_imbalance_t0"] = -yes_feat["depth_imbalance_t0"]
             res_no = self._slingger.predict(no_feat, live_entry_odds=clob_state.no_bid)
+
+            # Apply single-side entry logic
+            if res_yes["signal"] == "ENTER" and res_no["signal"] == "ENTER":
+                if res_yes["swing_probability"] >= res_no["swing_probability"]:
+                    res_no["signal"] = "SKIP"
+                else:
+                    res_yes["signal"] = "SKIP"
+
+            # Apply regime filter
+            regime = self._get_btc_regime()
+            if res_yes["signal"] == "ENTER" and regime == "BEARISH":
+                res_yes["signal"] = "SKIP"
+            if res_no["signal"] == "ENTER" and regime == "BULLISH":
+                res_no["signal"] = "SKIP"
 
             # Extract spread blocked reason label
             reason = spread_result.reason or ""
