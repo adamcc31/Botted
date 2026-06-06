@@ -186,9 +186,6 @@ class V5DatabaseManager:
             entry_ts = row[0]
             duration_sec = int((now_ms - entry_ts) / 1000)
 
-            is_win = 1 if status == "WIN" else 0
-            is_loss = 1 if status in ("LOSS", "EMERGENCY_EXIT") else 0
-
             # Update trade record
             await db.execute("""
                 UPDATE v5_trades
@@ -197,17 +194,21 @@ class V5DatabaseManager:
                 WHERE trade_id = ?
             """, (status, exit_odds, pnl_usd, now_ms, duration_sec, trade_id))
 
-            # Update session: apply PnL to capital
-            await db.execute("""
-                UPDATE v5_session
-                SET capital_current = capital_current + ?,
-                    trades_executed = trades_executed + 1,
-                    trades_win = trades_win + ?,
-                    trades_loss = trades_loss + ?,
-                    total_pnl_usd = total_pnl_usd + ?,
-                    last_updated = ?
-                WHERE session_id = ?
-            """, (pnl_usd, is_win, is_loss, pnl_usd, now_ms, self._session_id))
+            if status != "HARD_BLOCK_CANCELLED":
+                is_win = 1 if status == "WIN" else 0
+                is_loss = 1 if status in ("LOSS", "EMERGENCY_EXIT") else 0
+
+                # Update session: apply PnL to capital
+                await db.execute("""
+                    UPDATE v5_session
+                    SET capital_current = capital_current + ?,
+                        trades_executed = trades_executed + 1,
+                        trades_win = trades_win + ?,
+                        trades_loss = trades_loss + ?,
+                        total_pnl_usd = total_pnl_usd + ?,
+                        last_updated = ?
+                    WHERE session_id = ?
+                """, (pnl_usd, is_win, is_loss, pnl_usd, now_ms, self._session_id))
 
             await db.commit()
         logger.info("v5_trade_closed",

@@ -1959,8 +1959,14 @@ class TradingBot:
                         logger.warning(
                             f"HARD BLOCK: fill price {current_price:.3f} < 0.35 minimum, aborting fill. trade_id={state['trade_id']}"
                         )
-                        await asyncio.sleep(POLL_INTERVAL)
-                        continue
+                        state['phase'] = 'CLOSED'
+                        state['result'] = 'HARD_BLOCK_CANCELLED'
+                        await self._record_shadow_outcome(
+                            trade_id=state['trade_id'],
+                            outcome="HARD_BLOCK_CANCELLED",
+                            reason="fill_price_below_minimum"
+                        )
+                        break
                     if current_price <= state['entry_odds']:
                         state['entry_filled'] = True
                         state['entry_fill_price'] = current_price
@@ -2251,6 +2257,75 @@ class TradingBot:
         finally:
             # Central GC anchor
             await self.cleanup_market(market_id, source='slingger_monitor')
+
+    async def _record_shadow_outcome(
+        self,
+        trade_id: str,
+        outcome: str,
+        reason: str
+    ) -> None:
+        """
+        Record permanent hard block or cancellation for a shadow trade.
+        Updates v5_trades SQLite, legacy signals SQLite, and the dry_run_shadow CSV.
+        """
+        market_id = None
+        for m_id, state in self._shadow_scalps.items():
+            if state.get('trade_id') == trade_id:
+                market_id = m_id
+                break
+        
+        if not market_id:
+            logger.warning("record_shadow_outcome_trade_not_found", trade_id=trade_id)
+            return
+
+        logger.info(
+            "recording_shadow_cancellation",
+            trade_id=trade_id[:8],
+            market_id=market_id,
+            outcome=outcome,
+            reason=reason
+        )
+
+        try:
+            await self._v5_db.close_trade(
+                trade_id=trade_id,
+                status=outcome,
+                exit_odds=None,
+                pnl_usd=0.0
+            )
+        except Exception as e:
+            logger.error("v5_db_close_trade_failed", error=str(e), trade_id=trade_id)
+
+        try:
+            async with self._db.engine.begin() as conn:
+                await conn.execute(
+                    text("""
+                        UPDATE signals
+                        SET actual_outcome = :outcome
+                        WHERE market_id = :market_id AND actual_outcome = 'PENDING'
+                    """),
+                    {"outcome": outcome, "market_id": market_id}
+                )
+        except Exception as e:
+            logger.error("legacy_db_update_failed", error=str(e), market_id=market_id)
+
+        if self._exporter:
+            try:
+                csv_path = self._exporter.session_dir / f"dry_run_shadow_{self._dry_run.session_id}.csv"
+                if csv_path.exists():
+                    import pandas as pd
+                    df = pd.read_csv(csv_path)
+                    mask = (df['market_id'] == market_id) & (df['actual_outcome'] == 'PENDING')
+                    if mask.any():
+                        df.loc[mask, 'actual_outcome'] = outcome
+                        df.to_csv(csv_path, index=False)
+                        logger.info("shadow_csv_outcome_updated", market_id=market_id, outcome=outcome)
+                    else:
+                        logger.debug("no_pending_shadow_row_found_in_csv", market_id=market_id)
+                else:
+                    logger.debug("shadow_csv_not_found", path=str(csv_path))
+            except Exception as e:
+                logger.error("shadow_csv_update_failed", error=str(e), market_id=market_id)
 
     # ── Centralized Garbage Collection (Section 10) ───────────
 
