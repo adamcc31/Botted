@@ -512,6 +512,8 @@ class MarketDiscovery:
                 return False
 
         candidates = await self._query_candidates()
+        if not self._active_market:
+            return False
         if not candidates:
             return False
 
@@ -707,7 +709,7 @@ class MarketDiscovery:
                                 slug=slug,
                             )
                     except Exception as e:
-                        logger.warning("dynamic_5m_slug_error", slug=slug, error=str(e))
+                        logger.warning("dynamic_5m_slug_error", slug=slug, error=repr(e))
 
         return candidates
 
