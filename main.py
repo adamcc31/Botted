@@ -813,11 +813,20 @@ class TradingBot:
         # ── Bar-close rotation check ──────────────────────────
         # Aligned here (not on an independent timer) so market switches never
         # interrupt a Z-score computation mid-window.
+        old_market_id = market.market_id if market else None
         rotated = await self._discovery.check_and_rotate()
         if rotated:
             # Discard stale CLOB cache — next poll will fetch fresh data
             self._clob._cached_state = None
             market = self._discovery.active_market
+
+            # Bersihkan static cache untuk market lama
+            if old_market_id:
+                keys_to_remove = [k for k in self._feature_engine._static_feature_cache 
+                                  if k.startswith(old_market_id)]
+                for k in keys_to_remove:
+                    self._feature_engine._static_feature_cache.pop(k, None)
+
             logger.info(
                 "bar_close_rotation_applied",
                 new_market_id=market.market_id if market else None,
@@ -970,6 +979,7 @@ class TradingBot:
             )
             return
         if fv is None:
+            logger.info("evaluation_skipped_incomplete_clob", market_id=market.market_id)
             return
 
         # ── Dry-run debug log for F16/F17/F20 post-fix monitoring ─
@@ -1463,6 +1473,10 @@ class TradingBot:
         Klasifikasikan regime BTC berdasarkan pergerakan 30 menit terakhir.
         Returns: 'BULLISH', 'BEARISH', atau 'NEUTRAL'
         """
+        USE_REGIME_FILTER = False
+        if not USE_REGIME_FILTER:
+            return "NEUTRAL"
+
         buffer = self._binance.ohlcv_1m_buffer
         if len(buffer) < 30:
             return "NEUTRAL"
@@ -1618,25 +1632,6 @@ class TradingBot:
                 rejected_prob=rejected_prob,
             )
 
-            # Apply regime filter
-            regime = self._get_btc_regime()
-            if winner == "YES" and regime == "BEARISH":
-                logger.info(
-                    "entry_blocked_regime_mismatch",
-                    side="YES",
-                    regime="BEARISH",
-                    market_id=m_id,
-                )
-                return
-            if winner == "NO" and regime == "BULLISH":
-                logger.info(
-                    "entry_blocked_regime_mismatch",
-                    side="NO",
-                    regime="BULLISH",
-                    market_id=m_id,
-                )
-                return
-            
             # [FIX-15] Capital from V5 native database — no DryRunEngine dependency
             v5_sess = await self._v5_db.get_session_state()
             primary_capital = v5_sess['capital_current'] if v5_sess else 50.0
@@ -1848,13 +1843,6 @@ class TradingBot:
                     res_no["signal"] = "SKIP"
                 else:
                     res_yes["signal"] = "SKIP"
-
-            # Apply regime filter
-            regime = self._get_btc_regime()
-            if res_yes["signal"] == "ENTER" and regime == "BEARISH":
-                res_yes["signal"] = "SKIP"
-            if res_no["signal"] == "ENTER" and regime == "BULLISH":
-                res_no["signal"] = "SKIP"
 
             # Extract spread blocked reason label
             reason = spread_result.reason or ""
