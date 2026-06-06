@@ -74,6 +74,10 @@ class FeatureEngine:
         self._cached_rv_key = None
         self._cached_vam = None
         self._cached_vam_key = None
+        self._static_feature_cache: Dict[str, dict] = {}
+        self._static_hits = 0
+        self._dynamic_count = 0
+        self._clob_skip_count = 0
 
     def compute(
         self,
@@ -122,129 +126,43 @@ class FeatureEngine:
             )
         reference_price = oracle_price
 
-        now = datetime.now(timezone.utc)
+        market_id = active_market.market_id
+        bar_close_time = ohlcv[-1]["close_time"]
+        cache_key = f"{market_id}_{bar_close_time}"
 
-        # Build feature values
+        # Hitung static features dari cache jika tersedia
+        if cache_key not in self._static_feature_cache:
+            self._static_feature_cache[cache_key] = self._compute_static_features(
+                binance_feed, active_market, reference_price
+            )
+            # Cap cache size to prevent memory leak (FIFO eviction)
+            if len(self._static_feature_cache) > 1000:
+                first_key = next(iter(self._static_feature_cache))
+                self._static_feature_cache.pop(first_key, None)
+        else:
+            self._static_hits += 1
+
+        static_features = self._static_feature_cache[cache_key]
+
+        # Dynamic features SELALU dihitung fresh dari CLOB state terbaru
+        dynamic_features = self._compute_dynamic_features(clob_feed, active_market, clob_state)
+
+        # Jika CLOB incomplete, jangan merge — kembalikan None
+        if dynamic_features is None:
+            logger.warning("feature_skipped_clob_incomplete", market_id=market_id)
+            return None
+
+        features = {**static_features, **dynamic_features}
+
+        # Log cache stats for monitoring
+        logger.info(
+            "feature_cache_stats",
+            static_cache_hits=self._static_hits,
+            dynamic_computed=self._dynamic_count,
+            clob_skips=self._clob_skip_count,
+        )
+
         try:
-            features = {}
-
-            # ── 01: OBI ───────────────────────────────────────
-            obi = binance_feed.get_ob_imbalance(levels=5)
-            features["OBI"] = obi if obi is not None else 0.0
-
-            # ── 02: TFM_normalized ────────────────────────────
-            features["TFM_normalized"] = self._compute_tfm(binance_feed)
-
-            # ── 03: VAM ───────────────────────────────────────
-            features["VAM"] = self._compute_vam(ohlcv)
-
-            # ── 04: RV ────────────────────────────────────────
-            features["RV"] = self._compute_rv(ohlcv)
-
-            # ── 05: vol_percentile ────────────────────────────
-            features["vol_percentile"] = self._compute_vol_percentile(ohlcv)
-
-            # ── 06: depth_ratio ───────────────────────────────
-            dr = binance_feed.get_depth_ratio(levels=3)
-            features["depth_ratio"] = dr if dr is not None else 1.0
-
-            # ── 07: price_vs_ema20 ────────────────────────────
-            features["price_vs_ema20"] = self._compute_price_vs_ema20(ohlcv)
-
-            # ── 08: binance_spread_bps ────────────────────────
-            spread = binance_feed.get_binance_spread_bps()
-            features["binance_spread_bps"] = spread if spread is not None else 2.0
-
-            # ── 09-12: Temporal cyclical ──────────────────────
-            utc_hour = now.hour + now.minute / 60.0
-            dow = now.weekday()  # 0=Monday, 6=Sunday
-
-            features["hour_sin"] = math.sin(2 * math.pi * utc_hour / 24.0)
-            features["hour_cos"] = math.cos(2 * math.pi * utc_hour / 24.0)
-            features["dow_sin"] = math.sin(2 * math.pi * dow / 7.0)
-            features["dow_cos"] = math.cos(2 * math.pi * dow / 7.0)
-
-            # ── 13-15: TTR contextual ─────────────────────────
-            ttr_seconds = (active_market.T_resolution - now).total_seconds()
-            ttr_minutes = max(0.0, ttr_seconds / 60.0)
-            
-            # Adaptive normalization
-            # If market lifespan > 2h, assume Daily (normalize by 24h)
-            # Otherwise assume 15m
-            lifespan_h = (active_market.T_resolution - active_market.T_open).total_seconds() / 3600.0
-            ttr_norm_base = 1440.0 if lifespan_h > 2.0 else 15.0
-            ttr_normalized = max(0.0, min(1.0, ttr_minutes / ttr_norm_base))
-
-            features["TTR_normalized"] = ttr_normalized
-            features["TTR_sin"] = math.sin(math.pi * ttr_normalized)
-            features["TTR_cos"] = math.cos(math.pi * ttr_normalized)
-
-            # ── 16: Strike distance ───────────────────────────
-            # BUG-1 FIX: use oracle reference_price, NOT Binance
-            strike = active_market.strike_price
-            if strike is None or reference_price is None or strike == 0:
-                strike_distance_pct = 0.0
-            else:
-                strike_distance_pct = (reference_price - strike) / strike * 100.0
-            
-            features["strike_distance_pct"] = strike_distance_pct
- 
-            # ── 17: Contest urgency ───────────────────────────
-            features["contest_urgency"] = abs(strike_distance_pct) * (1.0 - ttr_normalized) if strike_distance_pct is not None else 0.0
-
-            # ── 18-20: Interaction features ───────────────────
-            features["ttr_x_obi"] = ttr_normalized * features["OBI"]
-            features["ttr_x_tfm"] = ttr_normalized * features["TFM_normalized"]
-            features["ttr_x_strike"] = ttr_normalized * strike_distance_pct
-
-            # ── 21-24: CLOB features ─────────────────────────
-            features["clob_yes_mid"] = (clob_state.yes_ask + clob_state.yes_bid) / 2.0
-            features["clob_yes_spread"] = clob_state.yes_ask - clob_state.yes_bid
-            features["clob_no_spread"] = clob_state.no_ask - clob_state.no_bid
-            features["market_vig"] = clob_state.market_vig
-
-            # ── 25-26: Velocity Features ─────────────────────
-            # Velocity calculated over 15s window
-            lookback_s = 15.0
-            yes_token = active_market.clob_token_ids.get("YES", "")
-            no_token = active_market.clob_token_ids.get("NO", "")
-            
-            hist_yes_book = clob_feed.get_historical_book_snapshot(yes_token, lookback_s) if yes_token else None
-            hist_no_book = clob_feed.get_historical_book_snapshot(no_token, lookback_s) if no_token else None
-            
-            if hist_yes_book and hist_no_book:
-                hist_yes_ask = clob_feed._best_ask(hist_yes_book)
-                hist_yes_bid = clob_feed._best_bid(hist_yes_book)
-                hist_no_ask = clob_feed._best_ask(hist_no_book)
-                hist_no_bid = clob_feed._best_bid(hist_no_book)
-
-                # [FIX-NONETYPE] Guard: any None price means historical book is incomplete
-                # (e.g. empty asks/bids in a snapshot). Fall back to 0.0 defaults.
-                if any(v is None for v in [hist_yes_ask, hist_yes_bid, hist_no_ask, hist_no_bid]):
-                    features["clob_spread_vel"] = 0.0
-                    features["clob_depth_delta"] = 0.0
-                else:
-                    # Spread velocity (YES)
-                    current_spread = clob_state.yes_ask - clob_state.yes_bid
-                    hist_spread = hist_yes_ask - hist_yes_bid
-                    features["clob_spread_vel"] = (current_spread - hist_spread) / lookback_s
-
-                    # Depth Delta (Ratio of Bid/Ask depth)
-                    curr_depth_ratio = clob_state.yes_depth_usd / (clob_state.no_depth_usd + 0.1)
-
-                    hist_yes_depth = clob_feed._calc_depth_near_ask(hist_yes_book, hist_yes_ask, pct=0.03)
-                    hist_no_depth = clob_feed._calc_depth_near_ask(hist_no_book, hist_no_ask, pct=0.03)
-                    hist_depth_ratio = hist_yes_depth / (hist_no_depth + 0.1)
-
-                    # FEATURE SANITIZATION:
-                    # 1. Spread Velocity (clamped to +/- 0.1 per second)
-                    # 2. Depth Delta (clamped to +/- 50.0 ratio change)
-                    features["clob_spread_vel"] = np.clip((current_spread - hist_spread) / lookback_s, -0.1, 0.1)
-                    features["clob_depth_delta"] = np.clip(curr_depth_ratio - hist_depth_ratio, -50.0, 50.0)
-            else:
-                features["clob_spread_vel"] = 0.0
-                features["clob_depth_delta"] = 0.0
-
             # ── Assemble in canonical order ───────────────────
             values = [features[name] for name in FEATURE_NAMES]
 
@@ -254,6 +172,14 @@ class FeatureEngine:
             compute_lag_ms = (time.time() - start_time) * 1000.0
 
             # Determine TTR phase (supports dynamic policy by market horizon)
+            now = datetime.now(timezone.utc)
+            ttr_seconds = (active_market.T_resolution - now).total_seconds()
+            ttr_minutes = max(0.0, ttr_seconds / 60.0)
+            
+            lifespan_h = (active_market.T_resolution - active_market.T_open).total_seconds() / 3600.0
+            ttr_norm_base = 1440.0 if lifespan_h > 2.0 else 15.0
+            ttr_normalized = max(0.0, min(1.0, ttr_minutes / ttr_norm_base))
+
             dyn_enabled = bool(self._config.get("signal.dynamic_ttr_enabled", True))
             if dyn_enabled:
                 if lifespan_h <= 2.0:
@@ -287,6 +213,7 @@ class FeatureEngine:
             else:
                 ttr_phase = "LATE"
 
+            strike = active_market.strike_price
             metadata = FeatureMetadata(
                 timestamp=now,
                 bar_close_time=datetime.fromtimestamp(
@@ -314,6 +241,148 @@ class FeatureEngine:
         except Exception as e:
             logger.error("feature_compute_error", error=str(e))
             return None
+
+    # === STATIC FEATURES (cached per 15-min bar) ===
+    # entry_odds, contest_urgency, btc_realized_vol, ...
+    def _compute_static_features(
+        self,
+        binance_feed: BinanceFeed,
+        active_market: ActiveMarket,
+        reference_price: float,
+    ) -> dict:
+        ohlcv = binance_feed.ohlcv_buffer
+        now = datetime.now(timezone.utc)
+        features = {}
+
+        # ── 01: OBI ───────────────────────────────────────
+        obi = binance_feed.get_ob_imbalance(levels=5)
+        features["OBI"] = obi if obi is not None else 0.0
+
+        # ── 02: TFM_normalized ────────────────────────────
+        features["TFM_normalized"] = self._compute_tfm(binance_feed)
+
+        # ── 03: VAM ───────────────────────────────────────
+        features["VAM"] = self._compute_vam(ohlcv)
+
+        # ── 04: RV ────────────────────────────────────────
+        features["RV"] = self._compute_rv(ohlcv)
+
+        # ── 05: vol_percentile ────────────────────────────
+        features["vol_percentile"] = self._compute_vol_percentile(ohlcv)
+
+        # ── 06: depth_ratio ───────────────────────────────
+        dr = binance_feed.get_depth_ratio(levels=3)
+        features["depth_ratio"] = dr if dr is not None else 1.0
+
+        # ── 07: price_vs_ema20 ────────────────────────────
+        features["price_vs_ema20"] = self._compute_price_vs_ema20(ohlcv)
+
+        # ── 08: binance_spread_bps ────────────────────────
+        spread = binance_feed.get_binance_spread_bps()
+        features["binance_spread_bps"] = spread if spread is not None else 2.0
+
+        # ── 09-12: Temporal cyclical ──────────────────────
+        utc_hour = now.hour + now.minute / 60.0
+        dow = now.weekday()  # 0=Monday, 6=Sunday
+
+        features["hour_sin"] = math.sin(2 * math.pi * utc_hour / 24.0)
+        features["hour_cos"] = math.cos(2 * math.pi * utc_hour / 24.0)
+        features["dow_sin"] = math.sin(2 * math.pi * dow / 7.0)
+        features["dow_cos"] = math.cos(2 * math.pi * dow / 7.0)
+
+        # ── 13-15: TTR contextual ─────────────────────────
+        ttr_seconds = (active_market.T_resolution - now).total_seconds()
+        ttr_minutes = max(0.0, ttr_seconds / 60.0)
+        
+        # Adaptive normalization
+        lifespan_h = (active_market.T_resolution - active_market.T_open).total_seconds() / 3600.0
+        ttr_norm_base = 1440.0 if lifespan_h > 2.0 else 15.0
+        ttr_normalized = max(0.0, min(1.0, ttr_minutes / ttr_norm_base))
+
+        features["TTR_normalized"] = ttr_normalized
+        features["TTR_sin"] = math.sin(math.pi * ttr_normalized)
+        features["TTR_cos"] = math.cos(math.pi * ttr_normalized)
+
+        # ── 16: Strike distance ───────────────────────────
+        strike = active_market.strike_price
+        if strike is None or reference_price is None or strike == 0:
+            strike_distance_pct = 0.0
+        else:
+            strike_distance_pct = (reference_price - strike) / strike * 100.0
+        
+        features["strike_distance_pct"] = strike_distance_pct
+
+        # ── 17: Contest urgency ───────────────────────────
+        features["contest_urgency"] = abs(strike_distance_pct) * (1.0 - ttr_normalized) if strike_distance_pct is not None else 0.0
+
+        # ── 18-20: Interaction features ───────────────────
+        features["ttr_x_obi"] = ttr_normalized * features["OBI"]
+        features["ttr_x_tfm"] = ttr_normalized * features["TFM_normalized"]
+        features["ttr_x_strike"] = ttr_normalized * strike_distance_pct
+
+        return features
+
+    # === DYNAMIC FEATURES (real-time, never cached) ===
+    # price_velocity_30s, yes_depth_t0, clob_spread_vel, ...
+    def _compute_dynamic_features(
+        self,
+        clob_feed: CLOBFeed,
+        active_market: ActiveMarket,
+        clob_state: CLOBState,
+    ) -> Optional[dict]:
+        if clob_state is None or any(
+            v is None for v in [clob_state.yes_ask, clob_state.yes_bid, clob_state.no_ask, clob_state.no_bid]
+        ):
+            self._clob_skip_count += 1
+            return None
+
+        features = {}
+
+        # ── 21-24: CLOB features ─────────────────────────
+        features["clob_yes_mid"] = (clob_state.yes_ask + clob_state.yes_bid) / 2.0
+        features["clob_yes_spread"] = clob_state.yes_ask - clob_state.yes_bid
+        features["clob_no_spread"] = clob_state.no_ask - clob_state.no_bid
+        features["market_vig"] = clob_state.market_vig
+
+        # ── 25-26: Velocity Features ─────────────────────
+        # Velocity calculated over 15s window
+        lookback_s = 15.0
+        yes_token = active_market.clob_token_ids.get("YES", "")
+        no_token = active_market.clob_token_ids.get("NO", "")
+        
+        hist_yes_book = clob_feed.get_historical_book_snapshot(yes_token, lookback_s) if yes_token else None
+        hist_no_book = clob_feed.get_historical_book_snapshot(no_token, lookback_s) if no_token else None
+        
+        if hist_yes_book and hist_no_book:
+            hist_yes_ask = clob_feed._best_ask(hist_yes_book)
+            hist_yes_bid = clob_feed._best_bid(hist_yes_book)
+            hist_no_ask = clob_feed._best_ask(hist_no_book)
+            hist_no_bid = clob_feed._best_bid(hist_no_book)
+
+            # Guard: any None price means historical book is incomplete
+            if any(v is None for v in [hist_yes_ask, hist_yes_bid, hist_no_ask, hist_no_bid]):
+                features["clob_spread_vel"] = 0.0
+                features["clob_depth_delta"] = 0.0
+            else:
+                # Spread velocity (YES)
+                current_spread = clob_state.yes_ask - clob_state.yes_bid
+                hist_spread = hist_yes_ask - hist_yes_bid
+                features["clob_spread_vel"] = np.clip((current_spread - hist_spread) / lookback_s, -0.1, 0.1)
+
+                # Depth Delta (Ratio of Bid/Ask depth)
+                curr_depth_ratio = clob_state.yes_depth_usd / (clob_state.no_depth_usd + 0.1)
+
+                hist_yes_depth = clob_feed._calc_depth_near_ask(hist_yes_book, hist_yes_ask, pct=0.03)
+                hist_no_depth = clob_feed._calc_depth_near_ask(hist_no_book, hist_no_ask, pct=0.03)
+                hist_depth_ratio = hist_yes_depth / (hist_no_depth + 0.1)
+
+                features["clob_depth_delta"] = np.clip(curr_depth_ratio - hist_depth_ratio, -50.0, 50.0)
+        else:
+            features["clob_spread_vel"] = 0.0
+            features["clob_depth_delta"] = 0.0
+
+        self._dynamic_count += 1
+        return features
 
     # ── Private Computation Methods ───────────────────────────
 
