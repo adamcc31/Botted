@@ -1727,6 +1727,22 @@ class TradingBot:
             )
 
             asyncio.create_task(self._save_v5_state())
+
+            # Send Telegram SHADOW ENTRY immediately on pattern detection
+            msg = SlingshotAlerts.entry(
+                market_slug=market.slug,
+                entry_price=res['entry_odds'],
+                exit_target=res['exit_odds'],
+                ttr=ttr,
+                confidence=res['swing_probability'],
+                side=winner,
+                stake_usd=sizing['stake_usd'],
+                shares=sizing['shares'],
+                depth_available_usd=depth_at_entry,
+                btc_vs_strike_pct=btc_vs_strike_pct
+            )
+            asyncio.create_task(self._send_telegram("SLINGGER V5", msg))
+
             self._active_tasks[m_id] = asyncio.create_task(
                 self._shadow_scalp_monitor_loop(m_id),
                 name=f"slingger_monitor_{m_id[:8]}"
@@ -2057,8 +2073,19 @@ class TradingBot:
                             daily_wins=daily_wins,
                             daily_losses=daily_losses
                         )
+                        order_result_msg = "[SLINGGER V5] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv({
+                            "trade_id": state['trade_id'],
+                            "signal": "BUY_UP" if token_side == 'YES' else "BUY_DOWN",
+                            "outcome": "WIN",
+                            "entry_price": state['entry_fill_price'],
+                            "pnl_usd": f"+${net_pnl:.2f}",
+                            "capital_after": f"${self._session_stats['current_capital']:.2f}"
+                        })
                         asyncio.create_task(
-                            self._send_telegram("SLINGGER V5", msg),
+                            self._send_alerts_sequential(
+                                ("SLINGGER V5", msg),
+                                ("SLINGGER V5", order_result_msg)
+                            ),
                             name=f"slingger_hit_{market_id[:8]}"
                         )
                         logger.info("slingger_hit", market_id=market_id, pnl=net_pnl)
@@ -2116,8 +2143,19 @@ class TradingBot:
                             else:
                                 logger.debug("Ghost trade resolved. Bypassing RiskManager memory.")
                             
+                            order_result_msg = "[SLINGGER V5] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv({
+                                "trade_id": state['trade_id'],
+                                "signal": "BUY_UP" if token_side == 'YES' else "BUY_DOWN",
+                                "outcome": "HOLD_TO_MATURITY",
+                                "entry_price": state['entry_fill_price'],
+                                "pnl_usd": "+$0.00",
+                                "capital_after": f"{self._session_stats['current_capital']:.2f}"
+                            })
                             asyncio.create_task(
-                                self._send_telegram("SLINGGER V5", emergency_msg),
+                                self._send_alerts_sequential(
+                                    ("SLINGGER V5", emergency_msg),
+                                    ("SLINGGER V5", order_result_msg)
+                                ),
                                 name=f"slingger_emerg_{market_id[:8]}"
                             )
                             break
@@ -2192,11 +2230,21 @@ class TradingBot:
                                     daily_losses=daily_losses
                                 )
                                 
-                            # Dispatch EMERGENCY and outcome alerts sequentially to guarantee delivery order
+                            order_result_msg = "[SLINGGER V5] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv({
+                                "trade_id": state['trade_id'],
+                                "signal": "BUY_UP" if token_side == 'YES' else "BUY_DOWN",
+                                "outcome": "WIN" if is_win else "LOSE",
+                                "entry_price": state['entry_fill_price'],
+                                "pnl_usd": f"{net_pnl:+.2f}",
+                                "capital_after": f"{self._session_stats['current_capital']:.2f}"
+                            })
+
+                            # Dispatch EMERGENCY, outcome, and order result alerts sequentially to guarantee delivery order
                             asyncio.create_task(
                                 self._send_alerts_sequential(
                                     ("SLINGGER V5", emergency_msg),
-                                    ("SLINGGER V5", outcome_msg)
+                                    ("SLINGGER V5", outcome_msg),
+                                    ("SLINGGER V5", order_result_msg)
                                 ),
                                 name=f"slingger_emerg_seq_{market_id[:8]}"
                             )
@@ -2242,8 +2290,19 @@ class TradingBot:
                             exit_target=state['exit_odds'],
                             stake_usd=state['stake_usd']
                         )
+                        order_result_msg = "[SLINGGER V5] ✅ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv({
+                            "trade_id": state['trade_id'],
+                            "signal": "BUY_UP" if token_side == 'YES' else "BUY_DOWN",
+                            "outcome": "HOLD_TO_MATURITY",
+                            "entry_price": state['entry_fill_price'],
+                            "pnl_usd": "+$0.00",
+                            "capital_after": f"{self._session_stats['current_capital']:.2f}"
+                        })
                         asyncio.create_task(
-                            self._send_telegram("SLINGGER V5", msg),
+                            self._send_alerts_sequential(
+                                ("SLINGGER V5", msg),
+                                ("SLINGGER V5", order_result_msg)
+                            ),
                             name=f"slingger_stale_sync_{market_id[:8]}"
                         )
                         break
@@ -2326,6 +2385,24 @@ class TradingBot:
                     logger.debug("shadow_csv_not_found", path=str(csv_path))
             except Exception as e:
                 logger.error("shadow_csv_update_failed", error=str(e), market_id=market_id)
+
+        # Send Telegram notification for cancellation/HARD_BLOCK
+        try:
+            v5_sess = await self._v5_db.get_session_state()
+            capital_after = v5_sess['capital_current'] if v5_sess else 50.0
+            
+            state = self._shadow_scalps.get(market_id, {})
+            order_result_msg = "[SLINGGER V5] ❌ ORDER RESULT\n\n" + SlingshotAlerts._tg_kv({
+                "trade_id": trade_id,
+                "signal": f"BUY_{state.get('token_side', 'YES')}",
+                "outcome": outcome,
+                "entry_price": state.get('entry_odds', 0.0),
+                "pnl_usd": "+$0.00",
+                "capital_after": f"${capital_after:.2f}"
+            })
+            await self._send_telegram("SLINGGER V5", order_result_msg)
+        except Exception as e:
+            logger.error("cancellation_telegram_alert_failed", error=str(e))
 
     # ── Centralized Garbage Collection (Section 10) ───────────
 
