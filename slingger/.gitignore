@@ -1,0 +1,14 @@
+# Slingger V6 — Local gitignore
+# Excludes runtime artifacts from git tracking
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Log files (runtime, not source)
+logs/*.log
+logs/*.jsonl
+logs/startup.log
+logs/resolver_stdout.log
+logs/retrain_stdout.log

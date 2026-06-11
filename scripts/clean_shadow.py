@@ -31,7 +31,17 @@ def clean_shadow():
     after_fallback = len(df)
     print(f"Rows after dropping fallback vol (0.45): {after_fallback:,} (Dropped {after_pending - after_fallback:,} rows)")
     
-    # 3. Validate no NaN in critical features
+    # 3. Filter invalid prices
+    df = df[
+        (df['yes_price_t0'] > 0.05) &  # YES price tidak boleh < 5%
+        (df['no_price_t0'] > 0.05) &   # NO price tidak boleh < 5%
+        (df['yes_price_t0'] + df['no_price_t0'] > 0.80) &  # Sum harus mendekati 1.0
+        (df['yes_price_t0'] + df['no_price_t0'] < 1.20)    # Tidak boleh terlalu tinggi
+    ]
+    after_price_filter = len(df)
+    print(f"Rows after invalid price filtering: {after_price_filter:,} (Dropped {after_fallback - after_price_filter:,} rows)")
+    
+    # 4. Validate no NaN in critical features
     critical_features = [
         "spread_pct", "yes_price_t0", "no_price_t0", "clob_spread_t0", 
         "yes_depth_t0", "no_depth_t0", "btc_realized_vol_prior_30m"
@@ -45,7 +55,7 @@ def clean_shadow():
     # Drop any rows with NaN in these features
     df = df.dropna(subset=critical_features)
     final_rows = len(df)
-    print(f"\nFinal rows remaining: {final_rows:,} (Dropped {after_fallback - final_rows:,} rows with NaN)")
+    print(f"\nFinal rows remaining: {final_rows:,} (Dropped {after_price_filter - final_rows:,} rows with NaN)")
     
     # 4. Save to processed
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

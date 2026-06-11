@@ -38,3 +38,11 @@ models/*
 !models/slingger_hunter_v5/*.pkl
 plugin/
 tmp/
+
+# ─── Slingger V6 ML Pipeline ─────────────────────────────────
+# Allow the entire slingger/ directory including model and dataset
+# Model is small (~400KB) and safe to track in git
+!slingger/
+!slingger/**
+# Re-exclude only very large data artifacts if they appear
+# slingger/models/*.pkl is intentionally INCLUDED (V6 production model)

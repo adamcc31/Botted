@@ -2,7 +2,7 @@
 builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "python main.py --mode dry-run"
+startCommand = "bash slingger/start.sh"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 
@@ -10,4 +10,4 @@ restartPolicyMaxRetries = 3
 mountPath = "/app/logs"
 
 [environments.production]
-startCommand = "python main.py --mode dry-run"
+startCommand = "bash slingger/start.sh"

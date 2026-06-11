@@ -17,3 +17,7 @@ pydantic>=2.12.0
 joblib>=1.3.0
 xgboost>=2.0.0
 scikit-learn>=1.4.0
+
+# ─── Slingger V6 ML Pipeline ──────────────────────────────────
+schedule>=1.2.0          # Python scheduler for daemon scripts
+filelock>=3.13.0         # Thread-safe file locking for CSV updates
