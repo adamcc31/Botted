@@ -34,8 +34,6 @@ example_project/*
 dataset/
 models/*
 !models/alpha_v1/
-!models/killed_v5_poisoned/
-!models/killed_v5_poisoned/*.pkl
 plugin/
 tmp/
 

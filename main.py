@@ -1590,8 +1590,14 @@ class TradingBot:
         else:
             price_velocity_30s = 0.0
 
+        spread_result = self._spread_filter.check(self._dual_feed)
+        spread_pct = spread_result.spread_pct
+        ttr_seconds = max(0.0, (market.T_resolution - now).total_seconds())
+
         # 3. Predict for YES side swing
         yes_feat = {
+            'ttr_seconds':               ttr_seconds,
+            'spread_pct':                spread_pct,
             'yes_price_t0':              clob_state.yes_bid,
             'no_price_t0':               clob_state.no_bid,
             'clob_spread_t0':            clob_state.yes_ask - clob_state.yes_bid,
@@ -1601,7 +1607,7 @@ class TradingBot:
             'price_velocity_30s':        price_velocity_30s,
             'depth_trend_30s':           base_features.get("clob_depth_delta", 0.0),
             'btc_realized_vol_prior_30m': btc_vol,
-            'ttr_at_signal':             (market.T_resolution - now).total_seconds(),
+            'ttr_at_signal':             ttr_seconds,
             'market_hour_utc':           now.hour,
             'day_of_week':               now.weekday(),
         }
@@ -1854,6 +1860,8 @@ class TradingBot:
 
             # YES side prediction
             yes_feat = {
+                "ttr_seconds": ttr_seconds,
+                "spread_pct": spread_result.spread_pct,
                 "yes_price_t0": clob_state.yes_bid,
                 "no_price_t0": clob_state.no_bid,
                 "clob_spread_t0": (clob_state.yes_ask or 0.0) - (clob_state.yes_bid or 0.0),

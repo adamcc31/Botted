@@ -106,6 +106,7 @@ MODEL_PARAMS = {
 DROP_COLUMNS = [
     "market_id", "timestamp", "slug", "spread_blocked_reason",
     "shadow_signal_yes", "shadow_signal_no", "shadow_tier_yes", "shadow_tier_no",
+    "shadow_prob_yes", "shadow_prob_no", "shadow_kelly_yes", "shadow_kelly_no",
     "signal_direction", "actual_outcome", "label", "session_date",
     "session_id", "raw_clob_response",
 ]

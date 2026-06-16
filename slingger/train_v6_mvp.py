@@ -92,6 +92,10 @@ DROP_COLUMNS = [
     "shadow_signal_no",
     "shadow_tier_yes",
     "shadow_tier_no",
+    "shadow_prob_yes",
+    "shadow_prob_no",
+    "shadow_kelly_yes",
+    "shadow_kelly_no",
     "signal_direction",
     "actual_outcome",  # TARGET — must not be a feature
     "label",          # alias if present

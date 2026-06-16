@@ -1,6 +1,6 @@
 {
   "version": "6.0.0-mvp",
-  "trained_at": "2026-06-11T16:45:51.420602+00:00",
+  "trained_at": "2026-06-16T14:06:20.301062+00:00",
   "dataset": "dry_run_shadow_2026-06-06_154404_resolved.csv",
   "n_rows": 179,
   "features": [
@@ -17,15 +17,11 @@
     "btc_realized_vol_prior_30m",
     "ttr_at_signal",
     "market_hour_utc",
-    "day_of_week",
-    "shadow_prob_yes",
-    "shadow_kelly_yes",
-    "shadow_prob_no",
-    "shadow_kelly_no"
+    "day_of_week"
   ],
-  "n_features": 18,
-  "oof_auc_mean": 0.62127,
-  "oof_auc_std": 0.070055,
+  "n_features": 14,
+  "oof_auc_mean": 0.609469,
+  "oof_auc_std": 0.076385,
   "hyperparams": {
     "n_estimators": 100,
     "max_depth": 3,
