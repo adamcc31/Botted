@@ -494,6 +494,43 @@ class SlingshotAlerts:
             f"{stats_text}"
         )
 
+    @staticmethod
+    def retrain_result(
+        prev_auc: float,
+        new_auc: float,
+        n_positive: int,
+        n_markets: int,
+        deployed: bool,
+        reason: str,
+    ) -> str:
+        """
+        Alert untuk hasil auto-retrain daemon (Part 4 — Sprint Slingger V5).
+        Dipanggil oleh slingger/scripts/auto_retrain.py setelah training selesai.
+
+        Args:
+            prev_auc    : OOF AUC model yang sedang live
+            new_auc     : OOF AUC model baru hasil training
+            n_positive  : jumlah positive labels dalam training set baru
+            n_markets   : total markets dalam training set baru
+            deployed    : True jika model baru di-deploy, False jika ditolak
+            reason      : alasan trigger (misalnya "enters +200" atau "clob_rows +52000")
+        """
+        delta   = new_auc - prev_auc
+        d_emoji = "✅" if deployed else "❌"
+        verdict = "DEPLOYED" if deployed else "REJECTED (no improvement)"
+
+        return (
+            f"[SLINGGER V5] 🔄 AUTO RETRAIN\n"
+            f"\n"
+            f"<b>Trigger</b>  : {reason}\n"
+            f"<b>Prev AUC</b> : {prev_auc:.4f}\n"
+            f"<b>New AUC</b>  : {new_auc:.4f} ({delta:+.4f})\n"
+            f"<b>Training</b> : {n_positive} pos / {n_markets} markets\n"
+            f"\n"
+            f"{d_emoji} <b>Verdict</b>  : {verdict}"
+        )
+
+
     # ─────────────────────────────────────────────────────────────────────────
     # Shared Utilities
     # ─────────────────────────────────────────────────────────────────────────

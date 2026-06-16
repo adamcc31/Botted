@@ -174,7 +174,7 @@ class TradingBot:
         
         # [FIX-MEM-2] slingger_daily_stats is reset every day via _roll_session_day_if_needed.
         self._slingger_daily_stats = {'hit': 0, 'miss': 0, 'emergency': 0, 'pnls': []}
-        MAX_CONCURRENT_SLINGGER_TASKS = int(os.getenv("MAX_SLINGGER_TASKS", "10"))
+        MAX_CONCURRENT_SLINGGER_TASKS = int(os.getenv("MAX_SLINGGER_TASKS", "15"))  # [FIX-LIFECYCLE] raised default 10→15
         self._max_slingger_tasks = MAX_CONCURRENT_SLINGGER_TASKS
 
         # Dashboard state
@@ -200,6 +200,11 @@ class TradingBot:
         # Tracks total evaluations so Telegram heartbeat can confirm V5 is running
         self._v5_eval_count: int = 0
         self._v5_enter_count: int = 0
+        # [FIX-LIFECYCLE] Task lifecycle result-type counters
+        # Dipakai di heartbeat untuk analisis berapa banyak opportunity hilang karena cap vs TTR pendek
+        self._v5_expired_no_entry_count: int = 0   # task mati karena entry tidak fill sebelum deadline
+        self._v5_skip_low_ttr_count: int = 0        # market ditolak saat spawn karena TTR terlalu pendek
+        self._v5_skip_cap_reached_count: int = 0    # market ditolak karena slot cap penuh
 
     def _get_value_n_seconds_ago(
         self,
@@ -373,10 +378,15 @@ class TradingBot:
                     else "N/A",
                     # [FIX-V5-VISIBILITY] V5 evaluation diagnostics in heartbeat
                     # v5_evals > 0 confirms V5 is evaluating; v5_enters/v5_evals = entry rate
-                    "v5_evals_total": self._v5_eval_count,
-                    "v5_enters_total": self._v5_enter_count,
-                    "v5_enter_rate": f"{(self._v5_enter_count / max(self._v5_eval_count, 1) * 100):.1f}%",
-                    "v5_active_scalps": len(self._shadow_scalps),
+                    "v5_evals_total":      self._v5_eval_count,
+                    "v5_enters_total":     self._v5_enter_count,
+                    "v5_enter_rate":       f"{(self._v5_enter_count / max(self._v5_eval_count, 1) * 100):.1f}%",
+                    "v5_active_scalps":    len(self._shadow_scalps),
+                    # [FIX-LIFECYCLE] New lifecycle telemetry
+                    "v5_slot_util":        f"{len(self._shadow_scalps)/self._max_slingger_tasks*100:.1f}%",
+                    "v5_expired_no_entry": self._v5_expired_no_entry_count,
+                    "v5_skip_low_ttr":     self._v5_skip_low_ttr_count,
+                    "v5_skip_cap_reached": self._v5_skip_cap_reached_count,
                 }
                 await self._send_telegram(
                     "HEARTBEAT / MARKET WATCH",
@@ -1407,6 +1417,7 @@ class TradingBot:
             'emergency_triggered': False,
             'emergency_decision':  None,
             'created_at':          _time.time(),
+            'entry_deadline':      _time.time() + max(ttr - 90, 30),  # [FIX-LIFECYCLE] entry harus fill sebelum ini
             
             # New telemetry fields
             'stake_usd':            stake_usd,
@@ -1523,11 +1534,25 @@ class TradingBot:
             return
 
         if len(self._active_tasks) >= self._max_slingger_tasks:
+            self._v5_skip_cap_reached_count += 1  # [FIX-LIFECYCLE]
             logger.warning("slingger_v5_max_tasks_reached", limit=self._max_slingger_tasks)
             return
 
         now = datetime.now(timezone.utc)
-        
+
+        # [FIX-LIFECYCLE] TTR guard: jangan spawn task jika tidak cukup waktu untuk full cycle.
+        # Full cycle minimum: entry_wait (~60s) + exit_wait (~60s) + buffer = 120s
+        # Dengan entry_deadline = ttr - 90, masih ada ~30s breathing room untuk entry fill.
+        MIN_TTR_TO_SPAWN = int(os.getenv('MIN_TTR_TO_SPAWN', '120'))
+        _ttr_at_eval = int((market.T_resolution - now).total_seconds())
+        if _ttr_at_eval < MIN_TTR_TO_SPAWN:
+            self._v5_skip_low_ttr_count += 1
+            logger.debug(
+                f"[Slingger] SKIP_LOW_TTR | {m_id} | "
+                f"ttr={_ttr_at_eval}s < min={MIN_TTR_TO_SPAWN}s"
+            )
+            return
+
         # 1. Prepare Base Features (from FeatureEngine)
         base_features = dict(zip(fv.feature_names, fv.values))
         
@@ -1950,8 +1975,18 @@ class TradingBot:
                 # as long as self._clob still has its data in cache/history.
                 # But for polling simplicity, we assume we only track the primary.
                 if clob is None or clob.market_id != market_id:
-                    # Try to fetch fresh state for this specific market if possible
-                    # (This bot design usually assumes 1 active market at a time)
+                    # [FIX-LIFECYCLE] CRITICAL: Saat market rotasi, task WAITING_ENTRY bisa infinite-sleep
+                    # memblokir slot selamanya. Cek entry_deadline; jika sudah lewat → EXPIRED → break.
+                    if (state['phase'] == 'WAITING_ENTRY'
+                            and _time.time() > state.get('entry_deadline', float('inf'))):
+                        state['result'] = 'EXPIRED_NO_ENTRY'
+                        state['phase']  = 'CLOSED'
+                        self._v5_expired_no_entry_count += 1
+                        logger.info(
+                            f"[Slingger] EXPIRED_NO_ENTRY (market_rotated) | {market_id} | "
+                            f"waited {_time.time()-state['created_at']:.0f}s"
+                        )
+                        break  # → finally → cleanup_market → slot freed
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
@@ -1970,6 +2005,19 @@ class TradingBot:
 
                 # FASE 1: WAITING_ENTRY
                 if state['phase'] == 'WAITING_ENTRY':
+                    # [FIX-LIFECYCLE] Expiry check — HARUS sebelum price check.
+                    # Fallback untuk kasus clob masih match tapi task sudah melewati deadline.
+                    if _time.time() > state.get('entry_deadline', float('inf')):
+                        state['result'] = 'EXPIRED_NO_ENTRY'
+                        state['phase']  = 'CLOSED'
+                        self._v5_expired_no_entry_count += 1
+                        logger.info(
+                            f"[Slingger] EXPIRED_NO_ENTRY | {market_id} | "
+                            f"waited {_time.time()-state['created_at']:.0f}s | "
+                            f"ttr_at_entry={state['ttr_at_entry']}s"
+                        )
+                        break
+
                     # [FIX-12] Sanity guard: reject fills at absurdly low prices
                     if current_price < 0.35:
                         logger.warning(
