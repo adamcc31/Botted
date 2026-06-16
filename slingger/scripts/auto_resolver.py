@@ -56,7 +56,13 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 SLINGGER_DIR = SCRIPT_DIR.parent  # slingger/
 ROOT_DIR = SLINGGER_DIR.parent    # project root
 
-DATA_DIR = SLINGGER_DIR / "data"
+if Path("/app/data").exists():
+    DATA_DIR = Path("/app/data")
+elif (ROOT_DIR / "data").exists():
+    DATA_DIR = ROOT_DIR / "data"
+else:
+    DATA_DIR = SLINGGER_DIR / "data"
+
 LOGS_DIR = SLINGGER_DIR / "logs"
 ENV_PATH = ROOT_DIR / ".env"
 
@@ -304,7 +310,9 @@ def find_resolvable_files() -> list[Path]:
     pattern = "dry_run_shadow_*.csv"
     candidates = []
 
-    for csv_path in sorted(DATA_DIR.glob(pattern)):
+    for csv_path in sorted(DATA_DIR.rglob(pattern)):
+        if "combined" in csv_path.name:
+            continue
         # Extract date from filename: dry_run_shadow_YYYY-MM-DD_HHMMSS*.csv
         try:
             parts = csv_path.stem.split("_")

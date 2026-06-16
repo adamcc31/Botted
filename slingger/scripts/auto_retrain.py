@@ -48,7 +48,13 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 SLINGGER_DIR = SCRIPT_DIR.parent          # slingger/
 ROOT_DIR = SLINGGER_DIR.parent            # project root
 
-DATA_DIR = SLINGGER_DIR / "data"
+if Path("/app/data").exists():
+    DATA_DIR = Path("/app/data")
+elif (ROOT_DIR / "data").exists():
+    DATA_DIR = ROOT_DIR / "data"
+else:
+    DATA_DIR = SLINGGER_DIR / "data"
+
 MODELS_DIR = SLINGGER_DIR / "models"
 CANDIDATES_DIR = MODELS_DIR / "candidates"
 LOGS_DIR = SLINGGER_DIR / "logs"
@@ -168,12 +174,39 @@ def load_production_meta() -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────────
 # Trigger Check
 # ─────────────────────────────────────────────────────────────────
-def should_trigger_retrain(total_resolved_rows: int) -> bool:
+def get_total_clob_rows() -> int:
+    """Scan all clob_log*.csv files recursively and count total rows."""
+    total = 0
+    for path in DATA_DIR.rglob("clob_log*.csv"):
+        try:
+            with open(path, "rb") as f:
+                total += sum(1 for _ in f) - 1
+        except Exception:
+            pass
+    return total
+
+
+def should_trigger_retrain(total_resolved_rows: int, current_clob_rows: int, production_meta: dict) -> bool:
     """
-    Returns True if total resolved row count crosses a batch threshold.
-    Thresholds: 250, 500, 750, 1000, ...
+    Returns True if:
+      1. Total resolved row count crosses a batch threshold (250, 500, ...)
+      2. OR clob_delta >= 50,000 since last training
     """
-    return total_resolved_rows > 0 and (total_resolved_rows % RETRAIN_BATCH_SIZE == 0)
+    # 1. Row count trigger
+    row_trigger = total_resolved_rows > 0 and (total_resolved_rows % RETRAIN_BATCH_SIZE == 0)
+
+    # 2. Clob delta trigger
+    last_clob_rows = production_meta.get("clob_rows_trained", 0)
+    clob_delta = current_clob_rows - last_clob_rows
+    clob_trigger = clob_delta >= 50_000
+
+    if clob_trigger:
+        logger.info(
+            f"[TRIGGER] Clob delta trigger activated: {clob_delta:,} new rows >= 50,000 "
+            f"(current: {current_clob_rows:,}, last: {last_clob_rows:,})"
+        )
+
+    return row_trigger or clob_trigger
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -190,7 +223,9 @@ def assemble_dataset() -> Optional[pd.DataFrame]:
     pattern = "dry_run_shadow_*.csv"
     all_dfs = []
 
-    for csv_path in sorted(DATA_DIR.glob(pattern)):
+    for csv_path in sorted(DATA_DIR.rglob(pattern)):
+        if "combined" in csv_path.name:
+            continue
         # ── CRITICAL GATE — PERMANENT IGNORE ─────────────────────
         try:
             parts = csv_path.stem.split("_")
@@ -242,7 +277,17 @@ def assemble_dataset() -> Optional[pd.DataFrame]:
         return None
 
     combined = pd.concat(all_dfs, ignore_index=True)
-    logger.info(f"[DATASET] Assembled dataset: {len(combined)} rows from {len(all_dfs)} files")
+    
+    # Drop duplicates by (timestamp, market_id)
+    if "timestamp" in combined.columns and "market_id" in combined.columns:
+        before_dedup = len(combined)
+        combined = combined.drop_duplicates(subset=["timestamp", "market_id"])
+        logger.info(
+            f"[DATASET] Assembled dataset: {len(combined)} rows (removed {before_dedup - len(combined)} duplicates) "
+            f"from {len(all_dfs)} files"
+        )
+    else:
+        logger.info(f"[DATASET] Assembled dataset: {len(combined)} rows from {len(all_dfs)} files")
 
     # ── Minimum row check ─────────────────────────────────────────
     if len(combined) < MIN_DATASET_ROWS:
@@ -340,13 +385,15 @@ def run_retrain(force: bool = False, dry_run: bool = False) -> bool:
         return False
 
     total_rows = len(df)
+    current_clob_rows = get_total_clob_rows()
+    logger.info(f"[RETRAIN] Current CLOB log rows: {current_clob_rows:,}")
 
     # ── Trigger check (skip if --force) ──────────────────────────
-    if not force and not should_trigger_retrain(total_rows):
+    if not force and not should_trigger_retrain(total_rows, current_clob_rows, production_meta):
         logger.info(
             f"[RETRAIN] Trigger condition NOT met: "
             f"{total_rows} rows (next trigger at {((total_rows // RETRAIN_BATCH_SIZE) + 1) * RETRAIN_BATCH_SIZE}). "
-            f"No retrain needed."
+            f"CLOB log delta is below 50,000. No retrain needed."
         )
         return False
 
@@ -435,6 +482,7 @@ def run_retrain(force: bool = False, dry_run: bool = False) -> bool:
         "delta_auc": round(delta_auc, 6),
         "win_ratio": round(win_ratio, 6),
         "retrain_trigger_rows": total_rows,
+        "clob_rows_trained": current_clob_rows,
     }
 
     # Save candidate to staging area

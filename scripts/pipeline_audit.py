@@ -32,8 +32,8 @@ def verify_pipeline():
 
     # 2. Check Model Artifacts
     print("\n[2/4] Verifying Model Artifacts...")
-    model_dir = Path("models/slingger_hunter_v5")
-    required = ["model.json", "metadata.json", "calibrator.pkl", "imputer.pkl"]
+    model_dir = Path("slingger/models")
+    required = ["v6_production.pkl", "v6_production_meta.json"]
     for f in required:
         path = model_dir / f
         if not path.exists():
@@ -41,19 +41,16 @@ def verify_pipeline():
             return False
         print(f"  Found: {f}")
     
-    with open(model_dir / "metadata.json", "r", encoding='utf-8') as f:
+    with open(model_dir / "v6_production_meta.json", "r", encoding='utf-8') as f:
         meta = json.load(f)
         print(f"  Model Version: {meta.get('version')}")
-        print(f"  Locked Threshold: {meta.get('enter_threshold')}")
-        if meta.get('enter_threshold') != 0.65:
-            print("  FAIL: Threshold not locked at 0.65 in metadata!")
-            return False
+        print(f"  OOF AUC Mean: {meta.get('oof_auc_mean')}")
 
     # 3. Check DualInference Engine
     print("\n[3/4] Verifying Inference Engine (dual_inference.py)...")
     try:
-        from model_training.dual_inference import SlingshotHunterV5
-        engine = SlingshotHunterV5()
+        from model_training.dual_inference import SlingshotHunterV6
+        engine = SlingshotHunterV6()
         engine.load()
         # Mock Feature Dict
         mock_features = {f: 0.5 for f in meta['features']}

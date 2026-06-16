@@ -81,7 +81,7 @@ from src.exporter import Exporter
 from src.feature_engine import FeatureEngine
 from src.market_discovery import MarketDiscovery
 # [FIX-03] Alpha V1 XGBoostGate removed — Slingger V5 is sole trading engine
-from model_training.dual_inference import SlingshotHunterV5
+from model_training.dual_inference import SlingshotHunterV6
 from src.telegram_notifier import SlingshotAlerts
 from src.fair_probability import FairProbabilityEngine
 from src.risk_manager import RiskManager
@@ -153,8 +153,8 @@ class TradingBot:
         
         self._exporter = Exporter(self._dry_run.session_id)
 
-        # Slingger Hunter V5
-        self._slingger = SlingshotHunterV5()
+        # Slingger Hunter V6
+        self._slingger = SlingshotHunterV6()
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._shadow_scalps: dict[str, dict] = {}
         # [FIX-MEM-1] Bounded completed_markets set — capped at 500 entries to prevent

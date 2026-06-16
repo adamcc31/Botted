@@ -34,8 +34,8 @@ example_project/*
 dataset/
 models/*
 !models/alpha_v1/
-!models/slingger_hunter_v5/
-!models/slingger_hunter_v5/*.pkl
+!models/killed_v5_poisoned/
+!models/killed_v5_poisoned/*.pkl
 plugin/
 tmp/
 
